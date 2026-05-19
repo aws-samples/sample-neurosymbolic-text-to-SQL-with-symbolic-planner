@@ -1,0 +1,27 @@
+[project]
+name = "text-to-sql-planner"
+version = "0.1.0"
+description = "Text-to-SQL Planner using symbolic planning with Domain Relational Calculus"
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic>=0.39",
+    "pydantic>=2.5",
+]
+
+[project.optional-dependencies]
+dev = [
+    "hypothesis>=6.90",
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.setuptools.packages.find]
+include = ["text_to_sql_planner*"]
