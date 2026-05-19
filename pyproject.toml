@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Text-to-SQL Planner using symbolic planning with Domain Relational Calculus"
 requires-python = ">=3.11"
 dependencies = [
-    "anthropic>=0.39",
+    "boto3>=1.34",
     "pydantic>=2.5",
 ]
 
@@ -14,6 +14,9 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
 ]
+
+[project.scripts]
+text-to-sql = "text_to_sql_planner.cli:main"
 
 [build-system]
 requires = ["setuptools>=68.0"]
