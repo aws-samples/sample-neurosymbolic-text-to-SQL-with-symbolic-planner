@@ -77,6 +77,10 @@ def main() -> None:
         action="store_true",
         help="Show the target DRC expression and operation tree details.",
     )
+    output_group.add_argument(
+        "-o", "--output",
+        help="Write Markdown output to a file (default: stdout).",
+    )
 
     args = parser.parse_args()
 
@@ -116,8 +120,25 @@ def main() -> None:
         ),
     )
 
+    # Redirect stdout to file if -o specified
+    output_file = None
+    if args.output:
+        try:
+            output_file = open(args.output, "w")
+            sys.stdout = output_file
+        except (OSError, IOError) as e:
+            print(f"Error opening output file: {e}", file=sys.stderr)
+            sys.exit(1)
+
     # Run the pipeline
-    result = asyncio.run(_run_pipeline(question, schema, config, verbose=args.verbose))
+    try:
+        result = asyncio.run(_run_pipeline(question, schema, config, verbose=args.verbose))
+    finally:
+        if output_file:
+            sys.stdout = sys.__stdout__
+            output_file.close()
+            print(f"Output written to {args.output}", file=sys.stderr)
+
     sys.exit(result)
 
 
@@ -128,19 +149,22 @@ async def _run_pipeline(
     result = await run(question=question, schema=schema, config=config)
 
     if isinstance(result, TextToSQLSuccess):
+        print(f"\n---\n")
+        print(f"# Result\n")
         if verbose:
-            # Print the target DRC expression
             pp_result = pretty_print(result.target_expression)
             if isinstance(pp_result, PrintSuccess):
-                print(f"Target DRC: {pp_result.output}", file=sys.stderr)
-            print(f"Iterations: {result.operation_tree}", file=sys.stderr)
-            print("---", file=sys.stderr)
+                print(f"**Target DRC:**\n```\n{pp_result.output}\n```\n")
 
-        print(result.sql)
+        print(f"**Generated SQL:**\n")
+        print(f"```sql\n{result.sql}\n```\n")
         return 0
 
     else:
-        print(f"Error [{result.code.value}]: {result.error}", file=sys.stderr)
+        print(f"\n---\n")
+        print(f"# ❌ Error\n")
+        print(f"- **Code:** `{result.code.value}`")
+        print(f"- **Message:** {result.error}\n")
         return 1
 
 

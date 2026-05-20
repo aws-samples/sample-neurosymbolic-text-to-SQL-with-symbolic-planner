@@ -241,3 +241,136 @@ def _needs_arith_parens(child: DRCCondition, parent_op: str) -> bool:
     if parent_op in high_prec and child.operator in low_prec:
         return True
     return False
+
+
+def pretty_print_indented(expr: DRCExpression, width: int = 80) -> PrintResult:
+    """Format a DRCExpression with intelligent indentation for long expressions.
+
+    If the single-line output exceeds `width` characters, produces a
+    multi-line indented version. Otherwise returns the single-line form.
+    Sub-expressions that fit within `width` stay on one line.
+    """
+    # First try the compact single-line version
+    result = pretty_print(expr)
+    if not isinstance(result, PrintSuccess):
+        return result
+
+    if len(result.output) <= width:
+        return result
+
+    # Need indented version
+    if expr is None:
+        return PrintFailure(error=PrintError(message="Input expression is None", node=None))
+
+    try:
+        result_vars_str = _print_result_variables(expr.result_variables)
+        condition_str = _print_condition_indented(expr.condition, indent=2, width=width, parent_precedence=0)
+        output = f"{{{result_vars_str} |\n{condition_str}\n}}"
+        return PrintSuccess(output=output)
+    except _PrintInternalError as e:
+        return PrintFailure(error=e.print_error)
+
+
+def _print_condition_indented(node: DRCCondition, indent: int = 0, width: int = 80, parent_precedence: int = 0) -> str:
+    """Print a DRC condition with indentation for nested structures.
+
+    If a sub-expression fits on one line within `width - indent`, use the
+    compact single-line form. Only break into multiple lines when needed.
+    """
+    pad = " " * indent
+
+    if node is None:
+        raise _PrintInternalError(PrintError(message="Condition node is None", node=None))
+
+    # Try compact form first — if it fits, use it
+    compact = _print_condition(node, parent_precedence=parent_precedence)
+    if len(compact) + indent <= width:
+        return f"{pad}{compact}"
+
+    # Doesn't fit — break it up based on node type
+
+    if isinstance(node, VariableRefNode):
+        return f"{pad}{compact}"
+
+    if isinstance(node, LiteralNode):
+        return f"{pad}{compact}"
+
+    if isinstance(node, MembershipNode):
+        return f"{pad}{compact}"
+
+    if isinstance(node, QuantifierNode):
+        if node.kind not in ("forall", "exists"):
+            raise _PrintInternalError(PrintError(message=f"Invalid quantifier kind: {node.kind}", node=node))
+        if not node.relation:
+            raise _PrintInternalError(PrintError(message="QuantifierNode has empty relation", node=node))
+        symbol = _EXISTS if node.kind == "exists" else _FORALL
+        vars_str = ",".join(node.variables)
+        header = f"{symbol} {vars_str} {_IN} {node.relation} ("
+        body_str = _print_condition_indented(node.body, indent=indent + 2, width=width, parent_precedence=0)
+        return f"{pad}{header}\n{body_str}\n{pad})"
+
+    if isinstance(node, NotNode):
+        operand_str = _print_condition_indented(node.operand, indent=indent + 2, width=width, parent_precedence=_PRECEDENCE["not"])
+        return f"{pad}{_NOT}(\n{operand_str}\n{pad})"
+
+    if isinstance(node, LogicalConnectiveNode):
+        if node.operator not in ("and", "or", "implies"):
+            raise _PrintInternalError(PrintError(message=f"Invalid logical operator: {node.operator}", node=node))
+        symbol = _CONNECTIVE_SYMBOLS[node.operator]
+        my_precedence = _PRECEDENCE[node.operator]
+
+        # Flatten chains of the same operator (a ∧ b ∧ c ∧ d)
+        operands = _flatten_connective(node, node.operator)
+
+        # Render each operand compactly
+        rendered_compact: list[str] = []
+        for operand in operands:
+            operand_compact = _print_condition(operand, parent_precedence=my_precedence)
+            if _needs_parens(operand, my_precedence):
+                operand_compact = f"({operand_compact})"
+            rendered_compact.append(operand_compact)
+
+        # Group operands onto lines, joining with the symbol
+        # Each line should be ≤ width characters (including indent)
+        lines: list[str] = []
+        current_parts: list[str] = []
+        current_len = indent
+
+        for item in rendered_compact:
+            joiner = f" {symbol} "
+            joiner_len = len(joiner) if current_parts else 0
+            needed = joiner_len + len(item)
+
+            if current_parts and current_len + needed > width:
+                # Flush current line
+                lines.append(pad + f" {symbol} ".join(current_parts))
+                current_parts = [item]
+                current_len = indent + len(item)
+            else:
+                current_parts.append(item)
+                current_len += needed
+
+        if current_parts:
+            lines.append(pad + f" {symbol} ".join(current_parts))
+
+        return f"\n{pad}{symbol} ".join(lines)
+
+    if isinstance(node, ComparisonNode):
+        return f"{pad}{compact}"
+
+    if isinstance(node, ArithmeticNode):
+        return f"{pad}{compact}"
+
+    raise _PrintInternalError(
+        PrintError(message=f"Unknown condition node type: {type(node).__name__}", node=node)
+    )
+
+
+def _flatten_connective(node: DRCCondition, operator: str) -> list[DRCCondition]:
+    """Flatten a chain of the same logical connective into a list of operands.
+
+    e.g. (and (and a b) c) → [a, b, c]
+    """
+    if isinstance(node, LogicalConnectiveNode) and node.operator == operator:
+        return _flatten_connective(node.left, operator) + _flatten_connective(node.right, operator)
+    return [node]

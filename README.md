@@ -15,9 +15,30 @@ A Text-to-SQL agent that converts natural language questions into provably corre
 - Python 3.11+
 - AWS credentials configured (IAM role, environment variables, or `~/.aws/credentials`)
 - Access to Claude on Amazon Bedrock (model: `global.anthropic.claude-opus-4-6-v1`)
-- cvc5 binary on PATH (for equivalence checking) — https://cvc5.github.io
+- cvc5 binary on PATH (for equivalence checking) — see install instructions below
 
 ## Installation
+
+### Install cvc5
+
+Download the static binary for your platform from the [cvc5 releases page](https://github.com/cvc5/cvc5/releases):
+
+```bash
+# Linux arm64 (aarch64)
+curl -L -o /tmp/cvc5.zip https://github.com/cvc5/cvc5/releases/download/cvc5-1.3.4/cvc5-Linux-arm64-static.zip
+
+# Linux x86_64
+# curl -L -o /tmp/cvc5.zip https://github.com/cvc5/cvc5/releases/download/cvc5-1.3.4/cvc5-Linux-x86_64-static.zip
+
+unzip -o /tmp/cvc5.zip -d /tmp/cvc5-extract
+sudo cp /tmp/cvc5-extract/cvc5-Linux-*/bin/cvc5 /usr/local/bin/cvc5
+sudo chmod +x /usr/local/bin/cvc5
+
+# Verify
+cvc5 --version
+```
+
+### Install the Python project
 
 ```bash
 cd /home/ubuntu

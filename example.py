@@ -32,19 +32,11 @@ QUESTION = "Which students have taken one or more Computer Science courses?"
 
 
 def main():
-    print("=" * 60)
-    print("Text-to-SQL Planner — Canned Example")
-    print("=" * 60)
-    print()
-    print(f"Question: {QUESTION}")
-    print()
-    print("Schema:")
-    for line in SCHEMA.strip().splitlines():
-        print(f"  {line}")
-    print()
-    print("-" * 60)
-    print("Running CLI...")
-    print(flush=True)
+    print("# Text-to-SQL Planner\n")
+    print(f"**Question:** {QUESTION}\n")
+    print(f"### Schema\n")
+    print(f"```sql\n{SCHEMA.strip()}\n```\n")
+    print(f"---\n", flush=True)
 
     result = subprocess.run(
         [

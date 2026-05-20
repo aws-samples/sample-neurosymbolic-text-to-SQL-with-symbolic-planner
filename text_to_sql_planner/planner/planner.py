@@ -21,7 +21,7 @@ from text_to_sql_planner.planner.llm_client import (
     OperatorSelection,
     select_operator,
 )
-from text_to_sql_planner.printer import print_lisp, pretty_print, PrintSuccess
+from text_to_sql_planner.printer import print_lisp, pretty_print, pretty_print_indented, PrintSuccess
 from text_to_sql_planner.types.drc import DRCExpression
 from text_to_sql_planner.types.operation_tree import (
     OperationTree,
@@ -130,15 +130,15 @@ async def plan(
         )
     target_lisp = target_print.output
 
-    target_pp = pretty_print(target_relation)
+    target_pp = pretty_print_indented(target_relation)
     target_pretty = target_pp.output if isinstance(target_pp, PrintSuccess) else target_lisp
 
-    print(f"[planner] Starting planner loop")
-    print(f"[planner] Target (pretty): {target_pretty}")
-    print(f"[planner] Target (lisp):   {target_lisp}")
-    print(f"[planner] Max iterations: {config.max_iterations}")
-    print(f"[planner] Max retries/iteration: {config.max_retries_per_iteration}")
-    print(f"[planner] Tables: {[tr.table_name for tr in table_relations]}")
+    print(f"# Planner\n")
+    print(f"**Target (pretty):**\n```\n{target_pretty}\n```\n")
+    print(f"**Target (lisp):**\n```lisp\n{target_lisp}\n```\n")
+    print(f"- **Max iterations:** {config.max_iterations}")
+    print(f"- **Max retries/iteration:** {config.max_retries_per_iteration}")
+    print(f"- **Tables:** {[tr.table_name for tr in table_relations]}\n")
 
     # Prepare table relation descriptions for the LLM
     table_descs = []
@@ -152,7 +152,7 @@ async def plan(
                 "lisp_syntax": lisp_str,
             }
         )
-        print(f"[planner]   Table '{tr.table_name}' columns={tr.columns}")
+        print(f"  - `{tr.table_name}` columns=`{tr.columns}`")
 
     # Track available expressions (tables + intermediates)
     available: list[tuple[DRCExpression, list[str], object]] = []
@@ -167,17 +167,17 @@ async def plan(
     intermediate_relations: list[IntermediateRelation] = []
 
     for iteration in range(1, config.max_iterations + 1):
-        print(f"\n[planner] === Iteration {iteration}/{config.max_iterations} ===", flush=True)
-        print(f"[planner]   Available relations ({len(available)}):")
+        print(f"\n## Iteration {iteration}/{config.max_iterations}\n", flush=True)
+        print(f"### Available relations ({len(available)})\n")
         for i, (expr, cols, node) in enumerate(available):
             if isinstance(node, TableLeafNode):
-                label = f"Table '{node.table_name}'"
+                label = f"Table `{node.table_name}`"
             else:
-                label = f"Intermediate ({node.operator})"
-            pp = pretty_print(expr)
+                label = f"Intermediate (`{node.operator}`)"
+            pp = pretty_print_indented(expr)
             drc_str = pp.output if isinstance(pp, PrintSuccess) else f"columns={cols}"
-            print(f"[planner]     [{i}] {label} columns={cols}")
-            print(f"[planner]          DRC: {drc_str[:150]}")
+            print(f"**[{i}]** {label} — columns=`{cols}`\n")
+            print(f"```\n{drc_str}\n```\n")
         success_this_iteration = False
 
         for retry in range(config.max_retries_per_iteration):
@@ -185,10 +185,10 @@ async def plan(
             temperature = min(temperature, 1.0)
 
             if retry > 0:
-                print(f"[planner]   Retry {retry}/{config.max_retries_per_iteration} (temp={temperature:.1f})")
+                print(f"> ⚠️ Retry {retry}/{config.max_retries_per_iteration} (temp={temperature:.1f})\n")
 
             try:
-                print(f"[planner]   Asking LLM to select operator (temp={temperature:.1f})...", flush=True)
+                print(f"Asking LLM to select operator (temp={temperature:.1f})...\n", flush=True)
                 selection = await select_operator(
                     table_relations=table_descs,
                     intermediate_relations=intermediate_relations,
@@ -196,27 +196,39 @@ async def plan(
                     temperature=temperature,
                     config=config.llm_config,
                 )
-                print(f"[planner]   LLM selected: {selection.operator} "
-                      f"inputs={selection.input_indices} params={selection.params}")
+                print(f"**LLM selected:** `{selection.operator}` inputs=`{selection.input_indices}` params=`{selection.params}`\n")
+                # For joins, show a clearer breakdown
+                if selection.operator == "join" and selection.params.get("join_columns"):
+                    join_cols = selection.params["join_columns"]
+                    input_cols = [available[idx][1] if 0 <= idx < len(available) else [] for idx in selection.input_indices]
+                    left_cols = input_cols[0] if len(input_cols) > 0 else []
+                    right_cols = input_cols[1] if len(input_cols) > 1 else []
+                    left_other = [c for c in left_cols if c not in join_cols]
+                    right_other = [c for c in right_cols if c not in join_cols]
+                    print(f"| | Join columns | Other columns |")
+                    print(f"|---|---|---|")
+                    print(f"| Left [{selection.input_indices[0]}] | `{join_cols}` | `{left_other}` |")
+                    print(f"| Right [{selection.input_indices[1]}] | `{join_cols}` | `{right_other}` |")
+                    print(f"| **Output** | | `{join_cols + left_other + right_other}` |")
+                    print()
                 if selection.reasoning:
-                    print(f"[planner]   Reasoning: {selection.reasoning[:200]}")
+                    print(f"#### Reasoning\n\n{selection.reasoning}\n")
             except Exception as e:
-                print(f"[planner]   LLM call failed: {e}")
+                print(f"> ❌ LLM call failed: `{e}`\n")
                 continue
 
             # Validate input indices
             if not selection.input_indices:
-                print(f"[planner]   Invalid: no input indices provided")
+                print(f"> ⚠️ Invalid: no input indices provided\n")
                 continue
             if any(idx < 0 or idx >= len(available) for idx in selection.input_indices):
-                print(f"[planner]   Invalid: input indices out of range "
-                      f"(have {len(available)} available relations)")
+                print(f"> ⚠️ Invalid: input indices out of range (have {len(available)} available)\n")
                 continue
 
             # Build operator params
             op_params = _build_operator_params(selection.operator, selection.params)
             if op_params is None:
-                print(f"[planner]   Invalid: could not build operator params")
+                print(f"> ⚠️ Invalid: could not build operator params\n")
                 continue
 
             # Gather input expressions
@@ -231,19 +243,19 @@ async def plan(
             op_result = apply_operator(application)
 
             if isinstance(op_result, OperatorFailure):
-                print(f"[planner]   Operator failed: {op_result.error}")
+                print(f"> ❌ Operator failed: `{op_result.error}`\n")
                 continue
 
             # We have a new intermediate expression
             new_expr = op_result.output
             new_columns = _get_columns_from_expression(new_expr)
-            print(f"[planner]   Operator succeeded! Output columns: {new_columns}")
+            print(f"✅ **Operator succeeded** — output columns: `{new_columns}`\n")
 
-            new_pp = pretty_print(new_expr)
+            new_pp = pretty_print_indented(new_expr)
             new_lisp_result = print_lisp(new_expr)
             new_lisp_str = new_lisp_result.output if isinstance(new_lisp_result, PrintSuccess) else ""
             if isinstance(new_pp, PrintSuccess):
-                print(f"[planner]   Output DRC: {new_pp.output[:200]}")
+                print(f"```\n{new_pp.output}\n```\n")
 
             # Check for duplicates: skip if this expression already exists
             is_duplicate = False
@@ -253,7 +265,7 @@ async def plan(
                     is_duplicate = True
                     break
             if is_duplicate:
-                print(f"[planner]   DUPLICATE detected — skipping (already have this relation)")
+                print(f"> ⚠️ **DUPLICATE** — skipping (already have this relation)\n")
                 continue
 
             # Build the tree node for this operation
@@ -276,32 +288,31 @@ async def plan(
                     columns=new_columns,
                 )
             )
-            print(f"[planner]   Added as relation [{new_index}]")
+            print(f"Added as **relation [{new_index}]**\n")
 
             # Check equivalence with target
-            print(f"[planner]   Checking equivalence with target...", flush=True)
+            print(f"Checking equivalence with target...\n", flush=True)
             eq_result = await check_equivalence(
                 new_expr, target_relation, config.equivalence_config
             )
 
             if isinstance(eq_result, EquivalentResult):
-                print(f"[planner]   EQUIVALENT! Planning complete.")
+                print(f"### ✅ EQUIVALENT — Planning complete!\n")
                 tree = OperationTree(root=op_node)
                 return PlannerSuccess(
                     operation_tree=tree,
                     iterations=iteration,
                 )
             elif isinstance(eq_result, NotEquivalentResult):
-                print(f"[planner]   Not equivalent yet, continuing...")
+                print(f"> Not equivalent yet, continuing...\n")
             elif isinstance(eq_result, IndeterminateResult):
-                print(f"[planner]   Equivalence indeterminate: {eq_result.reason}")
-                print(f"[planner]   Treating as not-equivalent, continuing...")
+                print(f"> ⚠️ Equivalence indeterminate: {eq_result.reason} — treating as not-equivalent\n")
 
             success_this_iteration = True
             break
 
         if not success_this_iteration:
-            print(f"[planner] All retries exhausted at iteration {iteration}. Stopping.")
+            print(f"\n> ❌ All retries exhausted at iteration {iteration}. Stopping.\n")
             return PlannerError(
                 error_type="operator_selection_failed",
                 message=(
@@ -311,7 +322,7 @@ async def plan(
                 iterations=iteration,
             )
 
-    print(f"[planner] Max iterations ({config.max_iterations}) reached without equivalence.")
+    print(f"\n> ❌ Max iterations ({config.max_iterations}) reached without equivalence.\n")
     return PlannerError(
         error_type="max_iterations_exceeded",
         message=f"Reached maximum iterations ({config.max_iterations}) without finding equivalence.",
