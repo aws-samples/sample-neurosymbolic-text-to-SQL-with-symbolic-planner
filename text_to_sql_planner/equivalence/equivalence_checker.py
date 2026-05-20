@@ -14,8 +14,8 @@ from .smt_converter import convert_to_smt
 def _indent_smt(script: str, width: int = 80) -> str:
     """Pretty-print an SMT-LIB script with indentation.
 
-    Short lines stay as-is. Long parenthesized expressions get broken
-    across multiple lines with indentation reflecting nesting depth.
+    Each top-level command stays on its own line. Long S-expressions
+    get broken across multiple lines with 2-space indentation per nesting level.
     """
     output_lines: list[str] = []
     for line in script.split("\n"):
@@ -23,11 +23,15 @@ def _indent_smt(script: str, width: int = 80) -> str:
             output_lines.append(line)
         else:
             output_lines.append(_indent_sexp(line, width))
-    return "\n[cvc5]   ".join(output_lines)
+    return "\n".join(output_lines)
 
 
 def _indent_sexp(text: str, width: int = 80) -> str:
-    """Indent a single long S-expression across multiple lines."""
+    """Indent a single long S-expression across multiple lines.
+
+    Uses 2-space indentation per nesting level. Sub-expressions that
+    fit within the remaining width stay on one line.
+    """
     result: list[str] = []
     indent = 0
     i = 0
@@ -96,7 +100,7 @@ def _indent_sexp(text: str, width: int = 80) -> str:
     if current_line:
         result.append(" " * (indent * 2) + " ".join(current_line))
 
-    return "\n[cvc5]   ".join(result)
+    return "\n".join(result)
 
 
 def _find_matching_paren(text: str, start: int) -> int:
@@ -202,7 +206,7 @@ async def check_equivalence(
     script = _build_negated_equivalence_script(formula1, formula2)
 
     print(f"#### SMT-LIB script ({len(script)} chars)\n")
-    print(f"```smt2\n{script}\n```\n")
+    print(f"```smt2\n{_indent_smt(script)}\n```\n")
     print(f"Invoking `{config.cvc5_path}` (timeout={config.timeout_seconds}s)...\n", flush=True)
 
     # Run two parallel cvc5 processes on the same script for robustness

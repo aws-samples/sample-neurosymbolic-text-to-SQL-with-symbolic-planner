@@ -306,7 +306,14 @@ def _print_condition_indented(node: DRCCondition, indent: int = 0, width: int = 
         symbol = _EXISTS if node.kind == "exists" else _FORALL
         vars_str = ",".join(node.variables)
         header = f"{symbol} {vars_str} {_IN} {node.relation} ("
+        # The body starts after the header, so its effective indent is indent + len(header)
+        # But for readability, we indent the body by indent+2
         body_str = _print_condition_indented(node.body, indent=indent + 2, width=width, parent_precedence=0)
+        # Check if the whole thing fits on one line (header + compact body + closing paren)
+        body_compact = _print_condition(node.body, parent_precedence=0)
+        one_line = f"{header}{body_compact})"
+        if len(one_line) + indent <= width:
+            return f"{pad}{one_line}"
         return f"{pad}{header}\n{body_str}\n{pad})"
 
     if isinstance(node, NotNode):
