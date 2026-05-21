@@ -141,7 +141,7 @@ def _convert_quantifier(node: QuantifierNode) -> str:
     quantifier = node.kind  # "forall" or "exists"
     bindings = " ".join(f"({v} Int)" for v in node.variables)
     body = _convert_node(node.body)
-    return f"({quantifier} (({bindings})) {body})" if len(node.variables) == 1 else f"({quantifier} ({bindings}) {body})"
+    return f"({quantifier} ({bindings}) {body})"
 
 
 def _convert_logical(node: LogicalConnectiveNode) -> str:
