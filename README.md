@@ -12,6 +12,7 @@ A Text-to-SQL agent that converts natural language questions into provably corre
 
 ## Requirements
 
+- Ubuntu 26.04 LTS (or compatible Linux distribution)
 - Python 3.11+
 - AWS credentials configured (IAM role, environment variables, or `~/.aws/credentials`)
 - Access to Claude on Amazon Bedrock (model: `global.anthropic.claude-opus-4-6-v1`)

@@ -68,15 +68,16 @@ def apply_division(params: DivisionParams, inputs: list[DRCExpression]) -> Opera
         )
 
     # Output condition: forall quantifier over r2's columns
-    # (forall (r2_columns) r2_relation r1_condition)
-    # This means: for all tuples in S, the combination with the output tuple exists in R
-    r2_relation_name = _extract_relation_name(r2)
-
+    # (forall (r2_columns) (and (in r2_columns r2) r1_condition))
+    # This means: for all values of r2's columns, if they're in R2 then they're in R1
     output_condition = QuantifierNode(
         kind="forall",
         variables=r2_columns,
-        relation=r2_relation_name,
-        body=r1.condition,
+        body=LogicalConnectiveNode(
+            operator="and",
+            left=r2.condition,
+            right=r1.condition,
+        ),
     )
 
     output = DRCExpression(
@@ -92,8 +93,6 @@ def _extract_relation_name(expr: DRCExpression) -> str:
     condition = expr.condition
     if isinstance(condition, MembershipNode):
         return condition.relation
-    if isinstance(condition, QuantifierNode):
-        return condition.relation
     return _find_relation_name(condition)
 
 
@@ -104,7 +103,7 @@ def _find_relation_name(node) -> str:
     if isinstance(node, MembershipNode):
         return node.relation
     if isinstance(node, QuantifierNode):
-        return node.relation
+        return _find_relation_name(node.body)
     if isinstance(node, LogicalConnectiveNode):
         result = _find_relation_name(node.left)
         if result != "R":

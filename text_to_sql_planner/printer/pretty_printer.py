@@ -151,10 +151,6 @@ def _print_condition(node: DRCCondition, parent_precedence: int = 0) -> str:
             raise _PrintInternalError(
                 PrintError(message=f"Invalid quantifier kind: {node.kind}", node=node)
             )
-        if not node.relation:
-            raise _PrintInternalError(
-                PrintError(message="QuantifierNode has empty relation", node=node)
-            )
         if node.variables is None:
             raise _PrintInternalError(
                 PrintError(message="QuantifierNode has None variables", node=node)
@@ -162,7 +158,7 @@ def _print_condition(node: DRCCondition, parent_precedence: int = 0) -> str:
         symbol = _EXISTS if node.kind == "exists" else _FORALL
         vars_str = ",".join(node.variables)
         body_str = _print_condition(node.body, parent_precedence=0)
-        return f"{symbol} {vars_str} {_IN} {node.relation} ({body_str})"
+        return f"{symbol} {vars_str} ({body_str})"
 
     if isinstance(node, NotNode):
         operand_str = _print_condition(node.operand, parent_precedence=_PRECEDENCE["not"])
@@ -225,6 +221,11 @@ def _needs_parens(child: DRCCondition, parent_prec: int) -> bool:
     if isinstance(child, LogicalConnectiveNode):
         child_prec = _PRECEDENCE.get(child.operator, 0)
         return child_prec < parent_prec
+    return False
+
+
+def _is_redundant_body(node: QuantifierNode) -> bool:
+    """No longer used — quantifiers don't have a relation field anymore."""
     return False
 
 
@@ -301,15 +302,11 @@ def _print_condition_indented(node: DRCCondition, indent: int = 0, width: int = 
     if isinstance(node, QuantifierNode):
         if node.kind not in ("forall", "exists"):
             raise _PrintInternalError(PrintError(message=f"Invalid quantifier kind: {node.kind}", node=node))
-        if not node.relation:
-            raise _PrintInternalError(PrintError(message="QuantifierNode has empty relation", node=node))
         symbol = _EXISTS if node.kind == "exists" else _FORALL
         vars_str = ",".join(node.variables)
-        header = f"{symbol} {vars_str} {_IN} {node.relation} ("
-        # The body starts after the header, so its effective indent is indent + len(header)
-        # But for readability, we indent the body by indent+2
+        header = f"{symbol} {vars_str} ("
         body_str = _print_condition_indented(node.body, indent=indent + 2, width=width, parent_precedence=0)
-        # Check if the whole thing fits on one line (header + compact body + closing paren)
+        # Check if the whole thing fits on one line
         body_compact = _print_condition(node.body, parent_precedence=0)
         one_line = f"{header}{body_compact})"
         if len(one_line) + indent <= width:
@@ -329,13 +326,13 @@ def _print_condition_indented(node: DRCCondition, indent: int = 0, width: int = 
         # Flatten chains of the same operator (a ∧ b ∧ c ∧ d)
         operands = _flatten_connective(node, node.operator)
 
-        # Render each operand compactly
-        rendered_compact: list[str] = []
+        # Render each operand compactly and pair with the AST node
+        rendered: list[tuple[str, DRCCondition]] = []
         for operand in operands:
             operand_compact = _print_condition(operand, parent_precedence=my_precedence)
             if _needs_parens(operand, my_precedence):
                 operand_compact = f"({operand_compact})"
-            rendered_compact.append(operand_compact)
+            rendered.append((operand_compact, operand))
 
         # Group operands onto lines, joining with the symbol
         # Each line should be ≤ width characters (including indent)
@@ -343,24 +340,39 @@ def _print_condition_indented(node: DRCCondition, indent: int = 0, width: int = 
         current_parts: list[str] = []
         current_len = indent
 
-        for item in rendered_compact:
+        for item_text, item_node in rendered:
             joiner = f" {symbol} "
             joiner_len = len(joiner) if current_parts else 0
-            needed = joiner_len + len(item)
+            needed = joiner_len + len(item_text)
 
             if current_parts and current_len + needed > width:
                 # Flush current line
                 lines.append(pad + f" {symbol} ".join(current_parts))
-                current_parts = [item]
-                current_len = indent + len(item)
-            else:
-                current_parts.append(item)
-                current_len += needed
+                current_parts = []
+                current_len = indent
+
+            # Check if this single item exceeds width even on its own line
+            if len(item_text) + indent > width and not current_parts:
+                # Expand this operand with indentation
+                expanded = _print_condition_indented(item_node, indent=indent + 2, width=width, parent_precedence=my_precedence)
+                if _needs_parens(item_node, my_precedence):
+                    expanded = f"{pad}  ({expanded.lstrip()})"
+                if lines:
+                    lines.append(f"{pad}{symbol} {expanded.lstrip()}")
+                else:
+                    lines.append(expanded)
+                continue
+
+            current_parts.append(item_text)
+            current_len = indent + len(f" {symbol} ".join(current_parts))
 
         if current_parts:
-            lines.append(pad + f" {symbol} ".join(current_parts))
+            if lines:
+                lines.append(f"{pad}{symbol} " + f" {symbol} ".join(current_parts))
+            else:
+                lines.append(pad + f" {symbol} ".join(current_parts))
 
-        return f"\n{pad}{symbol} ".join(lines)
+        return "\n".join(lines)
 
     if isinstance(node, ComparisonNode):
         return f"{pad}{compact}"

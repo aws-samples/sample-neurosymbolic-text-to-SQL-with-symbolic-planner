@@ -223,17 +223,18 @@ class TestProjection:
         assert result.output.condition == relation.condition
 
     def test_projection_wraps_with_exists(self):
-        """Projection wraps removed columns with exists quantifier."""
+        """Projection wraps with exists quantifier binding only removed columns."""
         relation = _make_relation(["id", "name", "age"], "employees")
         params = ProjectionParams(columns=["name"])
 
         result = apply_projection(params, [relation])
 
         assert isinstance(result, OperatorSuccess)
-        # Condition should be wrapped with exists for removed columns
+        # Condition should be wrapped with exists for removed columns only
         cond = result.output.condition
         assert isinstance(cond, QuantifierNode)
         assert cond.kind == "exists"
+        # Only removed columns (id, age) should be quantified — NOT the result variable (name)
         assert set(cond.variables) == {"id", "age"}
 
     def test_error_nonexistent_column(self):

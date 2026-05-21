@@ -74,13 +74,12 @@ class TestQuantifiers:
             condition=QuantifierNode(
                 kind="exists",
                 variables=["y", "z"],
-                relation="Enrolled",
                 body=VariableRefNode(name="y"),
             ),
         )
         result = print_lisp(expr)
         assert isinstance(result, PrintSuccess)
-        assert result.output == "(drc (x) (exists (y z) Enrolled y))"
+        assert result.output == "(drc (x) (exists (y z) y))"
 
     def test_forall_quantifier(self):
         expr = DRCExpression(
@@ -88,7 +87,6 @@ class TestQuantifiers:
             condition=QuantifierNode(
                 kind="forall",
                 variables=["a"],
-                relation="Grades",
                 body=ComparisonNode(
                     operator=">",
                     left=VariableRefNode(name="a"),
@@ -98,7 +96,7 @@ class TestQuantifiers:
         )
         result = print_lisp(expr)
         assert isinstance(result, PrintSuccess)
-        assert result.output == "(drc (x) (forall (a) Grades (> a 90)))"
+        assert result.output == "(drc (x) (forall (a) (> a 90)))"
 
 
 class TestLogicalConnectives:
@@ -304,7 +302,6 @@ class TestFullDRCExpression:
                 left=QuantifierNode(
                     kind="exists",
                     variables=["sid", "cid", "grade"],
-                    relation="Enrollment",
                     body=LogicalConnectiveNode(
                         operator="and",
                         left=ComparisonNode(
@@ -326,7 +323,7 @@ class TestFullDRCExpression:
         assert isinstance(result, PrintSuccess)
         expected = (
             '(drc (student_name) (and '
-            '(exists (sid cid grade) Enrollment (and (= cid "CS101") (> grade 80))) '
+            '(exists (sid cid grade) (and (= cid "CS101") (> grade 80))) '
             '(in (student_name sid) Students)))'
         )
         assert result.output == expected
@@ -338,7 +335,6 @@ class TestFullDRCExpression:
             condition=QuantifierNode(
                 kind="forall",
                 variables=["s"],
-                relation="Students",
                 body=LogicalConnectiveNode(
                     operator="implies",
                     left=MembershipNode(variables=["s"], relation="Enrolled"),
@@ -352,7 +348,7 @@ class TestFullDRCExpression:
         )
         result = print_lisp(expr)
         assert isinstance(result, PrintSuccess)
-        expected = "(drc (x) (forall (s) Students (implies (in (s) Enrolled) (> grade 0))))"
+        expected = "(drc (x) (forall (s) (implies (in (s) Enrolled) (> grade 0))))"
         assert result.output == expected
 
 
@@ -438,7 +434,6 @@ class TestErrorCases:
             condition=QuantifierNode(
                 kind="exists",
                 variables=["y"],
-                relation="R",
                 body=None,
             ),
         )

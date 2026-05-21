@@ -96,13 +96,12 @@ class TestQuantifiers:
             condition=QuantifierNode(
                 kind="exists",
                 variables=["y", "z"],
-                relation="Enrolled",
                 body=VariableRefNode(name="y"),
             ),
         )
         result = pretty_print(expr)
         assert isinstance(result, PrintSuccess)
-        assert result.output == "{x | \u2203 y,z \u2208 Enrolled (y)}"
+        assert result.output == "{x | \u2203 y,z (y)}"
 
     def test_forall_quantifier(self):
         expr = DRCExpression(
@@ -110,7 +109,6 @@ class TestQuantifiers:
             condition=QuantifierNode(
                 kind="forall",
                 variables=["a"],
-                relation="Grades",
                 body=ComparisonNode(
                     operator=">",
                     left=VariableRefNode(name="a"),
@@ -120,7 +118,7 @@ class TestQuantifiers:
         )
         result = pretty_print(expr)
         assert isinstance(result, PrintSuccess)
-        assert result.output == "{x | \u2200 a \u2208 Grades (a > 90)}"
+        assert result.output == "{x | \u2200 a (a > 90)}"
 
     def test_exists_with_multiple_variables(self):
         expr = DRCExpression(
@@ -128,7 +126,6 @@ class TestQuantifiers:
             condition=QuantifierNode(
                 kind="exists",
                 variables=["sid", "cid", "grade"],
-                relation="Enrollment",
                 body=ComparisonNode(
                     operator="=",
                     left=VariableRefNode(name="cid"),
@@ -138,7 +135,7 @@ class TestQuantifiers:
         )
         result = pretty_print(expr)
         assert isinstance(result, PrintSuccess)
-        assert result.output == '{name | \u2203 sid,cid,grade \u2208 Enrollment (cid = "CS101")}'
+        assert result.output == '{name | \u2203 sid,cid,grade (cid = "CS101")}'
 
 
 class TestLogicalConnectives:
@@ -425,7 +422,6 @@ class TestComplexExpressions:
                 left=QuantifierNode(
                     kind="exists",
                     variables=["sid", "cid", "grade"],
-                    relation="Enrollment",
                     body=LogicalConnectiveNode(
                         operator="and",
                         left=ComparisonNode(
@@ -447,7 +443,7 @@ class TestComplexExpressions:
         assert isinstance(result, PrintSuccess)
         expected = (
             '{student_name | '
-            '\u2203 sid,cid,grade \u2208 Enrollment (cid = "CS101" \u2227 grade > 80) '
+            '\u2203 sid,cid,grade (cid = "CS101" \u2227 grade > 80) '
             '\u2227 student_name,sid \u2208 Students}'
         )
         assert result.output == expected
@@ -459,7 +455,6 @@ class TestComplexExpressions:
             condition=QuantifierNode(
                 kind="forall",
                 variables=["s"],
-                relation="Students",
                 body=LogicalConnectiveNode(
                     operator="implies",
                     left=MembershipNode(variables=["s"], relation="Enrolled"),
@@ -473,7 +468,7 @@ class TestComplexExpressions:
         )
         result = pretty_print(expr)
         assert isinstance(result, PrintSuccess)
-        expected = "{x | \u2200 s \u2208 Students (s \u2208 Enrolled \u2192 grade > 0)}"
+        expected = "{x | \u2200 s (s \u2208 Enrolled \u2192 grade > 0)}"
         assert result.output == expected
 
 
@@ -559,7 +554,6 @@ class TestErrorCases:
             condition=QuantifierNode(
                 kind="exists",
                 variables=["y"],
-                relation="R",
                 body=None,
             ),
         )

@@ -65,27 +65,25 @@ class TestQuantifiers:
     """Test parsing of forall and exists quantifiers."""
 
     def test_exists_quantifier(self):
-        result = parse("(drc (x) (exists (y) Orders (= x y)))")
+        result = parse("(drc (x) (exists (y) (and (in (y) Orders) (= x y))))")
         assert isinstance(result, ParserSuccess)
         cond = result.expression.condition
         assert isinstance(cond, QuantifierNode)
         assert cond.kind == "exists"
         assert cond.variables == ["y"]
-        assert cond.relation == "Orders"
-        assert isinstance(cond.body, ComparisonNode)
+        assert isinstance(cond.body, LogicalConnectiveNode)
 
     def test_forall_quantifier(self):
-        result = parse("(drc (x) (forall (y z) Products (in (y z) Products)))")
+        result = parse("(drc (x) (forall (y z) (in (y z) Products)))")
         assert isinstance(result, ParserSuccess)
         cond = result.expression.condition
         assert isinstance(cond, QuantifierNode)
         assert cond.kind == "forall"
         assert cond.variables == ["y", "z"]
-        assert cond.relation == "Products"
         assert isinstance(cond.body, MembershipNode)
 
     def test_nested_quantifiers(self):
-        result = parse("(drc (x) (exists (y) R1 (forall (z) R2 (= y z))))")
+        result = parse("(drc (x) (exists (y) (forall (z) (= y z))))")
         assert isinstance(result, ParserSuccess)
         cond = result.expression.condition
         assert isinstance(cond, QuantifierNode)
@@ -314,7 +312,7 @@ class TestFullDRCExpression:
         assert isinstance(cond.right, ComparisonNode)
 
     def test_complex_expression_with_quantifier(self):
-        source = "(drc (x) (exists (y) Orders (and (in (x y) Orders) (= x 1))))"
+        source = "(drc (x) (exists (y) (and (in (x y) Orders) (= x 1))))"
         result = parse(source)
         assert isinstance(result, ParserSuccess)
         cond = result.expression.condition

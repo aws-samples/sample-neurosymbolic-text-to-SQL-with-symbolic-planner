@@ -20,6 +20,7 @@ from text_to_sql_planner.planner.llm_client import (
     LLMClientConfig,
     OperatorSelection,
     select_operator,
+    summarize_relation,
 )
 from text_to_sql_planner.printer import print_lisp, pretty_print, pretty_print_indented, PrintSuccess
 from text_to_sql_planner.types.drc import DRCExpression
@@ -142,17 +143,22 @@ async def plan(
 
     # Prepare table relation descriptions for the LLM
     table_descs = []
+    # Track summaries for each available relation
+    summaries: list[str] = []
     for tr in table_relations:
         tr_print = print_lisp(tr.expression)
         lisp_str = tr_print.output if isinstance(tr_print, PrintSuccess) else ""
+        summary = f"All rows from table {tr.table_name}"
         table_descs.append(
             {
                 "table_name": tr.table_name,
                 "columns": tr.columns,
                 "lisp_syntax": lisp_str,
+                "summary": summary,
             }
         )
-        print(f"  - `{tr.table_name}` columns=`{tr.columns}`")
+        summaries.append(summary)
+        print(f"  - `{tr.table_name}` columns=`{tr.columns}` — _{summary}_")
 
     # Track available expressions (tables + intermediates)
     available: list[tuple[DRCExpression, list[str], object]] = []
@@ -166,6 +172,28 @@ async def plan(
 
     intermediate_relations: list[IntermediateRelation] = []
 
+    # Degenerate case: check if the target is already one of the input tables
+    target_columns = _get_columns_from_expression(target_relation)
+    target_lisp_for_compare = print_lisp(target_relation)
+    target_lisp_str = target_lisp_for_compare.output if isinstance(target_lisp_for_compare, PrintSuccess) else ""
+
+    for i, (expr, cols, node) in enumerate(available):
+        if cols == target_columns:
+            expr_lisp = print_lisp(expr)
+            if isinstance(expr_lisp, PrintSuccess) and expr_lisp.output == target_lisp_str:
+                print(f"### ✅ Degenerate case: target is already table relation [{i}]\n")
+                tree = OperationTree(root=node)
+                return PlannerSuccess(operation_tree=tree, iterations=0)
+
+    # Also check via cvc5 equivalence for structural matches
+    for i, (expr, cols, node) in enumerate(available):
+        if len(cols) == len(target_columns):
+            eq_result = await check_equivalence(expr, target_relation, config.equivalence_config)
+            if isinstance(eq_result, EquivalentResult):
+                print(f"### ✅ Degenerate case: target is equivalent to table relation [{i}]\n")
+                tree = OperationTree(root=node)
+                return PlannerSuccess(operation_tree=tree, iterations=0)
+
     for iteration in range(1, config.max_iterations + 1):
         print(f"\n## Iteration {iteration}/{config.max_iterations}\n", flush=True)
         print(f"### Available relations ({len(available)})\n")
@@ -174,9 +202,10 @@ async def plan(
                 label = f"Table `{node.table_name}`"
             else:
                 label = f"Intermediate (`{node.operator}`)"
+            summary = summaries[i] if i < len(summaries) else ""
             pp = pretty_print_indented(expr)
             drc_str = pp.output if isinstance(pp, PrintSuccess) else f"columns={cols}"
-            print(f"**[{i}]** {label} — columns=`{cols}`\n")
+            print(f"**[{i}]** {label} — _{summary}_\n")
             print(f"```\n{drc_str}\n```\n")
         success_this_iteration = False
 
@@ -281,14 +310,25 @@ async def plan(
             # Add to available relations
             new_index = len(available)
             available.append((new_expr, new_columns, op_node))
+
+            # Summarize the new relation
+            new_pp_for_summary = pretty_print(new_expr)
+            drc_for_summary = new_pp_for_summary.output if isinstance(new_pp_for_summary, PrintSuccess) else ""
+            try:
+                summary = await summarize_relation(drc_for_summary, new_columns, config.llm_config)
+            except Exception:
+                summary = f"Result of {selection.operator} on [{', '.join(str(i) for i in selection.input_indices)}]"
+            summaries.append(summary)
+
             intermediate_relations.append(
                 IntermediateRelation(
                     index=new_index,
                     expression=new_expr,
                     columns=new_columns,
+                    summary=summary,
                 )
             )
-            print(f"Added as **relation [{new_index}]**\n")
+            print(f"Added as **relation [{new_index}]** — _{summary}_\n")
 
             # Check equivalence with target
             print(f"Checking equivalence with target...\n", flush=True)

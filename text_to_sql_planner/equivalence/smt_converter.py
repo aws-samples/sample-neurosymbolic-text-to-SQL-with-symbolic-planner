@@ -45,6 +45,27 @@ def convert_to_smt(condition: DRCCondition) -> str:
     return "\n".join(lines)
 
 
+def convert_condition_to_formula(condition: DRCCondition) -> str:
+    """Convert a DRC condition to an SMT-LIB formula string (no script wrapper)."""
+    return _convert_node(condition)
+
+
+def collect_symbols(condition: DRCCondition) -> tuple[dict[str, int], set[str]]:
+    """Collect relation names (with arities) and variable names from a condition.
+
+    Returns (relations_dict, variables_set).
+    """
+    relations: dict[str, int] = {}
+    variables: set[str] = set()
+    _collect_symbols(condition, relations, variables)
+    return relations, variables
+    formula = _convert_node(condition)
+    lines.append(f"(assert {formula})")
+    lines.append("(check-sat)")
+
+    return "\n".join(lines)
+
+
 def _collect_symbols(
     node: DRCCondition,
     relations: dict[str, int],
@@ -54,10 +75,6 @@ def _collect_symbols(
     if isinstance(node, QuantifierNode):
         for v in node.variables:
             variables.add(v)
-        if node.relation:
-            relations[node.relation] = max(
-                relations.get(node.relation, 0), len(node.variables)
-            )
         if node.body is not None:
             _collect_symbols(node.body, relations, variables)
 

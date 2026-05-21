@@ -7,6 +7,7 @@ projection are existentially quantified in the output condition.
 from __future__ import annotations
 
 from text_to_sql_planner.types.drc import (
+    AggregateVariable,
     ColumnVariable,
     DRCExpression,
     QuantifierNode,
@@ -20,10 +21,54 @@ from text_to_sql_planner.types.operators import (
     ProjectionParams,
 )
 
+# Aggregate function names
+_AGGREGATE_FUNCS = {"COUNT", "SUM", "AVG", "MIN", "MAX"}
+
 
 def _get_columns(expr: DRCExpression) -> list[str]:
     """Extract column names from a DRC expression's result variables."""
     return [rv.name if isinstance(rv, ColumnVariable) else rv.column for rv in expr.result_variables]
+
+
+def _parse_column_spec(col: str) -> ResultVariable:
+    """Parse a column specification which may be a plain name or an aggregate.
+
+    Handles formats like:
+    - "name" → ColumnVariable(name="name")
+    - "COUNT s_id" → AggregateVariable(function="COUNT", column="s_id")
+    - "COUNT(s_id)" → AggregateVariable(function="COUNT", column="s_id")
+    - "(COUNT s_id)" → AggregateVariable(function="COUNT", column="s_id")
+    - "AVG grade" → AggregateVariable(function="AVG", column="grade")
+    """
+    col = col.strip()
+
+    # Check for "(FUNC col)" format (Lisp-style with outer parens)
+    if col.startswith("(") and col.endswith(")"):
+        inner = col[1:-1].strip()
+        parts = inner.split()
+        if len(parts) == 2 and parts[0] in _AGGREGATE_FUNCS:
+            return AggregateVariable(function=parts[0], column=parts[1])
+
+    # Check for "FUNC(col)" format
+    for func in _AGGREGATE_FUNCS:
+        if col.startswith(f"{func}(") and col.endswith(")"):
+            inner = col[len(func) + 1:-1].strip()
+            return AggregateVariable(function=func, column=inner)
+
+    # Check for "FUNC col" format (space-separated)
+    parts = col.split()
+    if len(parts) == 2 and parts[0] in _AGGREGATE_FUNCS:
+        return AggregateVariable(function=parts[0], column=parts[1])
+
+    return ColumnVariable(name=col)
+
+
+def _get_underlying_column(col_spec: str) -> str:
+    """Get the underlying column name from a column spec (handles aggregates)."""
+    rv = _parse_column_spec(col_spec)
+    if isinstance(rv, AggregateVariable):
+        return rv.column
+    return rv.name
 
 
 def apply_projection(params: ProjectionParams, inputs: list[DRCExpression]) -> OperatorResult:
@@ -44,35 +89,43 @@ def apply_projection(params: ProjectionParams, inputs: list[DRCExpression]) -> O
 
     input_columns = _get_columns(relation)
 
-    # Validate all projection columns exist in input
+    # Validate all projection columns — for aggregates, check the underlying column
     for col in columns:
-        if col not in input_columns:
+        underlying = _get_underlying_column(col)
+        if underlying not in input_columns:
             return OperatorFailure(
-                error=f"Projection column '{col}' not found in input relation. "
+                error=f"Projection column '{col}' (underlying: '{underlying}') not found in input relation. "
                 f"Available columns: {input_columns}"
             )
 
-    # Output variables: only the projected columns (preserve order from params)
+    # Build output variables from the column specs
     output_variables: list[ResultVariable] = []
-    for rv in relation.result_variables:
-        col_name = rv.name if isinstance(rv, ColumnVariable) else rv.column
-        if col_name in columns:
-            output_variables.append(rv)
+    projected_underlying: list[str] = []
+    for col in columns:
+        rv = _parse_column_spec(col)
+        output_variables.append(rv)
+        if isinstance(rv, AggregateVariable):
+            projected_underlying.append(rv.column)
+        else:
+            projected_underlying.append(rv.name)
 
     # Columns being removed (existentially quantified)
-    removed_columns = [col for col in input_columns if col not in columns]
+    removed_columns = [c for c in input_columns if c not in projected_underlying]
 
-    if not removed_columns:
-        # No columns removed, condition stays the same
+    # If all output variables are aggregates, the condition stays as-is
+    # (aggregates operate over all rows matching the condition)
+    all_aggregates = all(isinstance(rv, AggregateVariable) for rv in output_variables)
+
+    if not removed_columns or all_aggregates:
+        # No columns removed, or all outputs are aggregates — condition stays the same
         output_condition = relation.condition
     else:
-        # Wrap with exists for removed columns
-        # Find relation name from the input expression
-        relation_name = _extract_relation_name(relation)
+        # Wrap with exists quantifier for the REMOVED columns only.
+        # Result variables are free and must NOT be quantified.
+        # The body includes the original condition (membership + any filters).
         output_condition = QuantifierNode(
             kind="exists",
             variables=removed_columns,
-            relation=relation_name,
             body=relation.condition,
         )
 
@@ -91,8 +144,6 @@ def _extract_relation_name(expr: DRCExpression) -> str:
     condition = expr.condition
     if isinstance(condition, MembershipNode):
         return condition.relation
-    if isinstance(condition, QuantifierNode):
-        return condition.relation
     return _find_relation_name(condition)
 
 
@@ -105,7 +156,7 @@ def _find_relation_name(node) -> str:
     if isinstance(node, MembershipNode):
         return node.relation
     if isinstance(node, QuantifierNode):
-        return node.relation
+        return _find_relation_name(node.body)
     if isinstance(node, LogicalConnectiveNode):
         result = _find_relation_name(node.left)
         if result != "R":

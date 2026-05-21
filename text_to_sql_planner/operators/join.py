@@ -109,23 +109,19 @@ def apply_join(params: JoinParams, inputs: list[DRCExpression]) -> OperatorResul
 
     # Wrap with exists for r2 vars
     r2_exist_vars = r2_columns
-    r2_relation_name = _extract_relation_name(r2)
 
     exists_r2 = QuantifierNode(
         kind="exists",
         variables=r2_exist_vars,
-        relation=r2_relation_name,
         body=outer_and,
     )
 
     # Wrap with exists for r1 vars
     r1_exist_vars = r1_columns
-    r1_relation_name = _extract_relation_name(r1)
 
     output_condition = QuantifierNode(
         kind="exists",
         variables=r1_exist_vars,
-        relation=r1_relation_name,
         body=exists_r2,
     )
 
@@ -140,7 +136,7 @@ def apply_join(params: JoinParams, inputs: list[DRCExpression]) -> OperatorResul
 def _extract_relation_name(expr: DRCExpression) -> str:
     """Extract a relation name from a DRC expression's condition.
 
-    Looks for a MembershipNode or QuantifierNode to find the relation name.
+    Looks for a MembershipNode in the condition tree to find the relation name.
     Falls back to 'R' if none found.
     """
     from text_to_sql_planner.types.drc import MembershipNode
@@ -148,9 +144,6 @@ def _extract_relation_name(expr: DRCExpression) -> str:
     condition = expr.condition
     if isinstance(condition, MembershipNode):
         return condition.relation
-    if isinstance(condition, QuantifierNode):
-        return condition.relation
-    # For composed expressions, try to find a membership node
     return _find_relation_name(condition)
 
 
@@ -163,7 +156,7 @@ def _find_relation_name(node) -> str:
     if isinstance(node, MembershipNode):
         return node.relation
     if isinstance(node, QuantifierNode):
-        return node.relation
+        return _find_relation_name(node.body)
     if isinstance(node, LogicalConnectiveNode):
         result = _find_relation_name(node.left)
         if result != "R":

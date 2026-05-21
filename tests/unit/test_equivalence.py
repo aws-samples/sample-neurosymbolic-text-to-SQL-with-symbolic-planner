@@ -162,7 +162,6 @@ class TestConvertToSmt:
         node = QuantifierNode(
             kind="forall",
             variables=["x"],
-            relation="R",
             body=VariableRefNode(name="x"),
         )
         result = convert_to_smt(node)
@@ -175,7 +174,6 @@ class TestConvertToSmt:
         node = QuantifierNode(
             kind="exists",
             variables=["y"],
-            relation="S",
             body=ComparisonNode(
                 operator=">",
                 left=VariableRefNode(name="y"),
@@ -193,7 +191,6 @@ class TestConvertToSmt:
         node = QuantifierNode(
             kind="exists",
             variables=["a", "b", "c"],
-            relation="T",
             body=MembershipNode(variables=["a", "b", "c"], relation="T"),
         )
         result = convert_to_smt(node)

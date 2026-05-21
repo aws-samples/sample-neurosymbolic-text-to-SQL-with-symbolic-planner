@@ -36,11 +36,10 @@ AggregateFunction = Literal["COUNT", "SUM", "AVG", "MIN", "MAX"]
 
 @dataclass
 class QuantifierNode:
-    """Quantifiers: ∀ and ∃"""
+    """Quantifiers: ∀ and ∃ — bind variables, body is the condition."""
     type: Literal["quantifier"] = "quantifier"
     kind: Literal["forall", "exists"] = "forall"
     variables: list[str] = field(default_factory=list)
-    relation: str = ""  # relation name for ∈
     body: DRCCondition = None  # type: ignore
 
 

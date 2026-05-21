@@ -140,17 +140,13 @@ def _print_condition(node: DRCCondition) -> str:
             raise _PrintInternalError(
                 PrintError(message=f"Invalid quantifier kind: {node.kind}", node=node)
             )
-        if not node.relation:
-            raise _PrintInternalError(
-                PrintError(message="QuantifierNode has empty relation", node=node)
-            )
         if node.variables is None:
             raise _PrintInternalError(
                 PrintError(message="QuantifierNode has None variables", node=node)
             )
         vars_str = " ".join(node.variables)
         body_str = _print_condition(node.body)
-        return f"({node.kind} ({vars_str}) {node.relation} {body_str})"
+        return f"({node.kind} ({vars_str}) {body_str})"
 
     if isinstance(node, LogicalConnectiveNode):
         if node.operator not in ("and", "or", "implies"):

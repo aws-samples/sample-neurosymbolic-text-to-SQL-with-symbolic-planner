@@ -187,7 +187,14 @@ async def check_equivalence(
     expr2: DRCExpression,
     config: EquivalenceCheckerConfig | None = None,
 ) -> EquivalenceResult:
-    """Check if two DRC expressions are logically equivalent using cvc5."""
+    """Check if two DRC expressions are logically equivalent using cvc5.
+
+    Two DRC expressions {x1,...,xn | C1(x1,...,xn)} and {x1,...,xn | C2(x1,...,xn)}
+    are equivalent iff for all values of the result variables, C1 ↔ C2.
+
+    We check: (not (forall ((x1 Int) ... (xn Int)) (= C1 C2)))
+    If unsat → equivalent. If sat → not equivalent.
+    """
     if config is None:
         config = EquivalenceCheckerConfig()
 
@@ -198,12 +205,8 @@ async def check_equivalence(
 
     print(f"\n### cvc5 equivalence check\n", flush=True)
 
-    # Convert conditions to SMT-LIB formulas
-    formula1 = convert_to_smt(expr1.condition)
-    formula2 = convert_to_smt(expr2.condition)
-
-    # Build SMT-LIB script asserting the negation of equivalence
-    script = _build_negated_equivalence_script(formula1, formula2)
+    # Build the proper equivalence check script
+    script = _build_equivalence_script(expr1, expr2)
 
     print(f"#### SMT-LIB script ({len(script)} chars)\n")
     print(f"```smt2\n{_indent_smt(script)}\n```\n")
@@ -219,36 +222,70 @@ async def check_equivalence(
     return result
 
 
-def _build_negated_equivalence_script(formula1: str, formula2: str) -> str:
-    """Build SMT-LIB script asserting (not (= E1 E2)).
+def _build_equivalence_script(expr1: DRCExpression, expr2: DRCExpression) -> str:
+    """Build SMT-LIB script to check equivalence of two DRC expressions.
 
-    - If unsat: the expressions are equivalent (no counterexample exists).
-    - If sat: the expressions are not equivalent (counterexample found).
+    For {x1,...,xn | C1} and {x1,...,xn | C2}, we check:
+        (assert (not (forall ((x1 Int) ... (xn Int)) (= C1 C2))))
+        (check-sat)
+
+    If unsat: the expressions define the same relation (equivalent).
+    If sat: there exists a tuple where they differ (not equivalent).
     """
-    lines1 = formula1.split("\n")
-    lines2 = formula2.split("\n")
+    from text_to_sql_planner.types.drc import ColumnVariable, AggregateVariable
+    from .smt_converter import convert_condition_to_formula, collect_symbols
 
-    decls: set[str] = set()
-    assert1 = ""
-    assert2 = ""
+    # Get the result variable names (these are the free variables we quantify over)
+    result_vars: list[str] = []
+    for rv in expr1.result_variables:
+        if isinstance(rv, ColumnVariable):
+            result_vars.append(rv.name)
+        elif isinstance(rv, AggregateVariable):
+            result_vars.append(rv.column)
 
-    for line in lines1:
-        if line.startswith("(declare-"):
-            decls.add(line)
-        elif line.startswith("(assert"):
-            assert1 = line[len("(assert "):-1]
+    # Convert both conditions to SMT-LIB formulas
+    formula1 = convert_condition_to_formula(expr1.condition)
+    formula2 = convert_condition_to_formula(expr2.condition)
 
-    for line in lines2:
-        if line.startswith("(declare-"):
-            decls.add(line)
-        elif line.startswith("(assert"):
-            assert2 = line[len("(assert "):-1]
+    # Collect all symbols (relations and variables) from both conditions
+    rels1, vars1 = collect_symbols(expr1.condition)
+    rels2, vars2 = collect_symbols(expr2.condition)
 
-    result_lines = ["(set-logic ALL)"]
-    result_lines.extend(sorted(decls))
-    result_lines.append(f"(assert (not (= {assert1} {assert2})))")
-    result_lines.append("(check-sat)")
-    return "\n".join(result_lines)
+    # Merge declarations
+    all_relations: dict[str, int] = {}
+    for name, arity in rels1.items():
+        all_relations[name] = max(all_relations.get(name, 0), arity)
+    for name, arity in rels2.items():
+        all_relations[name] = max(all_relations.get(name, 0), arity)
+
+    all_variables = vars1 | vars2
+
+    # Build the script
+    lines: list[str] = []
+    lines.append("(set-logic ALL)")
+
+    # Declare relations as uninterpreted functions returning Bool
+    for rel_name, arity in sorted(all_relations.items()):
+        sorts = " ".join(["Int"] * arity)
+        lines.append(f"(declare-fun {rel_name} ({sorts}) Bool)")
+
+    # Declare free variables that are NOT the result variables
+    # (result variables will be universally quantified)
+    bound_vars = set(result_vars)
+    for var in sorted(all_variables - bound_vars):
+        lines.append(f"(declare-const {var} Int)")
+
+    # Build the universally quantified equivalence assertion:
+    # (assert (not (forall ((x1 Int) ... (xn Int)) (= C1 C2))))
+    if result_vars:
+        bindings = " ".join(f"({v} Int)" for v in result_vars)
+        lines.append(f"(assert (not (forall ({bindings}) (= {formula1} {formula2}))))")
+    else:
+        # No result variables — just compare directly
+        lines.append(f"(assert (not (= {formula1} {formula2})))")
+
+    lines.append("(check-sat)")
+    return "\n".join(lines)
 
 
 async def _run_parallel_checks(

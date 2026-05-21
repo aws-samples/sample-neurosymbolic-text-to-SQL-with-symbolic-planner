@@ -243,7 +243,7 @@ class _Parser:
         return result
 
     def _parse_quantifier(self, kind: str, op_token: Token) -> QuantifierNode:
-        """Parse (forall (vars...) relation body) or (exists (vars...) relation body)."""
+        """Parse (forall (vars...) body) or (exists (vars...) body)."""
         # Parse variable list
         self._expect(TokenType.LPAREN, "before quantifier variables")
         variables: list[str] = []
@@ -252,16 +252,12 @@ class _Parser:
             variables.append(var_token.value)
         self._expect(TokenType.RPAREN, "after quantifier variables")
 
-        # Parse relation name
-        relation_token = self._expect(TokenType.SYMBOL, "expected relation name")
-
         # Parse body condition
         body = self._parse_condition()
 
         return QuantifierNode(
             kind=kind,  # type: ignore[arg-type]
             variables=variables,
-            relation=relation_token.value,
             body=body,
         )
 

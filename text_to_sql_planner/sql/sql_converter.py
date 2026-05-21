@@ -84,10 +84,13 @@ def _convert_node(node: OperationNode) -> str:
 
 
 def _convert_table_leaf(node: TableLeafNode) -> str:
-    """Convert a table leaf node to a table reference."""
+    """Convert a table leaf node to a SQL SELECT statement."""
     if not node.table_name:
         raise _ConversionError("Table leaf has empty table name")
-    return node.table_name
+    if node.columns:
+        cols = ", ".join(node.columns)
+        return f"SELECT {cols} FROM {node.table_name}"
+    return f"SELECT * FROM {node.table_name}"
 
 
 def _convert_operator(node: OperatorNode) -> str:
@@ -275,10 +278,31 @@ def _convert_division(
 
 
 def _wrap_as_source(sql: str, alias: str) -> str:
-    """Wrap SQL as a subquery source if it's not a simple table name."""
+    """Wrap SQL as a subquery source if it's not a simple table reference.
+
+    If the SQL is a simple 'SELECT cols FROM tablename' (no WHERE, JOIN, etc.),
+    just use the table name directly.
+    """
     if _is_simple_table_name(sql):
         return sql
+    # Check if it's a simple SELECT from a single table (no subquery needed)
+    table = _extract_simple_table(sql)
+    if table:
+        return table
     return f"({sql}) AS {alias}"
+
+
+def _extract_simple_table(sql: str) -> str | None:
+    """If sql is 'SELECT ... FROM tablename' with no WHERE/JOIN/etc, return tablename."""
+    import re
+    match = re.match(
+        r"^SELECT\s+.+?\s+FROM\s+(\w+)$",
+        sql.strip(),
+        re.IGNORECASE,
+    )
+    if match:
+        return match.group(1)
+    return None
 
 
 def _is_simple_table_name(sql: str) -> bool:

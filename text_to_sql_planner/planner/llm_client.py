@@ -40,6 +40,7 @@ class IntermediateRelation:
     index: int
     expression: DRCExpression
     columns: list[str]
+    summary: str = ""  # one-sentence natural language description
 
 
 def _get_bedrock_client(config: LLMClientConfig):
@@ -71,8 +72,8 @@ DRC Notation Guide:
 - (in (vars...) RelationName) - membership
 - (and cond1 cond2), (or cond1 cond2), (not cond) - logical
 - (= x y), (!= x y), (< x y), (> x y), (<= x y), (>= x y) - comparison
-- (exists (vars...) RelationName body) - existential quantifier
-- (forall (vars...) RelationName body) - universal quantifier
+- (exists (vars...) body) - existential quantifier (use (in ...) in body to bind to a relation)
+- (forall (vars...) body) - universal quantifier (use (in ...) in body to bind to a relation)
 
 Select the next operator to apply to move closer to the target expression.
 Provide your reasoning, the operator type, which input relations to use (by index), and the operator parameters."""
@@ -149,7 +150,9 @@ async def select_operator(
     # Build the user message describing available relations
     relations_desc = "Available relations:\n"
     for i, tr in enumerate(table_relations):
+        summary = tr.get('summary', f"All rows from table {tr['table_name']}")
         relations_desc += f"  [{i}] Table '{tr['table_name']}' columns={tr['columns']}\n"
+        relations_desc += f"      Summary: {summary}\n"
         relations_desc += f"      DRC: {tr['lisp_syntax']}\n"
 
     for ir in intermediate_relations:
@@ -160,6 +163,7 @@ async def select_operator(
         if isinstance(lisp_result, _PS):
             ir_lisp = lisp_result.output
         relations_desc += f"  [{idx}] Intermediate columns={ir.columns}\n"
+        relations_desc += f"      Summary: {ir.summary}\n"
         if ir_lisp:
             relations_desc += f"      DRC: {ir_lisp}\n"
 
@@ -220,17 +224,35 @@ _SYSTEM_PROMPT_DRC = """You are a formal logic expert. Convert natural language 
 
 Syntax rules:
 - Top-level: (drc (result-var1 result-var2 ...) condition)
-- Membership: (in (var1 var2 ...) TableName)
+- Result variables can be plain column names OR aggregate functions:
+  - Plain column: just the name, e.g. name, id, age
+  - Aggregate: (COUNT col), (SUM col), (AVG col), (MIN col), (MAX col)
+- Membership: (in (var1 var2 ...) TableName) — asserts that the tuple (var1, var2, ...) is a row in TableName
 - Logical: (and cond1 cond2), (or cond1 cond2), (not cond), (implies cond1 cond2)
 - Comparison: (= x y), (!= x y), (< x y), (> x y), (<= x y), (>= x y)
-- Quantifiers: (exists (var1 var2 ...) TableName body), (forall (var1 var2 ...) TableName body)
+- Quantifiers: (exists (var1 var2 ...) body), (forall (var1 var2 ...) body)
+  - Quantifiers just bind variables. Use (in ...) inside the body to constrain them to a relation.
 - Literals: strings in double quotes "hello", numbers as-is 42
 - Variables: plain identifiers like name, age, id
 
-Example:
+IMPORTANT RULES:
+- Result variables are FREE variables — they must NOT appear as quantified variables.
+- When the question asks "how many", "count", "total number of", etc., use (COUNT col) in the result variables.
+- Quantifiers bind variables; membership (in) constrains them to a table. Always pair them.
+
+Examples:
+
 Question: "Find all employees in department 5"
 Schema: CREATE TABLE employees (id INT, name VARCHAR, dept_id INT)
 Answer: (drc (id name dept_id) (and (in (id name dept_id) employees) (= dept_id 5)))
+
+Question: "How many students are enrolled in CS courses?"
+Schema: CREATE TABLE Students (s_id INT, name VARCHAR); CREATE TABLE Enrolled (s_id INT, c_id INT); CREATE TABLE Courses (c_id INT, c_type VARCHAR)
+Answer: (drc ((COUNT s_id)) (and (in (s_id name) Students) (exists (es ec) (and (in (es ec) Enrolled) (= es s_id) (exists (cc ctype) (and (in (cc ctype) Courses) (= cc ec) (= ctype "Computer Science")))))))
+
+Question: "What is the average grade of students in course 101?"
+Schema: CREATE TABLE Enrolled (s_id INT, c_id INT, grade INT)
+Answer: (drc ((AVG grade)) (and (in (s_id c_id grade) Enrolled) (= c_id 101)))
 
 Return ONLY the DRC expression in Lisp syntax, nothing else."""
 
@@ -288,3 +310,60 @@ async def convert_question_to_drc(
             return block["text"].strip()
 
     raise RuntimeError("LLM did not return a text response for DRC conversion.")
+
+
+_SYSTEM_PROMPT_SUMMARIZE = """Summarize the given DRC (Domain Relational Calculus) expression in one short sentence describing what data it represents in plain English. Be concise — one sentence only, no more than 15 words. Do not include technical notation.
+
+Examples:
+- "All students" → "All rows from the Students table"
+- "{name | name,age ∈ Students ∧ age > 21}" → "Names of students older than 21"
+- "{s_id | s_id,c_id ∈ Enrolled ∧ c_id,type ∈ Courses ∧ type = \"CS\"}" → "IDs of students enrolled in CS courses"
+
+Return ONLY the one-sentence summary, nothing else."""
+
+
+async def summarize_relation(
+    drc_pretty: str,
+    columns: list[str],
+    config: LLMClientConfig | None = None,
+) -> str:
+    """Ask the LLM to summarize a DRC expression in one sentence.
+
+    Args:
+        drc_pretty: The pretty-printed DRC expression.
+        columns: The output columns of the relation.
+        config: LLM client configuration.
+
+    Returns:
+        A one-sentence summary string.
+    """
+    if config is None:
+        config = LLMClientConfig()
+
+    client = _get_bedrock_client(config)
+
+    user_message = f"Columns: {columns}\nDRC: {drc_pretty}"
+
+    request_body = {
+        "modelId": config.model_id,
+        "system": [{"text": _SYSTEM_PROMPT_SUMMARIZE}],
+        "messages": [
+            {"role": "user", "content": [{"text": user_message}]}
+        ],
+        "inferenceConfig": {
+            "maxTokens": 100,
+            "temperature": 0.0,
+        },
+    }
+
+    response = client.converse(**request_body)
+
+    output = response.get("output", {})
+    message = output.get("message", {})
+    content_blocks = message.get("content", [])
+
+    for block in content_blocks:
+        if "text" in block:
+            return block["text"].strip()
+
+    return f"Relation with columns {columns}"

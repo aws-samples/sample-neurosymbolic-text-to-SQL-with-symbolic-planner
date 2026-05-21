@@ -130,20 +130,20 @@ def _get_cols(node) -> list[str]:
 
 class TestTableLeaf:
     def test_simple_table(self):
-        """Table leaf produces the table name."""
+        """Table leaf produces SELECT columns FROM table."""
         tree = OperationTree(root=_table_leaf("employees", ["id", "name"]))
         result = convert_to_sql(tree)
 
         assert isinstance(result, SQLSuccess)
-        assert result.sql == "employees"
+        assert result.sql == "SELECT id, name FROM employees"
 
     def test_table_with_no_columns(self):
-        """Table leaf with no columns still produces the table name."""
+        """Table leaf with no columns produces SELECT * FROM table."""
         tree = OperationTree(root=_table_leaf("orders", []))
         result = convert_to_sql(tree)
 
         assert isinstance(result, SQLSuccess)
-        assert result.sql == "orders"
+        assert result.sql == "SELECT * FROM orders"
 
 
 # --- Selection Tests ---
