@@ -17,6 +17,7 @@ from text_to_sql_planner.types.drc import (
     ComparisonNode,
     DRCCondition,
     DRCExpression,
+    FunctionCallNode,
     LiteralNode,
     LogicalConnectiveNode,
     MembershipNode,
@@ -33,6 +34,7 @@ _MAX_NESTING_DEPTH = 50
 _COMPARISON_OPS = frozenset({"=", "!=", "<", ">", "<=", ">="})
 _ARITHMETIC_OPS = frozenset({"+", "-", "*", "/"})
 _LOGICAL_BINARY_OPS = frozenset({"and", "or", "implies"})
+_BUILTIN_FUNCTIONS = frozenset({"DATE_SUB", "DATE_ADD", "YEAR", "MONTH", "DAY", "DATEDIFF"})
 _QUANTIFIER_OPS = frozenset({"forall", "exists"})
 _AGGREGATE_FUNCS = frozenset({"COUNT", "SUM", "AVG", "MIN", "MAX"})
 
@@ -195,6 +197,9 @@ class _Parser:
             return LiteralNode(value=value, data_type="number")
         elif token.type is TokenType.SYMBOL:
             self._advance()
+            # CURRENT_DATE is a built-in constant (no arguments)
+            if token.value == "CURRENT_DATE":
+                return FunctionCallNode(function="CURRENT_DATE", arguments=[])
             return VariableRefNode(name=token.value)
         else:
             raise ParseError(
@@ -231,6 +236,8 @@ class _Parser:
             result = self._parse_arithmetic(op)
         elif op == "in":
             result = self._parse_membership()
+        elif op in _BUILTIN_FUNCTIONS or op == "CURRENT_DATE":
+            result = self._parse_function_call(op)
         else:
             raise ParseError(
                 offset=op_token.offset,
@@ -308,6 +315,13 @@ class _Parser:
         relation_token = self._expect(TokenType.SYMBOL, "expected relation name")
 
         return MembershipNode(variables=variables, relation=relation_token.value)
+
+    def _parse_function_call(self, func_name: str) -> FunctionCallNode:
+        """Parse (FUNC_NAME arg1 arg2 ...) — built-in function call."""
+        arguments: list = []
+        while self._current().type is not TokenType.RPAREN:
+            arguments.append(self._parse_condition())
+        return FunctionCallNode(function=func_name, arguments=arguments)
 
 
 # ------------------------------------------------------------------

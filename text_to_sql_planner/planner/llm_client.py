@@ -232,6 +232,7 @@ Syntax rules:
 - Comparison: (= x y), (!= x y), (< x y), (> x y), (<= x y), (>= x y)
 - Quantifiers: (exists (var1 var2 ...) body), (forall (var1 var2 ...) body)
   - Quantifiers just bind variables. Use (in ...) inside the body to constrain them to a relation.
+- Date functions: CURRENT_DATE (today's date), (DATE_SUB expr days) (subtract days from a date), (DATEDIFF expr1 expr2) (days between two dates)
 - Literals: strings in double quotes "hello", numbers as-is 42
 - Variables: plain identifiers like name, age, id
 
@@ -239,6 +240,7 @@ IMPORTANT RULES:
 - Result variables are FREE variables — they must NOT appear as quantified variables.
 - Any variable that appears in a membership (in ...) but is NOT a result variable and NOT the column being aggregated MUST be existentially quantified.
 - When the question asks "how many", "count", "total number of", etc., use (COUNT col) in the result variables.
+- For age/date calculations, use CURRENT_DATE and (DATE_SUB CURRENT_DATE days). For example, "at least 30 years old" means (>= (DATE_SUB CURRENT_DATE 10950) date_of_birth) where 10950 = 30*365.
 - Quantifiers bind variables; membership (in) constrains them to a table. Always pair them.
 
 Examples:

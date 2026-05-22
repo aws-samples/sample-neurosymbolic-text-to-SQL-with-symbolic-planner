@@ -31,6 +31,7 @@ from text_to_sql_planner.types.drc import (
     VariableRefNode,
     LiteralNode,
     MembershipNode,
+    FunctionCallNode,
     DRCCondition,
 )
 
@@ -382,6 +383,27 @@ def _condition_to_sql(condition: DRCCondition) -> str:
 
     elif isinstance(condition, MembershipNode):
         return ""
+
+    elif isinstance(condition, FunctionCallNode):
+        if condition.function == "CURRENT_DATE":
+            return "CURRENT_DATE"
+        elif condition.function == "DATE_SUB" and len(condition.arguments) == 2:
+            base = _condition_to_sql(condition.arguments[0])
+            days = _condition_to_sql(condition.arguments[1])
+            return f"{base} - INTERVAL '{days} days'"
+        elif condition.function == "DATE_ADD" and len(condition.arguments) == 2:
+            base = _condition_to_sql(condition.arguments[0])
+            days = _condition_to_sql(condition.arguments[1])
+            return f"{base} + INTERVAL '{days} days'"
+        elif condition.function == "DATEDIFF" and len(condition.arguments) == 2:
+            left = _condition_to_sql(condition.arguments[0])
+            right = _condition_to_sql(condition.arguments[1])
+            return f"({left} - {right})"
+        else:
+            if not condition.arguments:
+                return condition.function
+            args = ", ".join(_condition_to_sql(arg) for arg in condition.arguments)
+            return f"{condition.function}({args})"
 
     else:
         raise _ConversionError(f"Unsupported condition type: {type(condition).__name__}")

@@ -20,6 +20,7 @@ from text_to_sql_planner.types.drc import (
     ArithmeticNode,
     LiteralNode,
     VariableRefNode,
+    FunctionCallNode,
     DRCCondition,
     ResultVariable,
 )
@@ -210,6 +211,12 @@ def _print_condition(node: DRCCondition, parent_precedence: int = 0) -> str:
         if _needs_arith_parens(node.right, node.operator):
             right_str = f"({right_str})"
         return f"{left_str} {node.operator} {right_str}"
+
+    if isinstance(node, FunctionCallNode):
+        if not node.arguments:
+            return node.function  # No-arg constant like CURRENT_DATE
+        args_str = ", ".join(_print_condition(arg, parent_precedence=0) for arg in node.arguments)
+        return f"{node.function}({args_str})"
 
     raise _PrintInternalError(
         PrintError(message=f"Unknown condition node type: {type(node).__name__}", node=node)

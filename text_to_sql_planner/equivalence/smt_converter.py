@@ -6,6 +6,7 @@ from text_to_sql_planner.types.drc import (
     ArithmeticNode,
     ComparisonNode,
     DRCCondition,
+    FunctionCallNode,
     LiteralNode,
     LogicalConnectiveNode,
     MembershipNode,
@@ -81,20 +82,37 @@ def collect_var_types(condition: DRCCondition) -> dict[str, str]:
 
 
 def _infer_types(node: DRCCondition, var_types: dict[str, str]) -> None:
-    """Infer variable types from context (comparisons with literals)."""
+    """Infer variable types from context (comparisons with literals).
+
+    Rules:
+    - Variable compared with = or != to a string literal → String
+    - Variable compared with <, >, <=, >= to a string literal → Int
+      (dates/ordered strings are modeled as Int since SMT-LIB String doesn't support ordering)
+    - Variable compared to a number → Int
+    - Variable used in arithmetic → Int
+    """
     if node is None:
         return
 
     if isinstance(node, ComparisonNode):
-        # If one side is a string literal and the other is a variable, mark it as String
+        # Ordering comparisons force Int even for string literals (dates, etc.)
+        is_ordering = node.operator in ("<", ">", "<=", ">=")
+
         if isinstance(node.left, VariableRefNode) and isinstance(node.right, LiteralNode):
             if node.right.data_type == "string":
-                var_types[node.left.name] = "String"
+                if is_ordering:
+                    # Dates and ordered strings → model as Int
+                    var_types[node.left.name] = "Int"
+                else:
+                    var_types[node.left.name] = "String"
             elif node.right.data_type == "number":
                 var_types.setdefault(node.left.name, "Int")
         elif isinstance(node.right, VariableRefNode) and isinstance(node.left, LiteralNode):
             if node.left.data_type == "string":
-                var_types[node.right.name] = "String"
+                if is_ordering:
+                    var_types[node.right.name] = "Int"
+                else:
+                    var_types[node.right.name] = "String"
             elif node.left.data_type == "number":
                 var_types.setdefault(node.right.name, "Int")
         _infer_types(node.left, var_types)
@@ -198,6 +216,11 @@ def _collect_symbols(
     elif isinstance(node, LiteralNode):
         pass  # No symbols to collect
 
+    elif isinstance(node, FunctionCallNode):
+        for arg in node.arguments:
+            if arg is not None:
+                _collect_symbols(arg, relations, variables)
+
 
 def _convert_node(node: DRCCondition, var_types: dict[str, str] | None = None) -> str:
     """Recursively convert a DRC condition node to SMT-LIB syntax."""
@@ -217,6 +240,8 @@ def _convert_node(node: DRCCondition, var_types: dict[str, str] | None = None) -
         return _convert_arithmetic(node, var_types)
     elif isinstance(node, LiteralNode):
         return _convert_literal(node)
+    elif isinstance(node, FunctionCallNode):
+        return _convert_function_call(node, var_types)
     elif isinstance(node, VariableRefNode):
         return node.name
     else:
@@ -244,8 +269,12 @@ def _convert_not(node: NotNode, var_types: dict[str, str]) -> str:
 
 
 def _convert_comparison(node: ComparisonNode, var_types: dict[str, str]) -> str:
-    left = _convert_node(node.left, var_types)
-    right = _convert_node(node.right, var_types)
+    is_ordering = node.operator in ("<", ">", "<=", ">=")
+
+    # For ordering comparisons with string literals (dates), convert to Int
+    left = _convert_node_for_comparison(node.left, var_types, is_ordering)
+    right = _convert_node_for_comparison(node.right, var_types, is_ordering)
+
     op_map = {
         "=": "=",
         "!=": "distinct",
@@ -258,6 +287,36 @@ def _convert_comparison(node: ComparisonNode, var_types: dict[str, str]) -> str:
     return f"({op} {left} {right})"
 
 
+def _convert_node_for_comparison(node: DRCCondition, var_types: dict[str, str], is_ordering: bool) -> str:
+    """Convert a node for use in a comparison, handling date literals."""
+    if is_ordering and isinstance(node, LiteralNode) and node.data_type == "string":
+        # Try to convert date-like strings to integers for ordering
+        int_val = _date_string_to_int(str(node.value))
+        if int_val is not None:
+            return str(int_val)
+    return _convert_node(node, var_types)
+
+
+def _date_string_to_int(s: str) -> int | None:
+    """Convert a date string like '2000-01-01' to days since epoch (1970-01-01).
+
+    Returns None if the string doesn't look like a date.
+    """
+    import re
+    from datetime import date
+
+    # Match YYYY-MM-DD or YYYY/MM/DD
+    m = re.match(r"^(\d{4})[-/](\d{2})[-/](\d{2})$", s)
+    if m:
+        try:
+            d = date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+            epoch = date(1970, 1, 1)
+            return (d - epoch).days
+        except ValueError:
+            return None
+    return None
+
+
 def _convert_membership(node: MembershipNode) -> str:
     args = " ".join(node.variables)
     return f"({node.relation} {args})"
@@ -267,6 +326,42 @@ def _convert_arithmetic(node: ArithmeticNode, var_types: dict[str, str]) -> str:
     left = _convert_node(node.left, var_types)
     right = _convert_node(node.right, var_types)
     return f"({node.operator} {left} {right})"
+
+
+def _convert_function_call(node: FunctionCallNode, var_types: dict[str, str]) -> str:
+    """Convert a function call to SMT-LIB.
+
+    CURRENT_DATE → today's epoch days (integer)
+    DATE_SUB(x, n) → (- x n)
+    DATE_ADD(x, n) → (+ x n)
+    DATEDIFF(x, y) → (- x y)
+    YEAR(x), MONTH(x), DAY(x) → treated as uninterpreted functions
+    """
+    from datetime import date
+
+    if node.function == "CURRENT_DATE":
+        today = date.today()
+        epoch = date(1970, 1, 1)
+        days = (today - epoch).days
+        return str(days)
+    elif node.function == "DATE_SUB" and len(node.arguments) == 2:
+        left = _convert_node(node.arguments[0], var_types)
+        right = _convert_node(node.arguments[1], var_types)
+        return f"(- {left} {right})"
+    elif node.function == "DATE_ADD" and len(node.arguments) == 2:
+        left = _convert_node(node.arguments[0], var_types)
+        right = _convert_node(node.arguments[1], var_types)
+        return f"(+ {left} {right})"
+    elif node.function == "DATEDIFF" and len(node.arguments) == 2:
+        left = _convert_node(node.arguments[0], var_types)
+        right = _convert_node(node.arguments[1], var_types)
+        return f"(- {left} {right})"
+    else:
+        # Generic uninterpreted function
+        if not node.arguments:
+            return node.function
+        args = " ".join(_convert_node(arg, var_types) for arg in node.arguments)
+        return f"({node.function} {args})"
 
 
 def _convert_literal(node: LiteralNode) -> str:

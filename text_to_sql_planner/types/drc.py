@@ -100,6 +100,14 @@ class VariableRefNode:
     name: str = ""
 
 
+@dataclass
+class FunctionCallNode:
+    """Built-in function call: CURRENT_DATE, DATE_SUB, YEAR, etc."""
+    type: Literal["function_call"] = "function_call"
+    function: str = ""
+    arguments: list[DRCCondition] = field(default_factory=list)
+
+
 DRCCondition = Union[
     QuantifierNode,
     LogicalConnectiveNode,
@@ -109,6 +117,7 @@ DRCCondition = Union[
     ArithmeticNode,
     LiteralNode,
     VariableRefNode,
+    FunctionCallNode,
 ]
 
 DRCNode = Union[DRCExpression, DRCCondition]
