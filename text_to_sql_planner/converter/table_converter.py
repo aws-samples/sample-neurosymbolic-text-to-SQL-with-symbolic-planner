@@ -120,6 +120,20 @@ def _extract_balanced_parens(text: str, start: int) -> str | None:
     return None
 
 
+def _strip_sql_comments(text: str) -> str:
+    """Remove SQL comments from text.
+
+    Handles:
+    - Single-line comments: -- ... to end of line
+    - Block comments: /* ... */
+    """
+    # Remove block comments first
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
+    # Remove single-line comments
+    text = re.sub(r"--[^\n]*", "", text)
+    return text
+
+
 def convert_tables(schema: str) -> TableConversionResult:
     """Convert CREATE TABLE statements into DRC expressions.
 
@@ -132,6 +146,9 @@ def convert_tables(schema: str) -> TableConversionResult:
     """
     if not schema or not schema.strip():
         return TableConversionFailure(error="Empty schema: no input provided")
+
+    # Strip SQL comments before parsing
+    schema = _strip_sql_comments(schema)
 
     matches = list(_CREATE_TABLE_HEADER_RE.finditer(schema))
 

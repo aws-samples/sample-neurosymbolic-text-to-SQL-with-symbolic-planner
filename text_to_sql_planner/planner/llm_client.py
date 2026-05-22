@@ -237,6 +237,7 @@ Syntax rules:
 
 IMPORTANT RULES:
 - Result variables are FREE variables — they must NOT appear as quantified variables.
+- Any variable that appears in a membership (in ...) but is NOT a result variable and NOT the column being aggregated MUST be existentially quantified.
 - When the question asks "how many", "count", "total number of", etc., use (COUNT col) in the result variables.
 - Quantifiers bind variables; membership (in) constrains them to a table. Always pair them.
 
@@ -248,11 +249,11 @@ Answer: (drc (id name dept_id) (and (in (id name dept_id) employees) (= dept_id 
 
 Question: "How many students are enrolled in CS courses?"
 Schema: CREATE TABLE Students (s_id INT, name VARCHAR); CREATE TABLE Enrolled (s_id INT, c_id INT); CREATE TABLE Courses (c_id INT, c_type VARCHAR)
-Answer: (drc ((COUNT s_id)) (and (in (s_id name) Students) (exists (es ec) (and (in (es ec) Enrolled) (= es s_id) (exists (cc ctype) (and (in (cc ctype) Courses) (= cc ec) (= ctype "Computer Science")))))))
+Answer: (drc ((COUNT s_id)) (exists (name) (and (in (s_id name) Students) (exists (es ec) (and (in (es ec) Enrolled) (= es s_id) (exists (cc ctype) (and (in (cc ctype) Courses) (= cc ec) (= ctype "Computer Science"))))))))
 
 Question: "What is the average grade of students in course 101?"
 Schema: CREATE TABLE Enrolled (s_id INT, c_id INT, grade INT)
-Answer: (drc ((AVG grade)) (and (in (s_id c_id grade) Enrolled) (= c_id 101)))
+Answer: (drc ((AVG grade)) (exists (s_id c_id) (and (in (s_id c_id grade) Enrolled) (= c_id 101))))
 
 Return ONLY the DRC expression in Lisp syntax, nothing else."""
 

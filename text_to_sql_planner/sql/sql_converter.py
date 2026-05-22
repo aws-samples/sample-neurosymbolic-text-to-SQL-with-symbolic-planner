@@ -1,8 +1,13 @@
-"""SQL converter: transforms an OperationTree into a SQL SELECT statement."""
+"""SQL converter: transforms an OperationTree into a SQL SELECT statement.
+
+Uses a flattening approach: collects all tables, joins, and WHERE conditions
+from the operation tree, then emits a single flat SQL statement rather than
+deeply nested subqueries.
+"""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Union
 
 from text_to_sql_planner.types.operation_tree import (
@@ -42,18 +47,13 @@ class SQLFailure:
 
 SQLResult = Union[SQLSuccess, SQLFailure]
 
+_AGGREGATE_FUNCS = {"COUNT", "SUM", "AVG", "MIN", "MAX"}
+
 
 def convert_to_sql(tree: OperationTree) -> SQLResult:
-    """Convert an OperationTree into a SQL SELECT statement.
+    """Convert an OperationTree into a flat SQL SELECT statement.
 
-    Performs bottom-up traversal of the operation tree, mapping each
-    RA operator to its SQL equivalent.
-
-    Args:
-        tree: The operation tree to convert.
-
-    Returns:
-        SQLSuccess with the SQL string, or SQLFailure with an error message.
+    Flattens joins and selections into a single SELECT ... FROM ... JOIN ... WHERE ...
     """
     if tree is None or tree.root is None:
         return SQLFailure(error="Invalid operation tree: root is None")
@@ -66,12 +66,30 @@ def convert_to_sql(tree: OperationTree) -> SQLResult:
 
 
 class _ConversionError(Exception):
-    """Internal exception for conversion errors."""
     pass
 
 
+@dataclass
+class _FlatQuery:
+    """Intermediate representation for flattening joins/selections."""
+    select_columns: list[str] = field(default_factory=list)
+    from_tables: list[str] = field(default_factory=list)
+    join_clauses: list[str] = field(default_factory=list)
+    where_conditions: list[str] = field(default_factory=list)
+
+    def to_sql(self) -> str:
+        cols = ", ".join(self.select_columns) if self.select_columns else "*"
+        parts = [f"SELECT {cols}"]
+        parts.append(f"  FROM {self.from_tables[0]}")
+        for join in self.join_clauses:
+            parts.append(f"  {join}")
+        if self.where_conditions:
+            parts.append(f"  WHERE {' AND '.join(self.where_conditions)}")
+        return "\n".join(parts)
+
+
 def _convert_node(node: OperationNode) -> str:
-    """Recursively convert an operation node to SQL (bottom-up)."""
+    """Convert an operation node to SQL."""
     if node is None:
         raise _ConversionError("Invalid tree: encountered None node")
 
@@ -84,7 +102,7 @@ def _convert_node(node: OperationNode) -> str:
 
 
 def _convert_table_leaf(node: TableLeafNode) -> str:
-    """Convert a table leaf node to a SQL SELECT statement."""
+    """Table leaf → SELECT cols FROM table"""
     if not node.table_name:
         raise _ConversionError("Table leaf has empty table name")
     if node.columns:
@@ -94,141 +112,141 @@ def _convert_table_leaf(node: TableLeafNode) -> str:
 
 
 def _convert_operator(node: OperatorNode) -> str:
-    """Convert an operator node to SQL based on operator type."""
+    """Convert operator node — tries to flatten joins/selections."""
+    params = node.params
+
+    if isinstance(params, ProjectionParams):
+        return _convert_projection(node, params)
+    elif isinstance(params, UnionParams):
+        return _convert_union(node, params)
+    elif isinstance(params, DivisionParams):
+        return _convert_division(node, params)
+    else:
+        # For joins, selections, cartesian products: flatten into a single query
+        flat = _flatten_to_query(node)
+        return flat.to_sql()
+
+
+def _flatten_to_query(node: OperationNode) -> _FlatQuery:
+    """Recursively flatten a tree of joins/selections/cartesian products into a flat query."""
+    if isinstance(node, TableLeafNode):
+        return _FlatQuery(
+            select_columns=list(node.columns) if node.columns else ["*"],
+            from_tables=[node.table_name],
+        )
+
+    if not isinstance(node, OperatorNode):
+        raise _ConversionError(f"Cannot flatten node type: {type(node).__name__}")
+
     params = node.params
     inputs = node.inputs
 
     if isinstance(params, SelectionParams):
-        return _convert_selection(node, params, inputs)
-    elif isinstance(params, ProjectionParams):
-        return _convert_projection(node, params, inputs)
+        # Flatten the input, add the WHERE condition
+        if not inputs:
+            raise _ConversionError("Selection requires exactly 1 input")
+        if params.condition is None:
+            raise _ConversionError("Selection requires a condition")
+        flat = _flatten_to_query(inputs[0])
+        condition_sql = _condition_to_sql(params.condition)
+        if condition_sql:
+            flat.where_conditions.append(condition_sql)
+        # Update select columns to match this node's output
+        if node.output_columns:
+            flat.select_columns = list(node.output_columns)
+        return flat
+
     elif isinstance(params, JoinParams):
-        return _convert_join(node, params, inputs)
+        if len(inputs) < 2:
+            raise _ConversionError("Join requires exactly 2 inputs")
+        if not params.join_columns:
+            raise _ConversionError("Join requires at least one join column")
+
+        left_flat = _flatten_to_query(inputs[0])
+        right_flat = _flatten_to_query(inputs[1])
+
+        # The right side becomes a JOIN clause
+        right_table = right_flat.from_tables[0] if right_flat.from_tables else "?"
+        on_conditions = [f"{left_flat.from_tables[0]}.{col} = {right_table}.{col}"
+                         for col in params.join_columns]
+        on_clause = " AND ".join(on_conditions)
+
+        # Merge
+        result = _FlatQuery(
+            select_columns=list(node.output_columns) if node.output_columns else ["*"],
+            from_tables=left_flat.from_tables,
+            join_clauses=left_flat.join_clauses + right_flat.join_clauses + [
+                f"JOIN {right_table} ON {on_clause}"
+            ],
+            where_conditions=left_flat.where_conditions + right_flat.where_conditions,
+        )
+        return result
+
     elif isinstance(params, CartesianProductParams):
-        return _convert_cartesian_product(node, params, inputs)
-    elif isinstance(params, UnionParams):
-        return _convert_union(node, params, inputs)
-    elif isinstance(params, DivisionParams):
-        return _convert_division(node, params, inputs)
+        if len(inputs) < 2:
+            raise _ConversionError("Cartesian product requires exactly 2 inputs")
+
+        left_flat = _flatten_to_query(inputs[0])
+        right_flat = _flatten_to_query(inputs[1])
+
+        right_table = right_flat.from_tables[0] if right_flat.from_tables else "?"
+
+        result = _FlatQuery(
+            select_columns=list(node.output_columns) if node.output_columns else ["*"],
+            from_tables=left_flat.from_tables,
+            join_clauses=left_flat.join_clauses + right_flat.join_clauses + [
+                f"CROSS JOIN {right_table}"
+            ],
+            where_conditions=left_flat.where_conditions + right_flat.where_conditions,
+        )
+        return result
+
     else:
-        raise _ConversionError(f"Unknown operator params type: {type(params).__name__}")
+        # For other operators that can't be flattened, convert to subquery
+        inner_sql = _convert_node(node)
+        return _FlatQuery(
+            select_columns=list(node.output_columns) if node.output_columns else ["*"],
+            from_tables=[f"({inner_sql}) AS sub"],
+        )
 
 
-def _convert_selection(
-    node: OperatorNode, params: SelectionParams, inputs: list[OperationNode]
-) -> str:
-    """Selection (σ) → SELECT * FROM (...) WHERE condition"""
-    if not inputs:
-        raise _ConversionError("Selection requires exactly 1 input")
-    if params.condition is None:
-        raise _ConversionError("Selection requires a condition")
-
-    input_sql = _convert_node(inputs[0])
-    condition_sql = _condition_to_sql(params.condition)
-
-    source = _wrap_as_source(input_sql, "t")
-    return f"SELECT * FROM {source} WHERE {condition_sql}"
-
-
-def _convert_projection(
-    node: OperatorNode, params: ProjectionParams, inputs: list[OperationNode]
-) -> str:
-    """Projection (π) → SELECT col1, col2 FROM (...)"""
+def _convert_projection(node: OperatorNode, params: ProjectionParams) -> str:
+    """Projection → SELECT specific columns FROM (flattened inner query)"""
+    inputs = node.inputs
     if not inputs:
         raise _ConversionError("Projection requires exactly 1 input")
     if not params.columns:
         raise _ConversionError("Projection requires at least one column")
 
-    # Validate columns against output_columns of input
     _validate_projection_columns(params.columns, inputs[0])
 
-    input_sql = _convert_node(inputs[0])
-    columns_sql = ", ".join(params.columns)
+    # Flatten the inner query
+    flat = _flatten_to_query(inputs[0])
 
-    source = _wrap_as_source(input_sql, "t")
-    return f"SELECT {columns_sql} FROM {source}"
+    # Replace select columns with the projection columns
+    flat.select_columns = [_col_to_sql(col) for col in params.columns]
 
-
-def _convert_join(
-    node: OperatorNode, params: JoinParams, inputs: list[OperationNode]
-) -> str:
-    """Join (⋈) → SELECT ... FROM (...) JOIN (...) ON condition"""
-    if len(inputs) < 2:
-        raise _ConversionError("Join requires exactly 2 inputs")
-    if not params.join_columns:
-        raise _ConversionError("Join requires at least one join column")
-
-    left_sql = _convert_node(inputs[0])
-    right_sql = _convert_node(inputs[1])
-
-    left_source = _wrap_as_source(left_sql, "t1")
-    right_source = _wrap_as_source(right_sql, "t2")
-
-    # Build ON clause
-    on_conditions = []
-    for col in params.join_columns:
-        on_conditions.append(f"t1.{col} = t2.{col}")
-    on_clause = " AND ".join(on_conditions)
-
-    # Build column list: all columns from output_columns or use *
-    if node.output_columns:
-        columns_sql = ", ".join(node.output_columns)
-    else:
-        columns_sql = "*"
-
-    return f"SELECT {columns_sql} FROM {left_source} JOIN {right_source} ON {on_clause}"
+    return flat.to_sql()
 
 
-def _convert_cartesian_product(
-    node: OperatorNode, params: CartesianProductParams, inputs: list[OperationNode]
-) -> str:
-    """Cartesian Product (×) → SELECT ... FROM (...) CROSS JOIN (...)"""
-    if len(inputs) < 2:
-        raise _ConversionError("Cartesian product requires exactly 2 inputs")
-
-    left_sql = _convert_node(inputs[0])
-    right_sql = _convert_node(inputs[1])
-
-    left_source = _wrap_as_source(left_sql, "t1")
-    right_source = _wrap_as_source(right_sql, "t2")
-
-    # Build column list from output_columns or use *
-    if node.output_columns:
-        columns_sql = ", ".join(node.output_columns)
-    else:
-        columns_sql = "*"
-
-    return f"SELECT {columns_sql} FROM {left_source} CROSS JOIN {right_source}"
-
-
-def _convert_union(
-    node: OperatorNode, params: UnionParams, inputs: list[OperationNode]
-) -> str:
-    """Union (∪) → (...) UNION (...)"""
+def _convert_union(node: OperatorNode, params: UnionParams) -> str:
+    """Union → (...) UNION (...)"""
+    inputs = node.inputs
     if len(inputs) < 2:
         raise _ConversionError("Union requires exactly 2 inputs")
 
     left_sql = _convert_node(inputs[0])
     right_sql = _convert_node(inputs[1])
 
-    # Wrap each side as a full SELECT if it's just a table name
-    left_select = _ensure_select(left_sql, inputs[0])
-    right_select = _ensure_select(right_sql, inputs[1])
-
-    return f"({left_select}) UNION ({right_select})"
+    return f"({left_sql}) UNION ({right_sql})"
 
 
-def _convert_division(
-    node: OperatorNode, params: DivisionParams, inputs: list[OperationNode]
-) -> str:
-    """Division (÷) → SELECT ... FROM ... WHERE NOT EXISTS (SELECT ... FROM ... WHERE NOT EXISTS (...))"""
+def _convert_division(node: OperatorNode, params: DivisionParams) -> str:
+    """Division → double NOT EXISTS pattern"""
+    inputs = node.inputs
     if len(inputs) < 2:
         raise _ConversionError("Division requires exactly 2 inputs")
 
-    left_sql = _convert_node(inputs[0])
-    right_sql = _convert_node(inputs[1])
-
-    # Determine columns: result columns are those in left but not in right
     left_cols = _get_node_columns(inputs[0])
     right_cols = _get_node_columns(inputs[1])
 
@@ -237,38 +255,26 @@ def _convert_division(
 
     result_cols = [c for c in left_cols if c not in right_cols]
     if not result_cols:
-        raise _ConversionError("Division: no result columns (all columns are in divisor)")
+        raise _ConversionError("Division: no result columns")
+
+    left_table = _get_table_name(inputs[0])
+    right_table = _get_table_name(inputs[1])
 
     result_cols_sql = ", ".join(result_cols)
-    right_cols_sql = ", ".join(right_cols)
 
-    left_source = _wrap_as_source(left_sql, "dividend")
-    right_source = _wrap_as_source(right_sql, "divisor")
-
-    # Build the double NOT EXISTS pattern
-    # SELECT result_cols FROM dividend AS t1
-    # WHERE NOT EXISTS (
-    #   SELECT * FROM divisor AS t2
-    #   WHERE NOT EXISTS (
-    #     SELECT * FROM dividend AS t3
-    #     WHERE t3.result_col = t1.result_col AND t3.right_col = t2.right_col
-    #   )
-    # )
     inner_conditions = []
     for col in result_cols:
         inner_conditions.append(f"t3.{col} = t1.{col}")
     for col in right_cols:
-        inner_conditions.append(f"t3.{col} = divisor.{col}")
+        inner_conditions.append(f"t3.{col} = t2.{col}")
     inner_where = " AND ".join(inner_conditions)
 
-    inner_left_source = _wrap_as_source(left_sql, "t3")
-
     return (
-        f"SELECT DISTINCT {result_cols_sql} FROM {left_source} AS t1 "
+        f"SELECT DISTINCT {result_cols_sql} FROM {left_table} t1 "
         f"WHERE NOT EXISTS ("
-        f"SELECT * FROM {right_source} "
+        f"SELECT * FROM {right_table} t2 "
         f"WHERE NOT EXISTS ("
-        f"SELECT * FROM {inner_left_source} "
+        f"SELECT * FROM {left_table} t3 "
         f"WHERE {inner_where}"
         f"))"
     )
@@ -277,47 +283,13 @@ def _convert_division(
 # --- Helpers ---
 
 
-def _wrap_as_source(sql: str, alias: str) -> str:
-    """Wrap SQL as a subquery source if it's not a simple table reference.
-
-    If the SQL is a simple 'SELECT cols FROM tablename' (no WHERE, JOIN, etc.),
-    just use the table name directly.
-    """
-    if _is_simple_table_name(sql):
-        return sql
-    # Check if it's a simple SELECT from a single table (no subquery needed)
-    table = _extract_simple_table(sql)
-    if table:
-        return table
-    return f"({sql}) AS {alias}"
-
-
-def _extract_simple_table(sql: str) -> str | None:
-    """If sql is 'SELECT ... FROM tablename' with no WHERE/JOIN/etc, return tablename."""
-    import re
-    match = re.match(
-        r"^SELECT\s+.+?\s+FROM\s+(\w+)$",
-        sql.strip(),
-        re.IGNORECASE,
-    )
-    if match:
-        return match.group(1)
-    return None
-
-
-def _is_simple_table_name(sql: str) -> bool:
-    """Check if the SQL is just a simple table name (no spaces, keywords, etc.)."""
-    return sql.isidentifier()
-
-
-def _ensure_select(sql: str, node: OperationNode) -> str:
-    """Ensure the SQL is a full SELECT statement."""
-    if _is_simple_table_name(sql):
-        cols = _get_node_columns(node)
-        if cols:
-            return f"SELECT {', '.join(cols)} FROM {sql}"
-        return f"SELECT * FROM {sql}"
-    return sql
+def _get_table_name(node: OperationNode) -> str:
+    """Get the base table name from a node (for simple cases)."""
+    if isinstance(node, TableLeafNode):
+        return node.table_name
+    # For complex nodes, fall back to subquery
+    sql = _convert_node(node)
+    return f"({sql})"
 
 
 def _get_node_columns(node: OperationNode) -> list[str]:
@@ -329,16 +301,50 @@ def _get_node_columns(node: OperationNode) -> list[str]:
     return []
 
 
+def _col_to_sql(col: str) -> str:
+    """Convert a column spec to SQL syntax (handles aggregates)."""
+    col = col.strip()
+    if col.startswith("(") and col.endswith(")"):
+        inner = col[1:-1].strip()
+        parts = inner.split()
+        if len(parts) == 2 and parts[0] in _AGGREGATE_FUNCS:
+            return f"{parts[0]}({parts[1]})"
+    for func in _AGGREGATE_FUNCS:
+        if col.startswith(f"{func}(") and col.endswith(")"):
+            return col
+    parts = col.split()
+    if len(parts) == 2 and parts[0] in _AGGREGATE_FUNCS:
+        return f"{parts[0]}({parts[1]})"
+    return col
+
+
+def _extract_underlying_column(col: str) -> str:
+    """Extract the underlying column name from a column spec."""
+    col = col.strip()
+    if col.startswith("(") and col.endswith(")"):
+        inner = col[1:-1].strip()
+        parts = inner.split()
+        if len(parts) == 2 and parts[0] in _AGGREGATE_FUNCS:
+            return parts[1]
+    for func in _AGGREGATE_FUNCS:
+        if col.startswith(f"{func}(") and col.endswith(")"):
+            return col[len(func) + 1:-1].strip()
+    parts = col.split()
+    if len(parts) == 2 and parts[0] in _AGGREGATE_FUNCS:
+        return parts[1]
+    return col
+
+
 def _validate_projection_columns(columns: list[str], input_node: OperationNode) -> None:
     """Validate that projection columns exist in the input node."""
     available = _get_node_columns(input_node)
     if not available:
-        # Can't validate if we don't know the input columns
         return
     for col in columns:
-        if col not in available:
+        underlying = _extract_underlying_column(col)
+        if underlying not in available:
             raise _ConversionError(
-                f"Projection column '{col}' not found in input columns: {available}"
+                f"Projection column '{col}' (underlying: '{underlying}') not found in input columns: {available}"
             )
 
 
@@ -357,7 +363,6 @@ def _condition_to_sql(condition: DRCCondition) -> str:
         right = _condition_to_sql(condition.right)
         op = condition.operator.upper()
         if op == "IMPLIES":
-            # p → q is equivalent to NOT p OR q
             return f"(NOT ({left}) OR {right})"
         return f"({left} {op} {right})"
 
@@ -370,14 +375,12 @@ def _condition_to_sql(condition: DRCCondition) -> str:
 
     elif isinstance(condition, LiteralNode):
         if condition.data_type == "string":
-            # Escape single quotes in string literals
             escaped = str(condition.value).replace("'", "''")
             return f"'{escaped}'"
         else:
             return str(condition.value)
 
     elif isinstance(condition, MembershipNode):
-        # MembershipNode is structural, not a filter - skip
         return ""
 
     else:

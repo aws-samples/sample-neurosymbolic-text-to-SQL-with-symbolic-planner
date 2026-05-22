@@ -189,19 +189,29 @@ async def check_equivalence(
 ) -> EquivalenceResult:
     """Check if two DRC expressions are logically equivalent using cvc5.
 
-    Two DRC expressions {x1,...,xn | C1(x1,...,xn)} and {x1,...,xn | C2(x1,...,xn)}
-    are equivalent iff for all values of the result variables, C1 ↔ C2.
-
-    We check: (not (forall ((x1 Int) ... (xn Int)) (= C1 C2)))
-    If unsat → equivalent. If sat → not equivalent.
+    Two DRC expressions are equivalent iff:
+    1. They have the same result variable structure (same types, same aggregates)
+    2. For all values of the result variables, their conditions are equivalent (C1 ↔ C2)
     """
     if config is None:
         config = EquivalenceCheckerConfig()
+
+    from text_to_sql_planner.types.drc import ColumnVariable, AggregateVariable
 
     # Early exit: if result variable counts differ, expressions can't be equivalent
     if len(expr1.result_variables) != len(expr2.result_variables):
         print(f"\n> ⚡ **cvc5:** Arity mismatch ({len(expr1.result_variables)} vs {len(expr2.result_variables)}) → `not_equivalent` (skipped cvc5)\n")
         return NotEquivalentResult()
+
+    # Early exit: result variable structure must match (column vs aggregate, function names)
+    for rv1, rv2 in zip(expr1.result_variables, expr2.result_variables):
+        if type(rv1) != type(rv2):
+            print(f"\n> ⚡ **cvc5:** Result variable type mismatch ({type(rv1).__name__} vs {type(rv2).__name__}) → `not_equivalent` (skipped cvc5)\n")
+            return NotEquivalentResult()
+        if isinstance(rv1, AggregateVariable) and isinstance(rv2, AggregateVariable):
+            if rv1.function != rv2.function:
+                print(f"\n> ⚡ **cvc5:** Aggregate function mismatch ({rv1.function} vs {rv2.function}) → `not_equivalent` (skipped cvc5)\n")
+                return NotEquivalentResult()
 
     print(f"\n### cvc5 equivalence check\n", flush=True)
 
@@ -251,12 +261,28 @@ def _build_equivalence_script(expr1: DRCExpression, expr2: DRCExpression) -> str
     rels1, vars1 = collect_symbols(expr1.condition)
     rels2, vars2 = collect_symbols(expr2.condition)
 
+    # Infer variable types from both conditions
+    from .smt_converter import collect_var_types, _collect_relation_sorts
+    var_types1 = collect_var_types(expr1.condition)
+    var_types2 = collect_var_types(expr2.condition)
+    # Merge: String wins over Int (more specific)
+    all_var_types: dict[str, str] = {}
+    for vt in (var_types1, var_types2):
+        for v, t in vt.items():
+            if t == "String" or v not in all_var_types:
+                all_var_types[v] = t
+
     # Merge declarations
     all_relations: dict[str, int] = {}
     for name, arity in rels1.items():
         all_relations[name] = max(all_relations.get(name, 0), arity)
     for name, arity in rels2.items():
         all_relations[name] = max(all_relations.get(name, 0), arity)
+
+    # Collect relation sorts
+    rel_sorts: dict[str, list[str]] = {}
+    _collect_relation_sorts(expr1.condition, all_var_types, rel_sorts)
+    _collect_relation_sorts(expr2.condition, all_var_types, rel_sorts)
 
     all_variables = vars1 | vars2
 
@@ -266,19 +292,23 @@ def _build_equivalence_script(expr1: DRCExpression, expr2: DRCExpression) -> str
 
     # Declare relations as uninterpreted functions returning Bool
     for rel_name, arity in sorted(all_relations.items()):
-        sorts = " ".join(["Int"] * arity)
+        if rel_name in rel_sorts:
+            sorts = " ".join(rel_sorts[rel_name])
+        else:
+            sorts = " ".join(["Int"] * arity)
         lines.append(f"(declare-fun {rel_name} ({sorts}) Bool)")
 
     # Declare free variables that are NOT the result variables
     # (result variables will be universally quantified)
     bound_vars = set(result_vars)
     for var in sorted(all_variables - bound_vars):
-        lines.append(f"(declare-const {var} Int)")
+        sort = all_var_types.get(var, "Int")
+        lines.append(f"(declare-const {var} {sort})")
 
     # Build the universally quantified equivalence assertion:
-    # (assert (not (forall ((x1 Int) ... (xn Int)) (= C1 C2))))
+    # (assert (not (forall ((x1 Sort) ... (xn Sort)) (= C1 C2))))
     if result_vars:
-        bindings = " ".join(f"({v} Int)" for v in result_vars)
+        bindings = " ".join(f"({v} {all_var_types.get(v, 'Int')})" for v in result_vars)
         lines.append(f"(assert (not (forall ({bindings}) (= {formula1} {formula2}))))")
     else:
         # No result variables — just compare directly
@@ -305,20 +335,14 @@ async def _run_parallel_checks(
                 stderr=asyncio.subprocess.PIPE,
             )
             stdout, stderr = await proc.communicate(input=script.encode())
-            output = stdout.decode().strip()
-            err_output = stderr.decode().strip()
+            output = stdout.decode(errors="replace").strip()
+            err_output = stderr.decode(errors="replace").strip()
             returncode = proc.returncode or 0
 
-            if err_output:
-                print(f"[cvc5]   stderr: {err_output[:200]}")
-
             if returncode != 0:
-                print(f"[cvc5]   Process exited with code {returncode}")
                 return IndeterminateResult(
                     reason=f"cvc5 exited with code {returncode}: {err_output[:100]}"
                 )
-
-            print(f"[cvc5]   Output: {output}")
 
             if output == "unsat":
                 return EquivalentResult()

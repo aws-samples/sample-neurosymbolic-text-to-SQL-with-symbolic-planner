@@ -112,17 +112,18 @@ def apply_projection(params: ProjectionParams, inputs: list[DRCExpression]) -> O
     # Columns being removed (existentially quantified)
     removed_columns = [c for c in input_columns if c not in projected_underlying]
 
-    # If all output variables are aggregates, the condition stays as-is
-    # (aggregates operate over all rows matching the condition)
-    all_aggregates = all(isinstance(rv, AggregateVariable) for rv in output_variables)
-
-    if not removed_columns or all_aggregates:
-        # No columns removed, or all outputs are aggregates — condition stays the same
+    if not removed_columns:
+        # No columns removed, condition stays the same
         output_condition = relation.condition
     else:
         # Wrap with exists quantifier for the REMOVED columns only.
-        # Result variables are free and must NOT be quantified.
+        # Result variables (and aggregate underlying columns) are free and must NOT be quantified.
         # The body includes the original condition (membership + any filters).
+        output_condition = QuantifierNode(
+            kind="exists",
+            variables=removed_columns,
+            body=relation.condition,
+        )
         output_condition = QuantifierNode(
             kind="exists",
             variables=removed_columns,

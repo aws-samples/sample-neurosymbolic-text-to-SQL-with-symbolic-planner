@@ -146,6 +146,8 @@ async def _run_pipeline(
     question: str, schema: str, config: PlannerConfig, verbose: bool
 ) -> int:
     """Run the text-to-SQL pipeline and print results."""
+    from text_to_sql_planner.types.operation_tree import TableLeafNode, OperatorNode
+
     result = await run(question=question, schema=schema, config=config)
 
     if isinstance(result, TextToSQLSuccess):
@@ -158,6 +160,14 @@ async def _run_pipeline(
 
         print(f"**Generated SQL:**\n")
         print(f"```sql\n{result.sql}\n```\n")
+
+        # Print the operation tree
+        print(f"## Operation Tree\n")
+        print(f"```")
+        _print_tree(result.operation_tree.root, indent=0)
+        print(f"```\n")
+
+        sys.stdout.flush()
         return 0
 
     else:
@@ -165,7 +175,45 @@ async def _run_pipeline(
         print(f"# ❌ Error\n")
         print(f"- **Code:** `{result.code.value}`")
         print(f"- **Message:** {result.error}\n")
+        sys.stdout.flush()
         return 1
+
+
+def _print_tree(node, indent: int = 0) -> None:
+    """Print an operation tree node recursively with indentation."""
+    from text_to_sql_planner.types.operation_tree import TableLeafNode, OperatorNode
+    from text_to_sql_planner.types.operators import (
+        SelectionParams, JoinParams, ProjectionParams,
+    )
+
+    pad = "  " * indent
+    if isinstance(node, TableLeafNode):
+        print(f"{pad}📋 Table: {node.table_name} [{', '.join(node.columns)}]")
+    elif isinstance(node, OperatorNode):
+        params_str = ""
+        if isinstance(node.params, SelectionParams) and node.params.condition:
+            from text_to_sql_planner.printer import pretty_print as pp
+            from text_to_sql_planner.types.drc import DRCExpression, ColumnVariable
+            # Print the condition
+            cond_expr = DRCExpression(
+                result_variables=[ColumnVariable(name="x")],
+                condition=node.params.condition,
+            )
+            pp_result = pp(cond_expr)
+            if isinstance(pp_result, PrintSuccess):
+                # Extract just the condition part (after "| ")
+                cond_str = pp_result.output.split("| ", 1)[-1].rstrip("}")
+                params_str = f" WHERE {cond_str}"
+        elif isinstance(node.params, JoinParams):
+            params_str = f" ON [{', '.join(node.params.join_columns)}]"
+        elif isinstance(node.params, ProjectionParams):
+            params_str = f" [{', '.join(node.params.columns)}]"
+
+        print(f"{pad}🔧 {node.operator}{params_str} → [{', '.join(node.output_columns)}]")
+        for child in node.inputs:
+            _print_tree(child, indent + 1)
+    else:
+        print(f"{pad}? Unknown node: {type(node).__name__}")
 
 
 if __name__ == "__main__":

@@ -181,7 +181,7 @@ class TestJoin:
         assert isinstance(result, OperatorFailure)
 
     def test_output_condition_structure(self):
-        """Join output condition uses exists quantifiers."""
+        """Join output condition is conjunction of both input conditions."""
         r1 = _make_relation(["id", "name"], "employees")
         r2 = _make_relation(["id", "dept"], "departments")
         params = JoinParams(join_columns=["id"])
@@ -189,10 +189,10 @@ class TestJoin:
         result = apply_join(params, [r1, r2])
 
         assert isinstance(result, OperatorSuccess)
-        # Top-level should be an exists quantifier
+        # Top-level should be a logical AND of both conditions
         cond = result.output.condition
-        assert isinstance(cond, QuantifierNode)
-        assert cond.kind == "exists"
+        assert isinstance(cond, LogicalConnectiveNode)
+        assert cond.operator == "and"
 
 
 # --- Projection Tests ---

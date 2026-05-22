@@ -164,7 +164,8 @@ class TestSelection:
         result = convert_to_sql(tree)
 
         assert isinstance(result, SQLSuccess)
-        assert "SELECT * FROM employees WHERE" in result.sql
+        assert "FROM employees" in result.sql
+        assert "WHERE" in result.sql
         assert "age > 30" in result.sql
 
     def test_string_literal_in_condition(self):
@@ -242,7 +243,8 @@ class TestProjection:
         result = convert_to_sql(tree)
 
         assert isinstance(result, SQLSuccess)
-        assert "SELECT name, age FROM employees" in result.sql
+        assert "SELECT name, age" in result.sql
+        assert "FROM employees" in result.sql
 
     def test_single_column(self):
         """Projection with a single column."""
@@ -253,7 +255,8 @@ class TestProjection:
         result = convert_to_sql(tree)
 
         assert isinstance(result, SQLSuccess)
-        assert "SELECT id FROM employees" in result.sql
+        assert "SELECT id" in result.sql
+        assert "FROM employees" in result.sql
 
     def test_error_invalid_column(self):
         """Projection fails when column doesn't exist in input."""
@@ -272,7 +275,7 @@ class TestProjection:
 
 class TestJoin:
     def test_simple_join(self):
-        """Join produces JOIN ON clause."""
+        """Join produces JOIN ON clause with table names."""
         left = _table_leaf("employees", ["id", "name"])
         right = _table_leaf("departments", ["id", "dept_name"])
         node = _join_node(left, right, ["id"])
@@ -283,7 +286,7 @@ class TestJoin:
         assert isinstance(result, SQLSuccess)
         assert "JOIN" in result.sql
         assert "ON" in result.sql
-        assert "t1.id = t2.id" in result.sql
+        assert "employees.id = departments.id" in result.sql
 
     def test_join_with_multiple_columns(self):
         """Join with multiple join columns."""
@@ -295,8 +298,8 @@ class TestJoin:
         result = convert_to_sql(tree)
 
         assert isinstance(result, SQLSuccess)
-        assert "t1.customer_id = t2.customer_id" in result.sql
-        assert "t1.product_id = t2.product_id" in result.sql
+        assert "orders.customer_id = prices.customer_id" in result.sql
+        assert "orders.product_id = prices.product_id" in result.sql
 
     def test_join_output_columns(self):
         """Join includes output columns in SELECT."""
