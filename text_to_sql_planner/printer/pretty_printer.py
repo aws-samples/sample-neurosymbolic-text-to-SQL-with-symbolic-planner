@@ -85,11 +85,15 @@ def pretty_print(expr: DRCExpression) -> PrintResult:
 
 
 def _print_result_variables(variables: list[ResultVariable]) -> str:
-    """Print the result variables as comma-separated list."""
+    """Print the result variables as comma-separated list.
+
+    Plain columns come first, then aggregates.
+    """
     if variables is None:
         raise _PrintInternalError(PrintError(message="Result variables list is None", node=None))
 
-    parts: list[str] = []
+    plain_parts: list[str] = []
+    agg_parts: list[str] = []
     for var in variables:
         if var is None:
             raise _PrintInternalError(PrintError(message="Result variable is None", node=None))
@@ -98,7 +102,7 @@ def _print_result_variables(variables: list[ResultVariable]) -> str:
                 raise _PrintInternalError(
                     PrintError(message="ColumnVariable has empty name", node=var)
                 )
-            parts.append(var.name)
+            plain_parts.append(var.name)
         elif isinstance(var, AggregateVariable):
             if not var.function:
                 raise _PrintInternalError(
@@ -108,12 +112,12 @@ def _print_result_variables(variables: list[ResultVariable]) -> str:
                 raise _PrintInternalError(
                     PrintError(message="AggregateVariable has empty column", node=var)
                 )
-            parts.append(f"{var.function}({var.column})")
+            agg_parts.append(f"{var.function}({var.column})")
         else:
             raise _PrintInternalError(
                 PrintError(message=f"Unknown result variable type: {type(var).__name__}", node=var)
             )
-    return ", ".join(parts)
+    return ", ".join(plain_parts + agg_parts)
 
 
 def _print_condition(node: DRCCondition, parent_precedence: int = 0) -> str:

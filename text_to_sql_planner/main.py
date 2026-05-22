@@ -140,7 +140,7 @@ async def run(
         )
 
     # --- Step 4: Convert operation tree to SQL ---
-    sql_result = convert_to_sql(planner_result.operation_tree)
+    sql_result = convert_to_sql(planner_result.operation_tree, result_variables=target_expression.result_variables)
 
     if not isinstance(sql_result, SQLSuccess):
         return TextToSQLFailure(

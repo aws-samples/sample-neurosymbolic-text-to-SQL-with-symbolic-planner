@@ -51,16 +51,54 @@ SQLResult = Union[SQLSuccess, SQLFailure]
 _AGGREGATE_FUNCS = {"COUNT", "SUM", "AVG", "MIN", "MAX"}
 
 
-def convert_to_sql(tree: OperationTree) -> SQLResult:
+def convert_to_sql(tree: OperationTree, result_variables: list | None = None) -> SQLResult:
     """Convert an OperationTree into a flat SQL SELECT statement.
 
-    Flattens joins and selections into a single SELECT ... FROM ... JOIN ... WHERE ...
+    If result_variables contains a mix of plain columns and aggregates,
+    emits GROUP BY for the plain columns.
+
+    Args:
+        tree: The operation tree.
+        result_variables: The target DRC expression's result variables (optional).
     """
     if tree is None or tree.root is None:
         return SQLFailure(error="Invalid operation tree: root is None")
 
     try:
         sql = _convert_node(tree.root)
+
+        # If we have result_variables with aggregates, wrap with GROUP BY
+        if result_variables:
+            from text_to_sql_planner.types.drc import ColumnVariable, AggregateVariable
+            has_aggregates = any(isinstance(rv, AggregateVariable) for rv in result_variables)
+            plain_cols = [rv.name for rv in result_variables if isinstance(rv, ColumnVariable)]
+            agg_cols = [f"{rv.function}({rv.column})" for rv in result_variables if isinstance(rv, AggregateVariable)]
+
+            if has_aggregates:
+                # Build a new SELECT with proper columns and GROUP BY
+                all_select = []
+                for rv in result_variables:
+                    if isinstance(rv, ColumnVariable):
+                        all_select.append(rv.name)
+                    elif isinstance(rv, AggregateVariable):
+                        all_select.append(f"{rv.function}({rv.column})")
+
+                # If the inner SQL is already a SELECT, wrap it as a subquery
+                select_str = ", ".join(all_select)
+                if sql.strip().upper().startswith("SELECT"):
+                    inner_indented = _indent_sql(sql, indent=4)
+                    parts = [f"SELECT {select_str}"]
+                    parts.append(f"  FROM (\n{inner_indented}\n  ) AS sub")
+                    if plain_cols:
+                        parts.append(f"  GROUP BY {', '.join(plain_cols)}")
+                    sql = "\n".join(parts)
+                else:
+                    parts = [f"SELECT {select_str}"]
+                    parts.append(f"  FROM {sql}")
+                    if plain_cols:
+                        parts.append(f"  GROUP BY {', '.join(plain_cols)}")
+                    sql = "\n".join(parts)
+
         return SQLSuccess(sql=sql)
     except _ConversionError as e:
         return SQLFailure(error=str(e))
@@ -77,6 +115,7 @@ class _FlatQuery:
     from_tables: list[str] = field(default_factory=list)
     join_clauses: list[str] = field(default_factory=list)
     where_conditions: list[str] = field(default_factory=list)
+    group_by_columns: list[str] = field(default_factory=list)
 
     def to_sql(self) -> str:
         cols = ", ".join(self.select_columns) if self.select_columns else "*"
@@ -86,6 +125,8 @@ class _FlatQuery:
             parts.append(f"  {join}")
         if self.where_conditions:
             parts.append(f"  WHERE {' AND '.join(self.where_conditions)}")
+        if self.group_by_columns:
+            parts.append(f"  GROUP BY {', '.join(self.group_by_columns)}")
         return "\n".join(parts)
 
 
@@ -239,7 +280,10 @@ def _convert_union(node: OperatorNode, params: UnionParams) -> str:
     left_sql = _convert_node(inputs[0])
     right_sql = _convert_node(inputs[1])
 
-    return f"({left_sql}) UNION ({right_sql})"
+    left_indented = _indent_sql(left_sql, indent=2)
+    right_indented = _indent_sql(right_sql, indent=2)
+
+    return f"(\n{left_indented}\n)\nUNION\n(\n{right_indented}\n)"
 
 
 def _convert_division(node: OperatorNode, params: DivisionParams) -> str:
@@ -291,6 +335,12 @@ def _get_table_name(node: OperationNode) -> str:
     # For complex nodes, fall back to subquery
     sql = _convert_node(node)
     return f"({sql})"
+
+
+def _indent_sql(sql: str, indent: int = 4) -> str:
+    """Indent each line of a SQL string by the given number of spaces."""
+    pad = " " * indent
+    return "\n".join(f"{pad}{line}" for line in sql.split("\n"))
 
 
 def _get_node_columns(node: OperationNode) -> list[str]:

@@ -158,7 +158,8 @@ CREATE TABLE Job_History (
 
 # QUESTION = "How many employees work at location 'San Francisco'?"
 # QUESTION = "How many employees were born on or after Jan 1, 2000?"
-QUESTION = "How many employees are at least 30 years old?"
+# QUESTION = "How many employees are at least 30 years old?"
+QUESTION = "How many employees are there in each department?"
 
 
 def main():
