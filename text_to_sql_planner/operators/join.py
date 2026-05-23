@@ -110,18 +110,24 @@ def apply_join(params: JoinParams, inputs: list[DRCExpression]) -> OperatorResul
     output_variables: list[ResultVariable] = list(r1.result_variables)
     r2_condition = r2.condition
     r2_renames: dict[str, str] = {}  # old_name -> new_name
+    seen_names: set[str] = set()
+    for rv in r1.result_variables:
+        col_name = rv.name if isinstance(rv, ColumnVariable) else rv.column
+        seen_names.add(col_name)
 
     for rv in r2.result_variables:
         col_name = rv.name if isinstance(rv, ColumnVariable) else rv.column
         if col_name in join_columns:
             continue  # Skip join columns (already in output from r1)
-        if col_name in r1_columns:
+        if col_name in seen_names:
             # Name conflict — rename in r2
             new_name = f"{col_name}_r2"
             r2_renames[col_name] = new_name
             output_variables.append(ColumnVariable(name=new_name))
+            seen_names.add(new_name)
         else:
             output_variables.append(rv)
+            seen_names.add(col_name)
 
     # Apply renames to r2's condition
     for old_name, new_name in r2_renames.items():

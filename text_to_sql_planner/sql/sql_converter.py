@@ -396,9 +396,21 @@ def _condition_to_sql(condition: DRCCondition) -> str:
         raise _ConversionError("Condition is None")
 
     if isinstance(condition, ComparisonNode):
-        left = _condition_to_sql(condition.left)
-        right = _condition_to_sql(condition.right)
-        return f"{left} {condition.operator} {right}"
+        left_node = condition.left
+        right_node = condition.right
+        left = _condition_to_sql(left_node)
+        right = _condition_to_sql(right_node)
+
+        # Normalize: put simple column reference on the left side
+        # Flip the comparison if left is complex (function/literal) and right is a simple variable
+        if _is_complex_expr(left_node) and isinstance(right_node, VariableRefNode):
+            # Flip: "EXPR >= col" → "col <= EXPR"
+            left, right = right, left
+            op = _flip_operator(condition.operator)
+        else:
+            op = condition.operator
+
+        return f"{left} {op} {right}"
 
     elif isinstance(condition, LogicalConnectiveNode):
         left = _condition_to_sql(condition.left)
@@ -430,12 +442,14 @@ def _condition_to_sql(condition: DRCCondition) -> str:
             return "CURRENT_DATE"
         elif condition.function == "DATE_SUB" and len(condition.arguments) == 2:
             base = _condition_to_sql(condition.arguments[0])
-            days = _condition_to_sql(condition.arguments[1])
-            return f"{base} - INTERVAL '{days} days'"
+            days_str = _condition_to_sql(condition.arguments[1])
+            interval = _days_to_interval(days_str)
+            return f"{base} - INTERVAL '{interval}'"
         elif condition.function == "DATE_ADD" and len(condition.arguments) == 2:
             base = _condition_to_sql(condition.arguments[0])
-            days = _condition_to_sql(condition.arguments[1])
-            return f"{base} + INTERVAL '{days} days'"
+            days_str = _condition_to_sql(condition.arguments[1])
+            interval = _days_to_interval(days_str)
+            return f"{base} + INTERVAL '{interval}'"
         elif condition.function == "DATEDIFF" and len(condition.arguments) == 2:
             left = _condition_to_sql(condition.arguments[0])
             right = _condition_to_sql(condition.arguments[1])
@@ -448,3 +462,56 @@ def _condition_to_sql(condition: DRCCondition) -> str:
 
     else:
         raise _ConversionError(f"Unsupported condition type: {type(condition).__name__}")
+
+
+def _is_complex_expr(node) -> bool:
+    """Check if a node is a complex expression (not a simple variable reference)."""
+    from text_to_sql_planner.types.drc import FunctionCallNode, ArithmeticNode, LiteralNode
+    return isinstance(node, (FunctionCallNode, ArithmeticNode, LiteralNode))
+
+
+def _flip_operator(op: str) -> str:
+    """Flip a comparison operator (e.g., >= becomes <=)."""
+    flips = {"<": ">", ">": "<", "<=": ">=", ">=": "<=", "=": "=", "!=": "!="}
+    return flips.get(op, op)
+
+
+def _days_to_interval(days_str: str) -> str:
+    """Convert a number of days to the most readable interval unit.
+
+    Examples:
+        "10950" → "30 years"
+        "365" → "1 year"
+        "730" → "2 years"
+        "30" → "30 days"
+        "90" → "3 months"
+    """
+    try:
+        days = int(days_str)
+    except (ValueError, TypeError):
+        return f"{days_str} days"
+
+    # Check for exact year multiples (using 365 days/year)
+    if days % 365 == 0:
+        years = days // 365
+        if years == 1:
+            return "1 year"
+        return f"{years} years"
+
+    # Check for approximate month multiples (using 30 days/month)
+    if days % 30 == 0 and days < 365:
+        months = days // 30
+        if months == 1:
+            return "1 month"
+        return f"{months} months"
+
+    # Check for week multiples
+    if days % 7 == 0 and days < 30:
+        weeks = days // 7
+        if weeks == 1:
+            return "1 week"
+        return f"{weeks} weeks"
+
+    if days == 1:
+        return "1 day"
+    return f"{days} days"
