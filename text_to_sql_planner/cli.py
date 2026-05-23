@@ -161,6 +161,13 @@ async def _run_pipeline(
         print(f"**Generated SQL:**\n")
         print(f"```sql\n{result.sql}\n```\n")
 
+        # Simplify
+        from text_to_sql_planner.sql import simplify_sql
+        simplified = simplify_sql(result.sql)
+        if simplified != result.sql:
+            print(f"**Simplified SQL:**\n")
+            print(f"```sql\n{simplified}\n```\n")
+
         # Print the operation tree
         print(f"## Operation Tree\n")
         print(f"```")

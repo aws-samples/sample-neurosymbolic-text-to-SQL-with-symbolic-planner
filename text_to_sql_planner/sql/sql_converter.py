@@ -65,17 +65,16 @@ def convert_to_sql(tree: OperationTree, result_variables: list | None = None) ->
         return SQLFailure(error="Invalid operation tree: root is None")
 
     try:
-        sql = _convert_node(tree.root)
-
-        # If we have result_variables with aggregates, wrap with GROUP BY
+        # If we have result_variables with aggregates, use the flattened approach
+        # and add GROUP BY directly
         if result_variables:
             from text_to_sql_planner.types.drc import ColumnVariable, AggregateVariable
             has_aggregates = any(isinstance(rv, AggregateVariable) for rv in result_variables)
-            plain_cols = [rv.name for rv in result_variables if isinstance(rv, ColumnVariable)]
-            agg_cols = [f"{rv.function}({rv.column})" for rv in result_variables if isinstance(rv, AggregateVariable)]
 
             if has_aggregates:
-                # Build a new SELECT with proper columns and GROUP BY
+                plain_cols = [rv.name for rv in result_variables if isinstance(rv, ColumnVariable)]
+                
+                # Build the SELECT column list: plain cols first, then aggregates
                 all_select = []
                 for rv in result_variables:
                     if isinstance(rv, ColumnVariable):
@@ -83,22 +82,14 @@ def convert_to_sql(tree: OperationTree, result_variables: list | None = None) ->
                     elif isinstance(rv, AggregateVariable):
                         all_select.append(f"{rv.function}({rv.column})")
 
-                # If the inner SQL is already a SELECT, wrap it as a subquery
-                select_str = ", ".join(all_select)
-                if sql.strip().upper().startswith("SELECT"):
-                    inner_indented = _indent_sql(sql, indent=4)
-                    parts = [f"SELECT {select_str}"]
-                    parts.append(f"  FROM (\n{inner_indented}\n  ) AS sub")
-                    if plain_cols:
-                        parts.append(f"  GROUP BY {', '.join(plain_cols)}")
-                    sql = "\n".join(parts)
-                else:
-                    parts = [f"SELECT {select_str}"]
-                    parts.append(f"  FROM {sql}")
-                    if plain_cols:
-                        parts.append(f"  GROUP BY {', '.join(plain_cols)}")
-                    sql = "\n".join(parts)
+                # Flatten the tree into a query, then override select columns and add GROUP BY
+                flat = _flatten_to_query(tree.root)
+                flat.select_columns = all_select
+                if plain_cols:
+                    flat.group_by_columns = plain_cols
+                return SQLSuccess(sql=flat.to_sql())
 
+        sql = _convert_node(tree.root)
         return SQLSuccess(sql=sql)
     except _ConversionError as e:
         return SQLFailure(error=str(e))
