@@ -164,7 +164,10 @@ CREATE TABLE Job_History (
 # QUESTION = """\
 # How many employees over the age of 30 and having been working at this company for
 # more than a year are there in each department?"""
-QUESTION = "How many employees have had more than one job at this company?"
+# schema doesn't support:
+#QUESTION = "How many employees have had more than one job at this company?"
+# QUESTION = "How many employees report to each head of department?"
+QUESTION = "List all employees that don't have a performance review"
 
 
 def main():

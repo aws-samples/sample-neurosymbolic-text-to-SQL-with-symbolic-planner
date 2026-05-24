@@ -277,6 +277,9 @@ async def plan(
 
             # We have a new intermediate expression
             new_expr = op_result.output
+            # Simplify the DRC (merge nested quantifiers, etc.)
+            from text_to_sql_planner.drc_simplifier import simplify_drc
+            new_expr = simplify_drc(new_expr)
             new_columns = _get_columns_from_expression(new_expr)
             print(f"✅ **Operator succeeded** — output columns: `{new_columns}`\n")
 

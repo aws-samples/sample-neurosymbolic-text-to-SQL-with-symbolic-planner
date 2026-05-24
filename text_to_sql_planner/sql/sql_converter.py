@@ -31,6 +31,7 @@ from text_to_sql_planner.types.drc import (
     VariableRefNode,
     LiteralNode,
     MembershipNode,
+    QuantifierNode,
     FunctionCallNode,
     DRCCondition,
 )
@@ -436,6 +437,18 @@ def _condition_to_sql(condition: DRCCondition) -> str:
 
     elif isinstance(condition, MembershipNode):
         return ""
+
+    elif isinstance(condition, QuantifierNode):
+        # ∃ vars (body) → EXISTS (SELECT 1 WHERE body_sql)
+        # ∀ vars (body) → NOT EXISTS (SELECT 1 WHERE NOT (body_sql))
+        body_sql = _condition_to_sql(condition.body)
+        if not body_sql:
+            return ""
+        if condition.kind == "exists":
+            return f"EXISTS (SELECT 1 WHERE {body_sql})"
+        elif condition.kind == "forall":
+            return f"NOT EXISTS (SELECT 1 WHERE NOT ({body_sql}))"
+        return body_sql
 
     elif isinstance(condition, FunctionCallNode):
         if condition.function == "CURRENT_DATE":

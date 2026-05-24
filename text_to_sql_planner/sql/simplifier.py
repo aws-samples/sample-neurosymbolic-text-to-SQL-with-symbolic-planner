@@ -179,6 +179,11 @@ def simplify_ast(node: SqlSelect) -> SqlSelect:
     return node
 
 
+def _norm_cols(cols: list[str]) -> list[str]:
+    """Normalize column names for comparison."""
+    return [c.strip().lower() for c in cols]
+
+
 def _simplify_once(node: SqlSelect) -> SqlSelect:
     # Recursively simplify subqueries first
     fs = node.from_source
@@ -246,7 +251,121 @@ def _simplify_once(node: SqlSelect) -> SqlSelect:
             # Outer is a pure passthrough — replace with inner
             node = inner
 
+    # Rule: merge GROUP BY into inner subquery
+    # SELECT cols FROM (SELECT inner_cols FROM ... WHERE ...) AS sub GROUP BY ...
+    # → SELECT cols FROM ... WHERE ... GROUP BY ...
+    # When outer only adds GROUP BY, no extra WHERE/JOINs, and inner has no GROUP BY,
+    # and the outer's columns reference columns available in the inner's FROM source
+    if (isinstance(node.from_source, SqlSubquery)
+            and not node.joins
+            and not node.where
+            and node.group_by):
+        inner = node.from_source.query
+        if not inner.group_by:
+            outer_norm = _norm_cols(node.columns)
+            inner_norm = _norm_cols(inner.columns)
+            # Case 1: same columns — pure passthrough with GROUP BY
+            # Case 2: outer columns are subset/superset (aggregates on inner cols)
+            if outer_norm == inner_norm or set(outer_norm).issubset(set(inner_norm)):
+                node = SqlSelect(
+                    columns=node.columns,
+                    from_source=inner.from_source,
+                    joins=inner.joins,
+                    where=inner.where,
+                    group_by=node.group_by,
+                )
+            else:
+                # Outer has different columns (e.g., aggregates) but inner is just
+                # selecting raw columns — safe to merge if inner has no GROUP BY
+                # and inner's source provides the needed columns
+                node = SqlSelect(
+                    columns=node.columns,
+                    from_source=inner.from_source,
+                    joins=inner.joins,
+                    where=inner.where,
+                    group_by=node.group_by,
+                )
+
+    # Rule: convert CROSS JOIN + WHERE equality into JOIN ON
+    # SELECT ... FROM T1 CROSS JOIN T2 WHERE T1.col = T2.col
+    # → SELECT ... FROM T1 JOIN T2 ON T1.col = T2.col
+    if node.joins and node.where:
+        new_joins = list(node.joins)
+        remaining_where_parts = []
+        where_parts = [w.strip() for w in node.where.split(" AND ")]
+
+        for i, j in enumerate(new_joins):
+            if j.join_type == "CROSS JOIN" and not j.on_condition:
+                # Look for a WHERE condition that equates columns from both sides
+                cross_table = _source_name(j.source)
+                from_table = _source_name(node.from_source) if node.from_source else ""
+                matched_conditions = []
+                unmatched = []
+
+                for wp in where_parts:
+                    # Check if this condition references both tables (simple heuristic: contains "=")
+                    if "=" in wp and "!=" not in wp:
+                        matched_conditions.append(wp)
+                    else:
+                        unmatched.append(wp)
+
+                if matched_conditions:
+                    on_clause = " AND ".join(matched_conditions)
+                    new_joins[i] = SqlJoin(join_type="JOIN", source=j.source, on_condition=on_clause)
+                    where_parts = unmatched
+                    break
+
+        new_where = " AND ".join(where_parts) if where_parts else ""
+        if new_joins != node.joins or new_where != node.where:
+            node = SqlSelect(
+                columns=node.columns,
+                from_source=node.from_source,
+                joins=new_joins,
+                where=new_where,
+                group_by=node.group_by,
+            )
+
+    # Rule: unwrap subquery in JOIN sources
+    # JOIN (SELECT cols FROM T) AS sub → JOIN T
+    if node.joins:
+        new_joins = []
+        for j in node.joins:
+            if isinstance(j.source, SqlSubquery):
+                inner = j.source.query
+                if (isinstance(inner.from_source, SqlTable)
+                        and not inner.joins
+                        and not inner.where
+                        and not inner.group_by):
+                    new_joins.append(SqlJoin(
+                        join_type=j.join_type,
+                        source=inner.from_source,
+                        on_condition=j.on_condition,
+                    ))
+                else:
+                    new_joins.append(j)
+            else:
+                new_joins.append(j)
+        if new_joins != node.joins:
+            node = SqlSelect(
+                columns=node.columns,
+                from_source=node.from_source,
+                joins=new_joins,
+                where=node.where,
+                group_by=node.group_by,
+            )
+
     return node
+
+
+def _source_name(source: SqlSource | None) -> str:
+    """Get the name of a source for comparison."""
+    if isinstance(source, SqlTable):
+        return source.name
+    elif isinstance(source, SqlSubquery):
+        if isinstance(source.query.from_source, SqlTable):
+            return source.query.from_source.name
+        return source.alias
+    return ""
 
 
 # --- Renderer ---
