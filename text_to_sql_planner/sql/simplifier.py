@@ -130,7 +130,17 @@ def _parse_source(text: str) -> tuple[SqlSource, str]:
     else:
         m = re.match(r"(\w+)", text)
         if m:
-            return SqlTable(name=m.group(1)), text[m.end():]
+            table_name = m.group(1)
+            rest = text[m.end():].strip()
+            # Consume optional alias (a word that's not a SQL keyword)
+            alias_match = re.match(r"(\w+)", rest)
+            if alias_match:
+                potential_alias = alias_match.group(1).upper()
+                # Don't consume SQL keywords as aliases
+                keywords = {"WHERE", "JOIN", "CROSS", "ON", "GROUP", "ORDER", "HAVING", "LIMIT", "UNION", "AS", "LEFT", "RIGHT", "INNER", "OUTER", "FULL"}
+                if potential_alias not in keywords:
+                    rest = rest[alias_match.end():]
+            return SqlTable(name=table_name), rest
         return SqlTable(name=text), ""
 
 
