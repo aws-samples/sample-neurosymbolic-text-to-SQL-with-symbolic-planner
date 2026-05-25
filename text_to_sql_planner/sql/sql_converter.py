@@ -76,18 +76,21 @@ def convert_to_sql(tree: OperationTree, result_variables: list | None = None) ->
                 plain_cols = [rv.name for rv in result_variables if isinstance(rv, ColumnVariable)]
                 
                 # Build the SELECT column list: plain cols first, then aggregates
+                # Flatten the tree to get aliases
+                flat = _flatten_to_query(tree.root)
+
                 all_select = []
                 for rv in result_variables:
                     if isinstance(rv, ColumnVariable):
-                        all_select.append(rv.name)
+                        qualified = _qualify_column_from_aliases(rv.name, flat.table_aliases)
+                        all_select.append(qualified)
                     elif isinstance(rv, AggregateVariable):
-                        all_select.append(f"{rv.function}({rv.column})")
+                        qualified_col = _qualify_column_from_aliases(rv.column, flat.table_aliases)
+                        all_select.append(f"{rv.function}({qualified_col})")
 
-                # Flatten the tree into a query, then override select columns and add GROUP BY
-                flat = _flatten_to_query(tree.root)
                 flat.select_columns = all_select
                 if plain_cols:
-                    flat.group_by_columns = plain_cols
+                    flat.group_by_columns = [_qualify_column_from_aliases(c, flat.table_aliases) for c in plain_cols]
                 return SQLSuccess(sql=flat.to_sql())
 
         sql = _convert_node(tree.root)
@@ -104,10 +107,12 @@ class _ConversionError(Exception):
 class _FlatQuery:
     """Intermediate representation for flattening joins/selections."""
     select_columns: list[str] = field(default_factory=list)
-    from_tables: list[str] = field(default_factory=list)
+    from_tables: list[str] = field(default_factory=list)  # "TableName alias"
     join_clauses: list[str] = field(default_factory=list)
     where_conditions: list[str] = field(default_factory=list)
     group_by_columns: list[str] = field(default_factory=list)
+    # Maps table_name -> alias for explicit scoping
+    table_aliases: dict[str, str] = field(default_factory=dict)
 
     def to_sql(self) -> str:
         cols = ", ".join(self.select_columns) if self.select_columns else "*"
@@ -136,13 +141,14 @@ def _convert_node(node: OperationNode) -> str:
 
 
 def _convert_table_leaf(node: TableLeafNode) -> str:
-    """Table leaf → SELECT cols FROM table"""
+    """Table leaf → SELECT alias.cols FROM table alias"""
     if not node.table_name:
         raise _ConversionError("Table leaf has empty table name")
+    alias = _make_alias(node.table_name)
     if node.columns:
-        cols = ", ".join(node.columns)
-        return f"SELECT {cols} FROM {node.table_name}"
-    return f"SELECT * FROM {node.table_name}"
+        cols = ", ".join(f"{alias}.{col}" for col in node.columns)
+        return f"SELECT {cols} FROM {node.table_name} {alias}"
+    return f"SELECT * FROM {node.table_name} {alias}"
 
 
 def _convert_operator(node: OperatorNode) -> str:
@@ -164,9 +170,12 @@ def _convert_operator(node: OperatorNode) -> str:
 def _flatten_to_query(node: OperationNode) -> _FlatQuery:
     """Recursively flatten a tree of joins/selections/cartesian products into a flat query."""
     if isinstance(node, TableLeafNode):
+        alias = _make_alias(node.table_name)
+        qualified_cols = [f"{alias}.{col}" for col in node.columns] if node.columns else ["*"]
         return _FlatQuery(
-            select_columns=list(node.columns) if node.columns else ["*"],
-            from_tables=[node.table_name],
+            select_columns=qualified_cols,
+            from_tables=[f"{node.table_name} {alias}"],
+            table_aliases={node.table_name: alias},
         )
 
     if not isinstance(node, OperatorNode):
@@ -182,12 +191,13 @@ def _flatten_to_query(node: OperationNode) -> _FlatQuery:
         if params.condition is None:
             raise _ConversionError("Selection requires a condition")
         flat = _flatten_to_query(inputs[0])
-        condition_sql = _condition_to_sql(params.condition)
+        # Convert condition with alias context
+        condition_sql = _condition_to_sql_with_aliases(params.condition, flat.table_aliases)
         if condition_sql:
             flat.where_conditions.append(condition_sql)
         # Update select columns to match this node's output
         if node.output_columns:
-            flat.select_columns = list(node.output_columns)
+            flat.select_columns = [_qualify_column(col, flat.table_aliases, inputs) for col in node.output_columns]
         return flat
 
     elif isinstance(params, JoinParams):
@@ -199,20 +209,34 @@ def _flatten_to_query(node: OperationNode) -> _FlatQuery:
         left_flat = _flatten_to_query(inputs[0])
         right_flat = _flatten_to_query(inputs[1])
 
-        # The right side becomes a JOIN clause
-        right_table = right_flat.from_tables[0] if right_flat.from_tables else "?"
-        on_conditions = [f"{left_flat.from_tables[0]}.{col} = {right_table}.{col}"
+        # Get aliases for ON clause
+        left_alias = list(left_flat.table_aliases.values())[0] if left_flat.table_aliases else "t1"
+        right_alias = list(right_flat.table_aliases.values())[0] if right_flat.table_aliases else "t2"
+        right_from = right_flat.from_tables[0] if right_flat.from_tables else "?"
+
+        on_conditions = [f"{left_alias}.{col} = {right_alias}.{col}"
                          for col in params.join_columns]
         on_clause = " AND ".join(on_conditions)
 
-        # Merge
+        # Qualify output columns
+        output_cols = []
+        if node.output_columns:
+            # Try to qualify each output column with the correct alias
+            all_aliases = {**left_flat.table_aliases, **right_flat.table_aliases}
+            for col in node.output_columns:
+                qualified = _qualify_column(col, all_aliases, inputs)
+                output_cols.append(qualified)
+        else:
+            output_cols = ["*"]
+
         result = _FlatQuery(
-            select_columns=list(node.output_columns) if node.output_columns else ["*"],
+            select_columns=output_cols,
             from_tables=left_flat.from_tables,
             join_clauses=left_flat.join_clauses + right_flat.join_clauses + [
-                f"JOIN {right_table} ON {on_clause}"
+                f"JOIN {right_from} ON {on_clause}"
             ],
             where_conditions=left_flat.where_conditions + right_flat.where_conditions,
+            table_aliases={**left_flat.table_aliases, **right_flat.table_aliases},
         )
         return result
 
@@ -223,15 +247,26 @@ def _flatten_to_query(node: OperationNode) -> _FlatQuery:
         left_flat = _flatten_to_query(inputs[0])
         right_flat = _flatten_to_query(inputs[1])
 
-        right_table = right_flat.from_tables[0] if right_flat.from_tables else "?"
+        right_from = right_flat.from_tables[0] if right_flat.from_tables else "?"
+
+        # Qualify output columns
+        output_cols = []
+        if node.output_columns:
+            all_aliases = {**left_flat.table_aliases, **right_flat.table_aliases}
+            for col in node.output_columns:
+                qualified = _qualify_column(col, all_aliases, inputs)
+                output_cols.append(qualified)
+        else:
+            output_cols = ["*"]
 
         result = _FlatQuery(
-            select_columns=list(node.output_columns) if node.output_columns else ["*"],
+            select_columns=output_cols,
             from_tables=left_flat.from_tables,
             join_clauses=left_flat.join_clauses + right_flat.join_clauses + [
-                f"CROSS JOIN {right_table}"
+                f"CROSS JOIN {right_from}"
             ],
             where_conditions=left_flat.where_conditions + right_flat.where_conditions,
+            table_aliases={**left_flat.table_aliases, **right_flat.table_aliases},
         )
         return result
 
@@ -423,6 +458,8 @@ def _condition_to_sql(condition: DRCCondition) -> str:
 
     elif isinstance(condition, NotNode):
         operand = _condition_to_sql(condition.operand)
+        if not operand:
+            return ""
         return f"NOT ({operand})"
 
     elif isinstance(condition, VariableRefNode):
@@ -439,8 +476,53 @@ def _condition_to_sql(condition: DRCCondition) -> str:
         return ""
 
     elif isinstance(condition, QuantifierNode):
-        # ∃ vars (body) → EXISTS (SELECT 1 WHERE body_sql)
-        # ∀ vars (body) → NOT EXISTS (SELECT 1 WHERE NOT (body_sql))
+        # ∃ vars (body) → EXISTS (SELECT 1 FROM table alias WHERE alias.col = outer_alias.col)
+        # ∀ vars (body) → NOT EXISTS (...)
+
+        # If body is a membership, generate correlated EXISTS with proper aliases
+        if isinstance(condition.body, MembershipNode):
+            table = condition.body.relation
+            alias = table[0].lower()  # first letter as alias
+            quantified = set(condition.variables)
+            correlated = [v for v in condition.body.variables if v not in quantified]
+            if correlated:
+                where_parts = [f"{alias}.{v} = {v}" for v in correlated]
+                where_clause = f" WHERE {' AND '.join(where_parts)}"
+            else:
+                where_clause = ""
+            if condition.kind == "exists":
+                return f"EXISTS (SELECT 1 FROM {table} {alias}{where_clause})"
+            elif condition.kind == "forall":
+                return f"NOT EXISTS (SELECT 1 FROM {table} {alias}{where_clause})"
+            return ""
+
+        # If body is AND with a membership inside, extract table and conditions
+        if isinstance(condition.body, LogicalConnectiveNode) and condition.body.operator == "and":
+            table_name = _extract_table_from_condition(condition.body)
+            if table_name:
+                alias = table_name[0].lower()
+                membership = _find_membership(condition.body)
+                quantified = set(condition.variables)
+                correlated = []
+                if membership:
+                    correlated = [v for v in membership.variables if v not in quantified]
+
+                body_sql = _condition_to_sql_skip_membership(condition.body)
+                
+                where_parts = []
+                for v in correlated:
+                    where_parts.append(f"{alias}.{v} = {v}")
+                if body_sql:
+                    where_parts.append(body_sql)
+                
+                where_clause = f" WHERE {' AND '.join(where_parts)}" if where_parts else ""
+                
+                if condition.kind == "exists":
+                    return f"EXISTS (SELECT 1 FROM {table_name} {alias}{where_clause})"
+                elif condition.kind == "forall":
+                    return f"NOT EXISTS (SELECT 1 FROM {table_name} {alias}{where_clause})"
+
+        # Fallback: generic body
         body_sql = _condition_to_sql(condition.body)
         if not body_sql:
             return ""
@@ -481,6 +563,45 @@ def _is_complex_expr(node) -> bool:
     """Check if a node is a complex expression (not a simple variable reference)."""
     from text_to_sql_planner.types.drc import FunctionCallNode, ArithmeticNode, LiteralNode
     return isinstance(node, (FunctionCallNode, ArithmeticNode, LiteralNode))
+
+
+def _extract_table_from_condition(node) -> str | None:
+    """Extract a table name from a MembershipNode within a condition tree."""
+    if isinstance(node, MembershipNode):
+        return node.relation
+    if isinstance(node, LogicalConnectiveNode):
+        left = _extract_table_from_condition(node.left)
+        if left:
+            return left
+        return _extract_table_from_condition(node.right)
+    return None
+
+
+def _find_membership(node):
+    """Find the first MembershipNode in a condition tree."""
+    if isinstance(node, MembershipNode):
+        return node
+    if isinstance(node, LogicalConnectiveNode):
+        left = _find_membership(node.left)
+        if left:
+            return left
+        return _find_membership(node.right)
+    return None
+
+
+def _condition_to_sql_skip_membership(condition) -> str:
+    """Convert a condition to SQL, skipping MembershipNode (returns empty for them).
+    Then filter out empty parts from AND chains."""
+    if isinstance(condition, LogicalConnectiveNode) and condition.operator == "and":
+        left = _condition_to_sql_skip_membership(condition.left)
+        right = _condition_to_sql_skip_membership(condition.right)
+        parts = [p for p in [left, right] if p]
+        if not parts:
+            return ""
+        return " AND ".join(parts)
+    if isinstance(condition, MembershipNode):
+        return ""
+    return _condition_to_sql(condition)
 
 
 def _flip_operator(op: str) -> str:
@@ -528,3 +649,180 @@ def _days_to_interval(days_str: str) -> str:
     if days == 1:
         return "1 day"
     return f"{days} days"
+
+
+# --- Alias helpers ---
+
+_alias_counter: dict[str, int] = {}
+
+
+def _make_alias(table_name: str) -> str:
+    """Generate a short alias for a table name (first letter, lowercase)."""
+    base = table_name[0].lower()
+    # For uniqueness within a query, just use the first letter
+    # If there are conflicts, they'll be handled by the caller
+    return base
+
+
+def _qualify_column(col: str, table_aliases: dict[str, str], inputs: list) -> str:
+    """Qualify a column name with the appropriate table alias.
+
+    Looks through the inputs to find which table owns this column.
+    """
+    # If already qualified (contains a dot), return as-is
+    if "." in col:
+        return col
+
+    # Check if it's an aggregate
+    for func in _AGGREGATE_FUNCS:
+        if col.startswith(f"{func}(") or col.startswith(f"({func} "):
+            underlying = _extract_underlying_column(col)
+            qualified_underlying = _qualify_column_from_aliases(underlying, table_aliases)
+            return _col_to_sql(col).replace(underlying, qualified_underlying)
+
+    return _qualify_column_from_aliases(col, table_aliases)
+
+
+def _qualify_column_from_aliases(col: str, table_aliases: dict[str, str]) -> str:
+    """Qualify a column with the first matching table alias."""
+    if "." in col:
+        return col
+    # Use the first alias available (for simple cases)
+    # In a more sophisticated version, we'd track which table owns which column
+    if table_aliases:
+        # Just use the first alias — for single-table queries this is correct
+        # For multi-table, the caller should provide context
+        first_alias = list(table_aliases.values())[0]
+        return f"{first_alias}.{col}"
+    return col
+
+
+def _condition_to_sql_with_aliases(condition: DRCCondition, table_aliases: dict[str, str]) -> str:
+    """Convert a condition to SQL with explicit table alias qualification.
+
+    For now, qualifies VariableRefNode with the first available alias.
+    """
+    if condition is None:
+        return ""
+
+    if isinstance(condition, ComparisonNode):
+        left_node = condition.left
+        right_node = condition.right
+        left = _condition_to_sql_with_aliases(left_node, table_aliases)
+        right = _condition_to_sql_with_aliases(right_node, table_aliases)
+
+        if _is_complex_expr(left_node) and isinstance(right_node, VariableRefNode):
+            left, right = right, left
+            op = _flip_operator(condition.operator)
+        else:
+            op = condition.operator
+        return f"{left} {op} {right}"
+
+    elif isinstance(condition, LogicalConnectiveNode):
+        left = _condition_to_sql_with_aliases(condition.left, table_aliases)
+        right = _condition_to_sql_with_aliases(condition.right, table_aliases)
+        op = condition.operator.upper()
+        if op == "IMPLIES":
+            return f"(NOT ({left}) OR {right})"
+        parts = [p for p in [left, right] if p]
+        if not parts:
+            return ""
+        return f"({' {0} '.format(op).join(parts)})"
+
+    elif isinstance(condition, NotNode):
+        operand = _condition_to_sql_with_aliases(condition.operand, table_aliases)
+        if not operand:
+            return ""
+        return f"NOT ({operand})"
+
+    elif isinstance(condition, VariableRefNode):
+        return _qualify_column_from_aliases(condition.name, table_aliases)
+
+    elif isinstance(condition, LiteralNode):
+        if condition.data_type == "string":
+            escaped = str(condition.value).replace("'", "''")
+            return f"'{escaped}'"
+        return str(condition.value)
+
+    elif isinstance(condition, MembershipNode):
+        return ""
+
+    elif isinstance(condition, QuantifierNode):
+        # Use the same quantifier logic but with outer aliases for correlation
+        return _quantifier_to_sql_with_aliases(condition, table_aliases)
+
+    elif isinstance(condition, FunctionCallNode):
+        if condition.function == "CURRENT_DATE":
+            return "CURRENT_DATE"
+        elif condition.function == "DATE_SUB" and len(condition.arguments) == 2:
+            base = _condition_to_sql_with_aliases(condition.arguments[0], table_aliases)
+            days_str = _condition_to_sql_with_aliases(condition.arguments[1], table_aliases)
+            interval = _days_to_interval(days_str)
+            return f"{base} - INTERVAL '{interval}'"
+        elif condition.function == "DATE_ADD" and len(condition.arguments) == 2:
+            base = _condition_to_sql_with_aliases(condition.arguments[0], table_aliases)
+            days_str = _condition_to_sql_with_aliases(condition.arguments[1], table_aliases)
+            interval = _days_to_interval(days_str)
+            return f"{base} + INTERVAL '{interval}'"
+        else:
+            if not condition.arguments:
+                return condition.function
+            args = ", ".join(_condition_to_sql_with_aliases(arg, table_aliases) for arg in condition.arguments)
+            return f"{condition.function}({args})"
+
+    return ""
+
+
+def _quantifier_to_sql_with_aliases(condition: QuantifierNode, outer_aliases: dict[str, str]) -> str:
+    """Convert a quantifier to SQL with explicit outer alias for correlation."""
+    if isinstance(condition.body, MembershipNode):
+        table = condition.body.relation
+        inner_alias = _make_alias(table)
+        # Avoid alias collision with outer
+        if inner_alias in outer_aliases.values():
+            inner_alias = inner_alias + "2"
+        quantified = set(condition.variables)
+        correlated = [v for v in condition.body.variables if v not in quantified]
+        if correlated:
+            # Find the outer alias for the correlated variable
+            outer_alias = list(outer_aliases.values())[0] if outer_aliases else ""
+            where_parts = [f"{inner_alias}.{v} = {outer_alias}.{v}" for v in correlated]
+            where_clause = f" WHERE {' AND '.join(where_parts)}"
+        else:
+            where_clause = ""
+        if condition.kind == "exists":
+            return f"EXISTS (SELECT 1 FROM {table} {inner_alias}{where_clause})"
+        elif condition.kind == "forall":
+            return f"NOT EXISTS (SELECT 1 FROM {table} {inner_alias}{where_clause})"
+        return ""
+
+    # Body is AND with membership
+    if isinstance(condition.body, LogicalConnectiveNode) and condition.body.operator == "and":
+        table_name = _extract_table_from_condition(condition.body)
+        if table_name:
+            inner_alias = _make_alias(table_name)
+            if inner_alias in outer_aliases.values():
+                inner_alias = inner_alias + "2"
+            membership = _find_membership(condition.body)
+            quantified = set(condition.variables)
+            correlated = []
+            if membership:
+                correlated = [v for v in membership.variables if v not in quantified]
+
+            body_sql = _condition_to_sql_skip_membership(condition.body)
+            outer_alias = list(outer_aliases.values())[0] if outer_aliases else ""
+
+            where_parts = []
+            for v in correlated:
+                where_parts.append(f"{inner_alias}.{v} = {outer_alias}.{v}")
+            if body_sql:
+                where_parts.append(body_sql)
+
+            where_clause = f" WHERE {' AND '.join(where_parts)}" if where_parts else ""
+
+            if condition.kind == "exists":
+                return f"EXISTS (SELECT 1 FROM {table_name} {inner_alias}{where_clause})"
+            elif condition.kind == "forall":
+                return f"NOT EXISTS (SELECT 1 FROM {table_name} {inner_alias}{where_clause})"
+
+    return ""

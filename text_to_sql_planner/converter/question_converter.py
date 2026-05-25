@@ -103,6 +103,13 @@ async def convert_question(
             result = parse(raw_lisp)
 
             if isinstance(result, ParserSuccess):
+                # Validate: check for unquantified free variables
+                validation_error = _validate_free_variables(result.expression)
+                if validation_error:
+                    last_error = validation_error
+                    print(f"⚠️ **Validation failed:** {validation_error}\n")
+                    continue
+
                 print(f"✅ **Parse succeeded**\n")
                 pp = pretty_print_indented(result.expression)
                 if isinstance(pp, PrintSuccess):
@@ -139,3 +146,107 @@ async def convert_question(
         attempts=max_attempts,
         last_raw_output=last_raw_output,
     )
+
+
+def _validate_free_variables(expr: DRCExpression) -> str | None:
+    """Check that no variables are free in the condition except result variables.
+
+    Returns an error message if invalid, None if valid.
+    """
+    from text_to_sql_planner.types.drc import (
+        ColumnVariable, AggregateVariable, QuantifierNode,
+        LogicalConnectiveNode, NotNode, ComparisonNode,
+        MembershipNode, ArithmeticNode, VariableRefNode,
+        LiteralNode, FunctionCallNode,
+    )
+
+    # Collect result variable names (these are allowed to be free)
+    result_var_names: set[str] = set()
+    for rv in expr.result_variables:
+        if isinstance(rv, ColumnVariable):
+            result_var_names.add(rv.name)
+        elif isinstance(rv, AggregateVariable):
+            result_var_names.add(rv.column)
+
+    # Collect all variables used in the condition
+    all_vars: set[str] = set()
+    _collect_vars(expr.condition, all_vars)
+
+    # Collect all quantified (bound) variables
+    bound_vars: set[str] = set()
+    _collect_bound_vars(expr.condition, bound_vars)
+
+    # Free variables = all_vars - bound_vars - result_var_names
+    free_vars = all_vars - bound_vars - result_var_names
+
+    if free_vars:
+        return (
+            f"Unquantified free variables: {sorted(free_vars)}. "
+            f"These must be wrapped in (exists ...). "
+            f"Result variables are: {sorted(result_var_names)}"
+        )
+    return None
+
+
+def _collect_vars(node, vars_set: set[str]) -> None:
+    """Collect all variable names used in a condition tree."""
+    from text_to_sql_planner.types.drc import (
+        QuantifierNode, LogicalConnectiveNode, NotNode, ComparisonNode,
+        MembershipNode, ArithmeticNode, VariableRefNode, LiteralNode, FunctionCallNode,
+    )
+
+    if node is None:
+        return
+    if isinstance(node, VariableRefNode):
+        vars_set.add(node.name)
+    elif isinstance(node, MembershipNode):
+        for v in node.variables:
+            vars_set.add(v)
+    elif isinstance(node, QuantifierNode):
+        # Quantified vars are used but also bound
+        for v in node.variables:
+            vars_set.add(v)
+        _collect_vars(node.body, vars_set)
+    elif isinstance(node, LogicalConnectiveNode):
+        _collect_vars(node.left, vars_set)
+        _collect_vars(node.right, vars_set)
+    elif isinstance(node, NotNode):
+        _collect_vars(node.operand, vars_set)
+    elif isinstance(node, ComparisonNode):
+        _collect_vars(node.left, vars_set)
+        _collect_vars(node.right, vars_set)
+    elif isinstance(node, ArithmeticNode):
+        _collect_vars(node.left, vars_set)
+        _collect_vars(node.right, vars_set)
+    elif isinstance(node, FunctionCallNode):
+        for arg in node.arguments:
+            _collect_vars(arg, vars_set)
+
+
+def _collect_bound_vars(node, bound_set: set[str]) -> None:
+    """Collect all variables that are bound by quantifiers."""
+    from text_to_sql_planner.types.drc import (
+        QuantifierNode, LogicalConnectiveNode, NotNode, ComparisonNode,
+        MembershipNode, ArithmeticNode, FunctionCallNode,
+    )
+
+    if node is None:
+        return
+    if isinstance(node, QuantifierNode):
+        for v in node.variables:
+            bound_set.add(v)
+        _collect_bound_vars(node.body, bound_set)
+    elif isinstance(node, LogicalConnectiveNode):
+        _collect_bound_vars(node.left, bound_set)
+        _collect_bound_vars(node.right, bound_set)
+    elif isinstance(node, NotNode):
+        _collect_bound_vars(node.operand, bound_set)
+    elif isinstance(node, ComparisonNode):
+        _collect_bound_vars(node.left, bound_set)
+        _collect_bound_vars(node.right, bound_set)
+    elif isinstance(node, ArithmeticNode):
+        _collect_bound_vars(node.left, bound_set)
+        _collect_bound_vars(node.right, bound_set)
+    elif isinstance(node, FunctionCallNode):
+        for arg in node.arguments:
+            _collect_bound_vars(arg, bound_set)

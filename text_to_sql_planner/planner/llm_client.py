@@ -238,7 +238,7 @@ Syntax rules:
 
 IMPORTANT RULES:
 - Result variables are FREE variables — they must NOT appear as quantified variables.
-- Any variable that appears in a membership (in ...) but is NOT a result variable and NOT the column being aggregated MUST be existentially quantified.
+- CRITICAL: Every variable in a membership (in ...) that is NOT a result variable and NOT the column being aggregated MUST be wrapped in an existential quantifier (exists ...). There must be NO free variables in the condition other than the result variables (and aggregate columns). If a table has 10 columns but you only need 2 as result variables, the other 8 MUST be existentially quantified.
 - When the question asks "how many", "count", "total number of", etc., use (COUNT col) in the result variables.
 - For age/date calculations, use CURRENT_DATE and (DATE_SUB CURRENT_DATE days). For example, "at least 30 years old" means (>= (DATE_SUB CURRENT_DATE 10950) date_of_birth) where 10950 = 30*365.
 - Quantifiers bind variables; membership (in) constrains them to a table. Always pair them.
@@ -249,6 +249,11 @@ Question: "Find all employees in department 5"
 Schema: CREATE TABLE employees (id INT, name VARCHAR, dept_id INT)
 Answer: (drc (id name dept_id) (and (in (id name dept_id) employees) (= dept_id 5)))
 
+Question: "Find employee names in department 5"
+Schema: CREATE TABLE employees (id INT, name VARCHAR, dept_id INT)
+Answer: (drc (name) (exists (id dept_id) (and (in (id name dept_id) employees) (= dept_id 5))))
+Note: id and dept_id are NOT result variables, so they MUST be existentially quantified.
+
 Question: "How many students are enrolled in CS courses?"
 Schema: CREATE TABLE Students (s_id INT, name VARCHAR); CREATE TABLE Enrolled (s_id INT, c_id INT); CREATE TABLE Courses (c_id INT, c_type VARCHAR)
 Answer: (drc ((COUNT s_id)) (exists (name) (and (in (s_id name) Students) (exists (es ec) (and (in (es ec) Enrolled) (= es s_id) (exists (cc ctype) (and (in (cc ctype) Courses) (= cc ec) (= ctype "Computer Science"))))))))
@@ -256,6 +261,11 @@ Answer: (drc ((COUNT s_id)) (exists (name) (and (in (s_id name) Students) (exist
 Question: "What is the average grade of students in course 101?"
 Schema: CREATE TABLE Enrolled (s_id INT, c_id INT, grade INT)
 Answer: (drc ((AVG grade)) (exists (s_id c_id) (and (in (s_id c_id grade) Enrolled) (= c_id 101))))
+
+Question: "Find employees who have no performance reviews"
+Schema: CREATE TABLE Employees (emp_id INT, first_name VARCHAR, last_name VARCHAR, dept_id INT); CREATE TABLE Reviews (review_id INT, emp_id INT, rating INT)
+Answer: (drc (emp_id first_name last_name) (exists (dept_id) (and (in (emp_id first_name last_name dept_id) Employees) (not (exists (review_id rating) (in (review_id emp_id rating) Reviews))))))
+Note: dept_id is NOT a result variable so it's quantified. emp_id IS a result variable so it stays free.
 
 Return ONLY the DRC expression in Lisp syntax, nothing else."""
 
