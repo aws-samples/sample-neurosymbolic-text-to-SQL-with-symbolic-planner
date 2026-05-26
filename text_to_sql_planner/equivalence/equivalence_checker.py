@@ -186,12 +186,16 @@ async def check_equivalence(
     expr1: DRCExpression,
     expr2: DRCExpression,
     config: EquivalenceCheckerConfig | None = None,
+    schema_types: dict[str, str] | None = None,
 ) -> EquivalenceResult:
     """Check if two DRC expressions are logically equivalent using cvc5.
 
     Two DRC expressions are equivalent iff:
     1. They have the same result variable structure (same types, same aggregates)
     2. For all values of the result variables, their conditions are equivalent (C1 ↔ C2)
+
+    Args:
+        schema_types: Optional dict mapping column_name -> "Int"|"String" from the DB schema.
     """
     if config is None:
         config = EquivalenceCheckerConfig()
@@ -216,7 +220,7 @@ async def check_equivalence(
     print(f"\n### cvc5 equivalence check\n", flush=True)
 
     # Build the proper equivalence check script
-    script = _build_equivalence_script(expr1, expr2)
+    script = _build_equivalence_script(expr1, expr2, schema_types=schema_types)
 
     print(f"#### SMT-LIB script ({len(script)} chars)\n")
     print(f"```smt2\n{_indent_smt(script)}\n```\n")
@@ -232,7 +236,7 @@ async def check_equivalence(
     return result
 
 
-def _build_equivalence_script(expr1: DRCExpression, expr2: DRCExpression) -> str:
+def _build_equivalence_script(expr1: DRCExpression, expr2: DRCExpression, schema_types: dict[str, str] | None = None) -> str:
     """Build SMT-LIB script to check equivalence of two DRC expressions.
 
     For {x1,...,xn | C1} and {x1,...,xn | C2}, we check:
@@ -253,16 +257,15 @@ def _build_equivalence_script(expr1: DRCExpression, expr2: DRCExpression) -> str
         elif isinstance(rv, AggregateVariable):
             result_vars.append(rv.column)
 
-    # Convert both conditions to SMT-LIB formulas
-    formula1 = convert_condition_to_formula(expr1.condition)
-    formula2 = convert_condition_to_formula(expr2.condition)
+    # Convert both conditions to SMT-LIB formulas — done AFTER type computation
+    # (placeholder — actual conversion happens below after types are resolved)
 
     # Collect all symbols (relations and variables) from both conditions
     rels1, vars1 = collect_symbols(expr1.condition)
     rels2, vars2 = collect_symbols(expr2.condition)
 
     # Infer variable types from both conditions
-    from .smt_converter import collect_var_types, _collect_relation_sorts
+    from .smt_converter import collect_var_types, _collect_relation_sorts, _convert_node
     var_types1 = collect_var_types(expr1.condition)
     var_types2 = collect_var_types(expr2.condition)
     # Merge: String wins over Int (more specific)
@@ -271,6 +274,12 @@ def _build_equivalence_script(expr1: DRCExpression, expr2: DRCExpression) -> str
         for v, t in vt.items():
             if t == "String" or v not in all_var_types:
                 all_var_types[v] = t
+
+    # Apply schema types (authoritative source — overrides inference)
+    if schema_types:
+        for v, t in schema_types.items():
+            if t == "String":
+                all_var_types[v] = "String"
 
     # Merge declarations
     all_relations: dict[str, int] = {}
@@ -283,6 +292,19 @@ def _build_equivalence_script(expr1: DRCExpression, expr2: DRCExpression) -> str
     rel_sorts: dict[str, list[str]] = {}
     _collect_relation_sorts(expr1.condition, all_var_types, rel_sorts)
     _collect_relation_sorts(expr2.condition, all_var_types, rel_sorts)
+
+    # Propagate types from relation sorts back to variables
+    _propagate_types_from_relations(expr1.condition, rel_sorts, all_var_types)
+    _propagate_types_from_relations(expr2.condition, rel_sorts, all_var_types)
+
+    # Re-collect relation sorts with updated types
+    rel_sorts = {}
+    _collect_relation_sorts(expr1.condition, all_var_types, rel_sorts)
+    _collect_relation_sorts(expr2.condition, all_var_types, rel_sorts)
+
+    # NOW convert formulas with the fully-resolved type information
+    formula1 = _convert_node(expr1.condition, all_var_types)
+    formula2 = _convert_node(expr2.condition, all_var_types)
 
     all_variables = vars1 | vars2
 
@@ -389,3 +411,47 @@ async def _run_parallel_checks(
         return IndeterminateResult(reason="Operation cancelled")
     except Exception as e:
         return IndeterminateResult(reason=str(e))
+
+
+def _propagate_types_from_relations(condition, rel_sorts: dict[str, list[str]], var_types: dict[str, str]) -> None:
+    """Propagate types from relation sort signatures to variables.
+
+    If a relation is declared as (Int Int String) and a membership uses
+    variables (a, b, c) at those positions, then c must be String.
+    """
+    from text_to_sql_planner.types.drc import (
+        MembershipNode, LogicalConnectiveNode, NotNode,
+        QuantifierNode, ComparisonNode, ArithmeticNode, FunctionCallNode,
+    )
+
+    if condition is None:
+        return
+
+    if isinstance(condition, MembershipNode):
+        if condition.relation in rel_sorts:
+            sorts = rel_sorts[condition.relation]
+            for i, var in enumerate(condition.variables):
+                if i < len(sorts) and sorts[i] == "String":
+                    var_types[var] = "String"
+
+    elif isinstance(condition, LogicalConnectiveNode):
+        _propagate_types_from_relations(condition.left, rel_sorts, var_types)
+        _propagate_types_from_relations(condition.right, rel_sorts, var_types)
+
+    elif isinstance(condition, NotNode):
+        _propagate_types_from_relations(condition.operand, rel_sorts, var_types)
+
+    elif isinstance(condition, QuantifierNode):
+        _propagate_types_from_relations(condition.body, rel_sorts, var_types)
+
+    elif isinstance(condition, ComparisonNode):
+        _propagate_types_from_relations(condition.left, rel_sorts, var_types)
+        _propagate_types_from_relations(condition.right, rel_sorts, var_types)
+
+    elif isinstance(condition, ArithmeticNode):
+        _propagate_types_from_relations(condition.left, rel_sorts, var_types)
+        _propagate_types_from_relations(condition.right, rel_sorts, var_types)
+
+    elif isinstance(condition, FunctionCallNode):
+        for arg in condition.arguments:
+            _propagate_types_from_relations(arg, rel_sorts, var_types)

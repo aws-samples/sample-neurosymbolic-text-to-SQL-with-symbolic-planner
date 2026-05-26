@@ -167,7 +167,9 @@ CREATE TABLE Job_History (
 # schema doesn't support:
 #QUESTION = "How many employees have had more than one job at this company?"
 # QUESTION = "How many employees report to each head of department?"
-QUESTION = "List all employees that don't have a performance review"
+# QUESTION = "List all employees that don't have a performance review"
+# QUESTION = "List all employees that don't have a performance review but have taken at least one training course"
+QUESTION = "List all employees that have two or more performance reviews"
 
 
 def main():

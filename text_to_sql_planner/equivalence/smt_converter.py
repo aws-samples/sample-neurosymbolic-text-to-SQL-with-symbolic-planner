@@ -85,11 +85,12 @@ def _infer_types(node: DRCCondition, var_types: dict[str, str]) -> None:
     """Infer variable types from context (comparisons with literals).
 
     Rules:
-    - Variable compared with = or != to a string literal → String
+    - Variable compared with = or != to a string literal → String (always wins)
     - Variable compared with <, >, <=, >= to a string literal → Int
       (dates/ordered strings are modeled as Int since SMT-LIB String doesn't support ordering)
-    - Variable compared to a number → Int
-    - Variable used in arithmetic → Int
+    - Variable compared to a number → Int (only if not already String)
+    - Variable used in arithmetic → Int (only if not already String)
+    - String type always wins over Int (once a variable is seen as String, it stays String)
     """
     if node is None:
         return
@@ -99,22 +100,29 @@ def _infer_types(node: DRCCondition, var_types: dict[str, str]) -> None:
         is_ordering = node.operator in ("<", ">", "<=", ">=")
 
         if isinstance(node.left, VariableRefNode) and isinstance(node.right, LiteralNode):
+            name = node.left.name
             if node.right.data_type == "string":
                 if is_ordering:
-                    # Dates and ordered strings → model as Int
-                    var_types[node.left.name] = "Int"
+                    # Dates and ordered strings → model as Int, but only if not already String
+                    if var_types.get(name) != "String":
+                        var_types[name] = "Int"
                 else:
-                    var_types[node.left.name] = "String"
+                    # String equality → always String (wins over Int)
+                    var_types[name] = "String"
             elif node.right.data_type == "number":
-                var_types.setdefault(node.left.name, "Int")
+                if var_types.get(name) != "String":
+                    var_types.setdefault(name, "Int")
         elif isinstance(node.right, VariableRefNode) and isinstance(node.left, LiteralNode):
+            name = node.right.name
             if node.left.data_type == "string":
                 if is_ordering:
-                    var_types[node.right.name] = "Int"
+                    if var_types.get(name) != "String":
+                        var_types[name] = "Int"
                 else:
-                    var_types[node.right.name] = "String"
+                    var_types[name] = "String"
             elif node.left.data_type == "number":
-                var_types.setdefault(node.right.name, "Int")
+                if var_types.get(name) != "String":
+                    var_types.setdefault(name, "Int")
         _infer_types(node.left, var_types)
         _infer_types(node.right, var_types)
 
@@ -222,58 +230,96 @@ def _collect_symbols(
                 _collect_symbols(arg, relations, variables)
 
 
-def _convert_node(node: DRCCondition, var_types: dict[str, str] | None = None) -> str:
-    """Recursively convert a DRC condition node to SMT-LIB syntax."""
+def _convert_node(node: DRCCondition, var_types: dict[str, str] | None = None, scope: dict[str, str] | None = None) -> str:
+    """Recursively convert a DRC condition node to SMT-LIB syntax.
+    
+    `scope` maps original variable names to their (possibly renamed) SMT-LIB names,
+    handling shadowing in nested quantifiers.
+    """
     if var_types is None:
         var_types = {}
+    if scope is None:
+        scope = {}
     if isinstance(node, QuantifierNode):
-        return _convert_quantifier(node, var_types)
+        return _convert_quantifier(node, var_types, scope)
     elif isinstance(node, LogicalConnectiveNode):
-        return _convert_logical(node, var_types)
+        return _convert_logical(node, var_types, scope)
     elif isinstance(node, NotNode):
-        return _convert_not(node, var_types)
+        return _convert_not(node, var_types, scope)
     elif isinstance(node, ComparisonNode):
-        return _convert_comparison(node, var_types)
+        return _convert_comparison(node, var_types, scope)
     elif isinstance(node, MembershipNode):
-        return _convert_membership(node)
+        return _convert_membership(node, scope)
     elif isinstance(node, ArithmeticNode):
-        return _convert_arithmetic(node, var_types)
+        return _convert_arithmetic(node, var_types, scope)
     elif isinstance(node, LiteralNode):
         return _convert_literal(node)
     elif isinstance(node, FunctionCallNode):
-        return _convert_function_call(node, var_types)
+        return _convert_function_call(node, var_types, scope)
     elif isinstance(node, VariableRefNode):
-        return node.name
+        # Use the renamed name if in scope
+        return scope.get(node.name, node.name)
     else:
         raise ValueError(f"Unknown DRC node type: {type(node)}")
 
 
-def _convert_quantifier(node: QuantifierNode, var_types: dict[str, str]) -> str:
+_rename_counter: dict[str, int] = {}
+
+
+def _fresh_name(base: str, all_names: set[str]) -> str:
+    """Generate a fresh variable name that doesn't conflict with existing names."""
+    if base not in all_names:
+        return base
+    counter = 2
+    while f"{base}_{counter}" in all_names:
+        counter += 1
+    return f"{base}_{counter}"
+
+
+def _convert_quantifier(node: QuantifierNode, var_types: dict[str, str], scope: dict[str, str]) -> str:
     quantifier = node.kind  # "forall" or "exists"
-    bindings = " ".join(f"({v} {var_types.get(v, 'Int')})" for v in node.variables)
-    body = _convert_node(node.body, var_types)
+    
+    # Alpha-rename variables that shadow outer scope
+    all_in_scope = set(scope.values())
+    new_scope = dict(scope)  # copy outer scope
+    renamed_vars: list[str] = []
+    
+    for v in node.variables:
+        if v in all_in_scope:
+            # This variable shadows an outer one — rename it
+            fresh = _fresh_name(v, all_in_scope)
+            new_scope[v] = fresh
+            all_in_scope.add(fresh)
+            renamed_vars.append(fresh)
+        else:
+            new_scope[v] = v
+            all_in_scope.add(v)
+            renamed_vars.append(v)
+    
+    bindings = " ".join(f"({rv} {var_types.get(orig, 'Int')})" 
+                        for rv, orig in zip(renamed_vars, node.variables))
+    body = _convert_node(node.body, var_types, new_scope)
     return f"({quantifier} ({bindings}) {body})"
 
 
-def _convert_logical(node: LogicalConnectiveNode, var_types: dict[str, str]) -> str:
-    left = _convert_node(node.left, var_types)
-    right = _convert_node(node.right, var_types)
+def _convert_logical(node: LogicalConnectiveNode, var_types: dict[str, str], scope: dict[str, str]) -> str:
+    left = _convert_node(node.left, var_types, scope)
+    right = _convert_node(node.right, var_types, scope)
     op_map = {"and": "and", "or": "or", "implies": "=>"}
     op = op_map[node.operator]
     return f"({op} {left} {right})"
 
 
-def _convert_not(node: NotNode, var_types: dict[str, str]) -> str:
-    operand = _convert_node(node.operand, var_types)
+def _convert_not(node: NotNode, var_types: dict[str, str], scope: dict[str, str]) -> str:
+    operand = _convert_node(node.operand, var_types, scope)
     return f"(not {operand})"
 
 
-def _convert_comparison(node: ComparisonNode, var_types: dict[str, str]) -> str:
+def _convert_comparison(node: ComparisonNode, var_types: dict[str, str], scope: dict[str, str]) -> str:
     is_ordering = node.operator in ("<", ">", "<=", ">=")
 
-    # For ordering comparisons with string literals (dates), convert to Int
-    left = _convert_node_for_comparison(node.left, var_types, is_ordering)
-    right = _convert_node_for_comparison(node.right, var_types, is_ordering)
+    left = _convert_node_for_comparison(node.left, var_types, is_ordering, scope)
+    right = _convert_node_for_comparison(node.right, var_types, is_ordering, scope)
 
     op_map = {
         "=": "=",
@@ -287,14 +333,13 @@ def _convert_comparison(node: ComparisonNode, var_types: dict[str, str]) -> str:
     return f"({op} {left} {right})"
 
 
-def _convert_node_for_comparison(node: DRCCondition, var_types: dict[str, str], is_ordering: bool) -> str:
+def _convert_node_for_comparison(node: DRCCondition, var_types: dict[str, str], is_ordering: bool, scope: dict[str, str] | None = None) -> str:
     """Convert a node for use in a comparison, handling date literals."""
     if is_ordering and isinstance(node, LiteralNode) and node.data_type == "string":
-        # Try to convert date-like strings to integers for ordering
         int_val = _date_string_to_int(str(node.value))
         if int_val is not None:
             return str(int_val)
-    return _convert_node(node, var_types)
+    return _convert_node(node, var_types, scope)
 
 
 def _date_string_to_int(s: str) -> int | None:
@@ -317,18 +362,20 @@ def _date_string_to_int(s: str) -> int | None:
     return None
 
 
-def _convert_membership(node: MembershipNode) -> str:
-    args = " ".join(node.variables)
+def _convert_membership(node: MembershipNode, scope: dict[str, str] | None = None) -> str:
+    if scope is None:
+        scope = {}
+    args = " ".join(scope.get(v, v) for v in node.variables)
     return f"({node.relation} {args})"
 
 
-def _convert_arithmetic(node: ArithmeticNode, var_types: dict[str, str]) -> str:
-    left = _convert_node(node.left, var_types)
-    right = _convert_node(node.right, var_types)
+def _convert_arithmetic(node: ArithmeticNode, var_types: dict[str, str], scope: dict[str, str] | None = None) -> str:
+    left = _convert_node(node.left, var_types, scope)
+    right = _convert_node(node.right, var_types, scope)
     return f"({node.operator} {left} {right})"
 
 
-def _convert_function_call(node: FunctionCallNode, var_types: dict[str, str]) -> str:
+def _convert_function_call(node: FunctionCallNode, var_types: dict[str, str], scope: dict[str, str] | None = None) -> str:
     """Convert a function call to SMT-LIB.
 
     CURRENT_DATE → today's epoch days (integer)
@@ -345,22 +392,22 @@ def _convert_function_call(node: FunctionCallNode, var_types: dict[str, str]) ->
         days = (today - epoch).days
         return str(days)
     elif node.function == "DATE_SUB" and len(node.arguments) == 2:
-        left = _convert_node(node.arguments[0], var_types)
-        right = _convert_node(node.arguments[1], var_types)
+        left = _convert_node(node.arguments[0], var_types, scope)
+        right = _convert_node(node.arguments[1], var_types, scope)
         return f"(- {left} {right})"
     elif node.function == "DATE_ADD" and len(node.arguments) == 2:
-        left = _convert_node(node.arguments[0], var_types)
-        right = _convert_node(node.arguments[1], var_types)
+        left = _convert_node(node.arguments[0], var_types, scope)
+        right = _convert_node(node.arguments[1], var_types, scope)
         return f"(+ {left} {right})"
     elif node.function == "DATEDIFF" and len(node.arguments) == 2:
-        left = _convert_node(node.arguments[0], var_types)
-        right = _convert_node(node.arguments[1], var_types)
+        left = _convert_node(node.arguments[0], var_types, scope)
+        right = _convert_node(node.arguments[1], var_types, scope)
         return f"(- {left} {right})"
     else:
         # Generic uninterpreted function
         if not node.arguments:
             return node.function
-        args = " ".join(_convert_node(arg, var_types) for arg in node.arguments)
+        args = " ".join(_convert_node(arg, var_types, scope) for arg in node.arguments)
         return f"({node.function} {args})"
 
 

@@ -16,6 +16,7 @@ import re
 class SqlTable:
     """A plain table reference."""
     name: str
+    alias: str = ""
 
 
 @dataclass
@@ -133,14 +134,16 @@ def _parse_source(text: str) -> tuple[SqlSource, str]:
             table_name = m.group(1)
             rest = text[m.end():].strip()
             # Consume optional alias (a word that's not a SQL keyword)
+            alias = ""
             alias_match = re.match(r"(\w+)", rest)
             if alias_match:
                 potential_alias = alias_match.group(1).upper()
                 # Don't consume SQL keywords as aliases
                 keywords = {"WHERE", "JOIN", "CROSS", "ON", "GROUP", "ORDER", "HAVING", "LIMIT", "UNION", "AS", "LEFT", "RIGHT", "INNER", "OUTER", "FULL"}
                 if potential_alias not in keywords:
+                    alias = alias_match.group(1)
                     rest = rest[alias_match.end():]
-            return SqlTable(name=table_name), rest
+            return SqlTable(name=table_name, alias=alias), rest
         return SqlTable(name=text), ""
 
 
@@ -401,6 +404,8 @@ def render_sql(node: SqlSelect) -> str:
 
 def _render_source(source: SqlSource) -> str:
     if isinstance(source, SqlTable):
+        if source.alias:
+            return f"{source.name} {source.alias}"
         return source.name
     elif isinstance(source, SqlSubquery):
         inner = render_sql(source.query)

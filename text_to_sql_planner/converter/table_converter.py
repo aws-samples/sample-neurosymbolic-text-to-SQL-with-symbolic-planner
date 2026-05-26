@@ -19,6 +19,7 @@ class TableRelation:
     table_name: str
     columns: list[str]
     expression: DRCExpression
+    column_types: dict[str, str] = field(default_factory=dict)  # col_name -> "Int" | "String"
 
 
 @dataclass
@@ -69,6 +70,29 @@ def _extract_column_name(definition: str) -> str | None:
     if match:
         return match.group(1)
     return None
+
+
+# SQL types that map to String in SMT-LIB
+_STRING_TYPES = re.compile(
+    r"^(VARCHAR|CHAR|TEXT|CLOB|NVARCHAR|NCHAR|NTEXT|STRING)\b",
+    re.IGNORECASE,
+)
+
+
+def _extract_column_type(definition: str) -> str:
+    """Extract the SMT-LIB sort (Int or String) from a column definition.
+
+    Returns "String" for VARCHAR/CHAR/TEXT types, "Int" for everything else.
+    """
+    definition = definition.strip()
+    # Skip the column name (first token)
+    match = re.match(r"[`\"']?\w+[`\"']?\s+(.+)", definition)
+    if not match:
+        return "Int"
+    type_str = match.group(1).strip()
+    if _STRING_TYPES.match(type_str):
+        return "String"
+    return "Int"
 
 
 def _split_column_definitions(body: str) -> list[str]:
@@ -172,11 +196,13 @@ def convert_tables(schema: str) -> TableConversionResult:
         # Parse column definitions
         parts = _split_column_definitions(body)
         columns: list[str] = []
+        column_types: dict[str, str] = {}
 
         for part in parts:
             col_name = _extract_column_name(part)
             if col_name is not None:
                 columns.append(col_name)
+                column_types[col_name] = _extract_column_type(part)
 
         if not columns:
             return TableConversionFailure(
@@ -196,6 +222,7 @@ def convert_tables(schema: str) -> TableConversionResult:
                 table_name=table_name,
                 columns=columns,
                 expression=expression,
+                column_types=column_types,
             )
         )
 

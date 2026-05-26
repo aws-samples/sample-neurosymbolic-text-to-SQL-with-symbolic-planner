@@ -347,32 +347,37 @@ def _print_condition_indented(node: DRCCondition, indent: int = 0, width: int = 
 
         # Group operands onto lines, joining with the symbol
         # Each line should be ≤ width characters (including indent)
+        # When an operand is complex (multi-line), give it its own line with ∧ prefix
         lines: list[str] = []
         current_parts: list[str] = []
         current_len = indent
 
         for item_text, item_node in rendered:
+            is_complex = isinstance(item_node, (QuantifierNode, LogicalConnectiveNode))
             joiner = f" {symbol} "
             joiner_len = len(joiner) if current_parts else 0
             needed = joiner_len + len(item_text)
+
+            # Complex operands always get their own line
+            if is_complex and len(item_text) + indent > width:
+                # Flush any accumulated simple parts first
+                if current_parts:
+                    lines.append(pad + f" {symbol} ".join(current_parts))
+                    current_parts = []
+                    current_len = indent
+                # Expand this operand with indentation
+                expanded = _print_condition_indented(item_node, indent=indent, width=width, parent_precedence=my_precedence)
+                if lines:
+                    lines.append(f"{pad}{symbol} {expanded.lstrip()}")
+                else:
+                    lines.append(expanded)
+                continue
 
             if current_parts and current_len + needed > width:
                 # Flush current line
                 lines.append(pad + f" {symbol} ".join(current_parts))
                 current_parts = []
                 current_len = indent
-
-            # Check if this single item exceeds width even on its own line
-            if len(item_text) + indent > width and not current_parts:
-                # Expand this operand with indentation
-                expanded = _print_condition_indented(item_node, indent=indent + 2, width=width, parent_precedence=my_precedence)
-                if _needs_parens(item_node, my_precedence):
-                    expanded = f"{pad}  ({expanded.lstrip()})"
-                if lines:
-                    lines.append(f"{pad}{symbol} {expanded.lstrip()}")
-                else:
-                    lines.append(expanded)
-                continue
 
             current_parts.append(item_text)
             current_len = indent + len(f" {symbol} ".join(current_parts))

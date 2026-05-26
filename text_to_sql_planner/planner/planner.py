@@ -141,6 +141,14 @@ async def plan(
     print(f"- **Max retries/iteration:** {config.max_retries_per_iteration}")
     print(f"- **Tables:** {[tr.table_name for tr in table_relations]}\n")
 
+    # Build schema types from table relations (for SMT-LIB type inference)
+    schema_types: dict[str, str] = {}
+    for tr in table_relations:
+        if hasattr(tr, 'column_types'):
+            for col, col_type in tr.column_types.items():
+                if col_type == "String":
+                    schema_types[col] = "String"
+
     # Prepare table relation descriptions for the LLM
     table_descs = []
     # Track summaries for each available relation
@@ -188,7 +196,7 @@ async def plan(
     # Also check via cvc5 equivalence for structural matches
     for i, (expr, cols, node) in enumerate(available):
         if len(cols) == len(target_columns):
-            eq_result = await check_equivalence(expr, target_relation, config.equivalence_config)
+            eq_result = await check_equivalence(expr, target_relation, config.equivalence_config, schema_types=schema_types)
             if isinstance(eq_result, EquivalentResult):
                 print(f"### ✅ Degenerate case: target is equivalent to table relation [{i}]\n")
                 tree = OperationTree(root=node)
@@ -336,7 +344,7 @@ async def plan(
             # Check equivalence with target
             print(f"Checking equivalence with target...\n", flush=True)
             eq_result = await check_equivalence(
-                new_expr, target_relation, config.equivalence_config
+                new_expr, target_relation, config.equivalence_config, schema_types=schema_types
             )
 
             if isinstance(eq_result, EquivalentResult):

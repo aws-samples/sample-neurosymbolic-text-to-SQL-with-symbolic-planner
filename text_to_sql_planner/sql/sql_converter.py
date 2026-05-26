@@ -90,7 +90,10 @@ def convert_to_sql(tree: OperationTree, result_variables: list | None = None) ->
 
                 flat.select_columns = all_select
                 if plain_cols:
-                    flat.group_by_columns = [_qualify_column_from_aliases(c, flat.table_aliases) for c in plain_cols]
+                    # GROUP BY uses the same qualified names as the SELECT columns
+                    # Extract the qualified plain columns from all_select (non-aggregate entries)
+                    qualified_plain = [s for s in all_select if not any(s.startswith(f"{f}(") for f in _AGGREGATE_FUNCS)]
+                    flat.group_by_columns = qualified_plain
                 return SQLSuccess(sql=flat.to_sql())
 
         sql = _convert_node(tree.root)
@@ -209,9 +212,22 @@ def _flatten_to_query(node: OperationNode) -> _FlatQuery:
         left_flat = _flatten_to_query(inputs[0])
         right_flat = _flatten_to_query(inputs[1])
 
+        # Resolve alias conflicts between left and right
+        left_aliases_set = set(left_flat.table_aliases.values())
+        right_alias = list(right_flat.table_aliases.values())[0] if right_flat.table_aliases else "t2"
+
+        if right_alias in left_aliases_set:
+            # Conflict — generate a new unique alias for the right side
+            right_table_name = list(right_flat.table_aliases.keys())[0] if right_flat.table_aliases else "t"
+            new_alias = _make_alias(right_table_name, left_aliases_set)
+            # Update right_flat's from_tables and table_aliases
+            old_alias = right_alias
+            right_alias = new_alias
+            right_flat.from_tables = [f.replace(f" {old_alias}", f" {new_alias}") for f in right_flat.from_tables]
+            right_flat.table_aliases = {k: (new_alias if v == old_alias else v) for k, v in right_flat.table_aliases.items()}
+
         # Get aliases for ON clause
         left_alias = list(left_flat.table_aliases.values())[0] if left_flat.table_aliases else "t1"
-        right_alias = list(right_flat.table_aliases.values())[0] if right_flat.table_aliases else "t2"
         right_from = right_flat.from_tables[0] if right_flat.from_tables else "?"
 
         on_conditions = [f"{left_alias}.{col} = {right_alias}.{col}"
@@ -463,11 +479,26 @@ def _condition_to_sql(condition: DRCCondition) -> str:
         return f"NOT ({operand})"
 
     elif isinstance(condition, VariableRefNode):
-        return condition.name
+        # Strip DRC-level suffixes (_r2, _1, _2) for SQL output
+        # Only strip if the result is a valid column name (non-empty, no trailing _)
+        name = condition.name
+        if name.endswith("_r2") and len(name) > 3:
+            base = name[:-3]
+            if base and not base.endswith("_"):
+                name = base
+        elif len(name) > 2 and name[-2] == "_" and name[-1] in "12":
+            base = name[:-2]
+            if base and not base.endswith("_"):
+                name = base
+        return name
 
     elif isinstance(condition, LiteralNode):
         if condition.data_type == "string":
-            escaped = str(condition.value).replace("'", "''")
+            val = str(condition.value)
+            escaped = val.replace("'", "''")
+            # Use DATE literal for date-like strings
+            if _is_date_string(val):
+                return f"DATE '{escaped}'"
             return f"'{escaped}'"
         else:
             return str(condition.value)
@@ -656,12 +687,20 @@ def _days_to_interval(days_str: str) -> str:
 _alias_counter: dict[str, int] = {}
 
 
-def _make_alias(table_name: str) -> str:
-    """Generate a short alias for a table name (first letter, lowercase)."""
+def _make_alias(table_name: str, existing_aliases: set[str] | None = None) -> str:
+    """Generate a unique short alias for a table name.
+
+    Uses first letter, appending a number if there's a conflict.
+    """
     base = table_name[0].lower()
-    # For uniqueness within a query, just use the first letter
-    # If there are conflicts, they'll be handled by the caller
-    return base
+    if existing_aliases is None:
+        return base
+    alias = base
+    counter = 1
+    while alias in existing_aliases:
+        counter += 1
+        alias = f"{base}{counter}"
+    return alias
 
 
 def _qualify_column(col: str, table_aliases: dict[str, str], inputs: list) -> str:
@@ -684,17 +723,44 @@ def _qualify_column(col: str, table_aliases: dict[str, str], inputs: list) -> st
 
 
 def _qualify_column_from_aliases(col: str, table_aliases: dict[str, str]) -> str:
-    """Qualify a column with the first matching table alias."""
+    """Qualify a column with the appropriate table alias.
+
+    Handles suffixed variables from cartesian products/self-joins:
+    - col_r2 or col_2 → use the second table's alias with the base column name
+    - col_1 → use the first table's alias with the base column name
+    """
     if "." in col:
         return col
-    # Use the first alias available (for simple cases)
-    # In a more sophisticated version, we'd track which table owns which column
-    if table_aliases:
-        # Just use the first alias — for single-table queries this is correct
-        # For multi-table, the caller should provide context
-        first_alias = list(table_aliases.values())[0]
-        return f"{first_alias}.{col}"
-    return col
+
+    if not table_aliases:
+        return col
+
+    aliases = list(table_aliases.values())
+
+    # Check for _r2 suffix (from join operator renaming)
+    if col.endswith("_r2") and len(col) > 3:
+        base_col = col[:-3]
+        if base_col and not base_col.endswith("_"):
+            if len(aliases) >= 2:
+                return f"{aliases[1]}.{base_col}"
+            return f"{aliases[0]}.{base_col}"
+
+    # Check for _2 suffix (from cartesian product renaming)
+    if len(col) > 2 and col[-2] == "_" and col[-1] == "2":
+        base_col = col[:-2]
+        if base_col and not base_col.endswith("_"):
+            if len(aliases) >= 2:
+                return f"{aliases[1]}.{base_col}"
+            return f"{aliases[0]}.{base_col}"
+
+    # Check for _1 suffix (from cartesian product renaming)
+    if len(col) > 2 and col[-2] == "_" and col[-1] == "1":
+        base_col = col[:-2]
+        if base_col and not base_col.endswith("_"):
+            return f"{aliases[0]}.{base_col}"
+
+    # Default: use the first alias
+    return f"{aliases[0]}.{col}"
 
 
 def _condition_to_sql_with_aliases(condition: DRCCondition, table_aliases: dict[str, str]) -> str:
@@ -740,7 +806,10 @@ def _condition_to_sql_with_aliases(condition: DRCCondition, table_aliases: dict[
 
     elif isinstance(condition, LiteralNode):
         if condition.data_type == "string":
-            escaped = str(condition.value).replace("'", "''")
+            val = str(condition.value)
+            escaped = val.replace("'", "''")
+            if _is_date_string(val):
+                return f"DATE '{escaped}'"
             return f"'{escaped}'"
         return str(condition.value)
 
@@ -826,3 +895,9 @@ def _quantifier_to_sql_with_aliases(condition: QuantifierNode, outer_aliases: di
                 return f"NOT EXISTS (SELECT 1 FROM {table_name} {inner_alias}{where_clause})"
 
     return ""
+
+
+def _is_date_string(s: str) -> bool:
+    """Check if a string looks like a date (YYYY-MM-DD or YYYY/MM/DD)."""
+    import re
+    return bool(re.match(r"^\d{4}[-/]\d{2}[-/]\d{2}$", s))
