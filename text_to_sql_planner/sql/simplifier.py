@@ -123,10 +123,20 @@ def _parse_source(text: str) -> tuple[SqlSource, str]:
         inner = text[1:end].strip()
         rest = text[end + 1:].strip()
         alias = "sub"
+        # Accept either "AS alias" or a bare "alias" — but never consume a
+        # SQL keyword as an alias (otherwise we'd swallow JOIN, WHERE, etc.).
         am = re.match(r"AS\s+(\w+)", rest, re.IGNORECASE)
         if am:
             alias = am.group(1)
             rest = rest[am.end():]
+        else:
+            bm = re.match(r"(\w+)", rest)
+            if bm:
+                potential_alias = bm.group(1).upper()
+                keywords = {"WHERE", "JOIN", "CROSS", "ON", "GROUP", "ORDER", "HAVING", "LIMIT", "UNION", "AS", "LEFT", "RIGHT", "INNER", "OUTER", "FULL"}
+                if potential_alias not in keywords:
+                    alias = bm.group(1)
+                    rest = rest[bm.end():]
         return SqlSubquery(query=_parse_select(inner), alias=alias), rest
     else:
         m = re.match(r"(\w+)", text)
@@ -195,6 +205,69 @@ def simplify_ast(node: SqlSelect) -> SqlSelect:
 def _norm_cols(cols: list[str]) -> list[str]:
     """Normalize column names for comparison."""
     return [c.strip().lower() for c in cols]
+
+
+def _strip_outer_parens(text: str) -> str:
+    """Strip a single matching outer pair of parentheses, if present."""
+    text = text.strip()
+    if not (text.startswith("(") and text.endswith(")")):
+        return text
+    # Verify the opening paren matches the trailing one (i.e. they're a pair,
+    # not two unrelated parens at the boundaries).
+    depth = 0
+    for i, ch in enumerate(text):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                if i == len(text) - 1:
+                    return text[1:-1].strip()
+                return text
+    return text
+
+
+def _split_and(text: str) -> list[str]:
+    """Split a boolean expression on top-level ``AND``, respecting parentheses.
+
+    Strips a redundant outer pair of parentheses first, then walks the string
+    tracking paren depth and recognizing only ``AND`` tokens at depth 0.
+    """
+    text = _strip_outer_parens(text).strip()
+    if not text:
+        return []
+
+    parts: list[str] = []
+    start = 0
+    depth = 0
+    i = 0
+    upper = text.upper()
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "(":
+            depth += 1
+            i += 1
+            continue
+        if ch == ")":
+            depth -= 1
+            i += 1
+            continue
+        if depth == 0 and upper.startswith("AND", i):
+            # Word boundaries: previous char must be non-alnum, next char too.
+            before_ok = i == 0 or not text[i - 1].isalnum()
+            after_ok = i + 3 >= n or not text[i + 3].isalnum()
+            if before_ok and after_ok:
+                parts.append(text[start:i].strip())
+                i += 3
+                start = i
+                continue
+        i += 1
+    parts.append(text[start:].strip())
+    return [p for p in parts if p]
+
+
+
 
 
 def _simplify_once(node: SqlSelect) -> SqlSelect:
@@ -304,8 +377,7 @@ def _simplify_once(node: SqlSelect) -> SqlSelect:
     # → SELECT ... FROM T1 JOIN T2 ON T1.col = T2.col
     if node.joins and node.where:
         new_joins = list(node.joins)
-        remaining_where_parts = []
-        where_parts = [w.strip() for w in node.where.split(" AND ")]
+        where_parts = _split_and(node.where)
 
         for i, j in enumerate(new_joins):
             if j.join_type == "CROSS JOIN" and not j.on_condition:
@@ -317,8 +389,10 @@ def _simplify_once(node: SqlSelect) -> SqlSelect:
 
                 for wp in where_parts:
                     # Check if this condition references both tables (simple heuristic: contains "=")
-                    if "=" in wp and "!=" not in wp:
-                        matched_conditions.append(wp)
+                    # Use a paren-stripped form so wrapping doesn't fool the check.
+                    inner = _strip_outer_parens(wp)
+                    if "=" in inner and "!=" not in inner:
+                        matched_conditions.append(inner)
                     else:
                         unmatched.append(wp)
 
