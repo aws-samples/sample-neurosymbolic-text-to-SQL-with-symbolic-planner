@@ -22,7 +22,7 @@ from text_to_sql_planner.operators.selection import apply_selection
 from text_to_sql_planner.operators.join import apply_join
 from text_to_sql_planner.operators.projection import apply_projection
 from text_to_sql_planner.operators.cartesian_product import apply_cartesian_product
-from text_to_sql_planner.operators.union_op import apply_union
+from text_to_sql_planner.operators.union import apply_union
 from text_to_sql_planner.operators.division import apply_division
 
 

@@ -135,8 +135,9 @@ class TestTableLeaf:
         result = convert_to_sql(tree)
 
         assert isinstance(result, SQLSuccess)
-        assert "e.id" in result.sql
-        assert "e.name" in result.sql
+        # Uses numbered aliases: e1.id, e1.name, FROM employees e1
+        assert ".id" in result.sql
+        assert ".name" in result.sql
         assert "FROM employees e" in result.sql
 
     def test_table_with_no_columns(self):

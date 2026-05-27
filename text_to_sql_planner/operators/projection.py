@@ -11,7 +11,6 @@ from text_to_sql_planner.types.drc import (
     ColumnVariable,
     DRCExpression,
     QuantifierNode,
-    MembershipNode,
     ResultVariable,
 )
 from text_to_sql_planner.types.operators import (
@@ -124,11 +123,6 @@ def apply_projection(params: ProjectionParams, inputs: list[DRCExpression]) -> O
             variables=removed_columns,
             body=relation.condition,
         )
-        output_condition = QuantifierNode(
-            kind="exists",
-            variables=removed_columns,
-            body=relation.condition,
-        )
 
     output = DRCExpression(
         result_variables=output_variables,
@@ -136,31 +130,3 @@ def apply_projection(params: ProjectionParams, inputs: list[DRCExpression]) -> O
     )
 
     return OperatorSuccess(output=output)
-
-
-def _extract_relation_name(expr: DRCExpression) -> str:
-    """Extract a relation name from a DRC expression's condition."""
-    from text_to_sql_planner.types.drc import LogicalConnectiveNode
-
-    condition = expr.condition
-    if isinstance(condition, MembershipNode):
-        return condition.relation
-    return _find_relation_name(condition)
-
-
-def _find_relation_name(node) -> str:
-    """Recursively search for a relation name in a condition tree."""
-    from text_to_sql_planner.types.drc import LogicalConnectiveNode
-
-    if node is None:
-        return "R"
-    if isinstance(node, MembershipNode):
-        return node.relation
-    if isinstance(node, QuantifierNode):
-        return _find_relation_name(node.body)
-    if isinstance(node, LogicalConnectiveNode):
-        result = _find_relation_name(node.left)
-        if result != "R":
-            return result
-        return _find_relation_name(node.right)
-    return "R"
