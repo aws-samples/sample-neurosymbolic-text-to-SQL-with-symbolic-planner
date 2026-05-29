@@ -171,8 +171,8 @@ CREATE TABLE Job_History (
 # QUESTION = "List all employees that don't have a performance review but have taken at least one training course"
 # QUESTION = "List all employees that have two or more performance reviews"
 # QUESTION = "List all employees that have three or more performance reviews"
-QUESTION = "List the top 5 highest-compensated employees"
-# QUESTION = "List all employees that have exactly two performance reviews"
+# QUESTION = "List the top 5 highest-compensated employees"
+QUESTION = "List all employees that have exactly two performance reviews"
 
 
 def main():

@@ -1,238 +1,300 @@
 # Text-to-SQL Planner
 
-A Text-to-SQL agent that converts natural language questions into provably correct SQL queries using a symbolic planner grounded in Domain Relational Calculus (DRC) and the cvc5 theorem prover.
+A natural-language-to-SQL system that produces SQL whose meaning is *formally
+verified* against the user's intent — not just plausible-looking SQL stitched
+together by a language model.
 
-## How it works
+The pipeline:
 
-1. You provide a natural language question and a database schema (CREATE TABLE statements)
-2. Claude (via AWS Bedrock) converts the question into a formal DRC expression
-3. The planner iteratively applies relational algebra operators to build toward the target
-4. At each step, cvc5 verifies logical equivalence between the current result and the target
-5. Once equivalence is proven, the operation tree is translated into a SQL SELECT statement
+1. An LLM converts the question into Domain Relational Calculus (DRC), a
+   first-order set-builder language with relations as predicates.
+2. A symbolic planner builds the answer as a sequence of relational-algebra
+   operators applied to the schema's tables.
+3. After every step, an SMT solver (cvc5) is asked to *prove* that the
+   relation built so far is logically equivalent to the target DRC. The
+   planner iterates until cvc5 returns `unsat` for "the two could differ".
+4. The proven operation tree is lowered to SQL.
+
+The result is SQL that is provably equivalent to a formal specification of
+the question, not just empirically similar.
+
+## Goals
+
+- **Correctness first.** Every step is checked by an SMT solver; the SQL we
+  emit is the SQL whose DRC the planner *proved* equivalent to the target.
+  No "looks right to a benchmark" — `unsat` or nothing.
+- **Auditable.** Every artifact is human-readable: the DRC (Lisp + Unicode
+  pretty form), the operation tree, the SMT-LIB script, the SQL, and the
+  simplified SQL. Verbose mode prints them all.
+- **Schema-aware but agnostic.** No fine-tuning, no schema embeddings — only
+  the CREATE TABLE statements you provide. Works on schemas the model has
+  never seen.
+- **Composable extensions.** The core formalism is set-based DRC. Non-set
+  features (LIMIT, ORDER BY) are layered on top as explicit
+  non-relational wrappers so they don't pollute the core semantics or
+  the equivalence check.
+
+## Quick start
+
+```bash
+# 1. cvc5 (SMT solver — needed at runtime)
+curl -L -o /tmp/cvc5.zip \
+  https://github.com/cvc5/cvc5/releases/download/cvc5-1.3.4/cvc5-Linux-x86_64-static.zip
+unzip -o /tmp/cvc5.zip -d /tmp/cvc5-extract
+sudo install -m755 /tmp/cvc5-extract/cvc5-Linux-*/bin/cvc5 /usr/local/bin/cvc5
+cvc5 --version
+
+# 2. Python deps (uv recommended; pip works too)
+uv sync     # or: pip install -e ".[dev]"
+
+# 3. AWS credentials with Bedrock access for the Claude model
+#    (Anthropic API key is NOT used; we go through Bedrock.)
+aws configure          # or env vars / SSO / instance role
+
+# 4. Run an example
+uv run python -m text_to_sql_planner \
+  -q "Show me the top 5 most-compensated employees" \
+  -f example_schema.sql \
+  -v
+```
 
 ## Requirements
 
-- Ubuntu 26.04 LTS (or compatible Linux distribution)
-- Python 3.11+
-- AWS credentials configured (IAM role, environment variables, or `~/.aws/credentials`)
-- Access to Claude on Amazon Bedrock (model: `global.anthropic.claude-opus-4-6-v1`)
-- cvc5 binary on PATH (for equivalence checking) — see install instructions below
+- Python 3.11+ (uses `tomllib`, `asyncio.TaskGroup`, etc.)
+- `cvc5` on `PATH` (any 1.x release; tested with 1.3.4)
+- AWS credentials with `bedrock:InvokeModel` for `global.anthropic.claude-opus-4-6-v1`
 
-## Installation
+The Python dependencies are pinned in `pyproject.toml`:
 
-### Install cvc5
-
-Download the static binary for your platform from the [cvc5 releases page](https://github.com/cvc5/cvc5/releases):
-
-```bash
-# Linux arm64 (aarch64)
-curl -L -o /tmp/cvc5.zip https://github.com/cvc5/cvc5/releases/download/cvc5-1.3.4/cvc5-Linux-arm64-static.zip
-
-# Linux x86_64
-# curl -L -o /tmp/cvc5.zip https://github.com/cvc5/cvc5/releases/download/cvc5-1.3.4/cvc5-Linux-x86_64-static.zip
-
-unzip -o /tmp/cvc5.zip -d /tmp/cvc5-extract
-sudo cp /tmp/cvc5-extract/cvc5-Linux-*/bin/cvc5 /usr/local/bin/cvc5
-sudo chmod +x /usr/local/bin/cvc5
-
-# Verify
-cvc5 --version
-```
-
-### Install the Python project
-
-```bash
-cd /home/ubuntu
-uv sync
-```
-
-This installs:
-- `boto3` — AWS SDK for Bedrock LLM calls
-- `pydantic` — data validation
-- `hypothesis` — property-based testing (dev)
-- `pytest` / `pytest-asyncio` — test runner (dev)
+| Runtime    | Dev                |
+|------------|--------------------|
+| `boto3`    | `pytest`           |
+| `pydantic` | `pytest-asyncio`   |
+|            | `hypothesis`       |
 
 ## Usage
 
-### Command line
-
-After installation, run via `uv`:
+### CLI
 
 ```bash
-# Basic usage with inline question and schema
-uv run python -m text_to_sql_planner \
-    -q "Which students have taken Computer Science courses?" \
-    -s "CREATE TABLE Students (s_id INT, name VARCHAR);
-        CREATE TABLE Enrolled (s_id INT, c_id INT);
-        CREATE TABLE Courses (c_id INT, c_type VARCHAR);"
-
-# Read schema from a file
-uv run python -m text_to_sql_planner -q "Find all employees in department 5" -f schema.sql
-
-# Pipe the question via stdin
-echo "How many orders were placed last month?" | uv run python -m text_to_sql_planner -f schema.sql
-
-# Verbose mode (shows target DRC expression)
-uv run python -m text_to_sql_planner -q "Find all users" -f schema.sql -v
-
-# Custom AWS region and model
-uv run python -m text_to_sql_planner -q "Find all users" -f schema.sql --region us-west-2
-
-# Custom cvc5 path and timeout
-uv run python -m text_to_sql_planner -q "Find all users" -f schema.sql --cvc5-path /usr/local/bin/cvc5 --cvc5-timeout 60
+uv run python -m text_to_sql_planner [-q QUESTION] [-s SCHEMA | -f SCHEMA_FILE] [...]
 ```
 
-The command prints the SQL to stdout and errors to stderr. Exit code 0 on success, 1 on failure.
+| Flag             | Purpose                                         |
+|------------------|-------------------------------------------------|
+| `-q, --question` | The natural-language question (else read stdin) |
+| `-s, --schema`   | Inline `CREATE TABLE` statements                |
+| `-f, --schema-file` | Path to a file with `CREATE TABLE` statements |
+| `-v, --verbose`  | Show DRC, operation tree, SMT scripts           |
+| `-o, --output`   | Write Markdown report to file (else stdout)     |
+| `--region`       | AWS region (default `us-east-1`)                |
+| `--model-id`     | Bedrock model ID                                |
+| `--max-iterations` | Planner iteration cap (default 50)            |
+| `--max-retries`  | Retries per iteration (default 5)               |
+| `--cvc5-path`    | Path to `cvc5` binary (default `cvc5`)          |
+| `--cvc5-timeout` | Per-check timeout in seconds (default 30)       |
 
-### Quick start (canned example)
-
-Run the included example that uses a university schema:
-
-```bash
-uv run python example.py
-```
-
-This asks "Which students have taken one or more Computer Science courses?" against a Students/Courses/Enrolled schema and prints the generated SQL. You can also use the CLI with the included schema file:
-
-```bash
-uv run python -m text_to_sql_planner \
-    -q "How many students got a grade above 90?" \
-    -f example_schema.sql
-```
-
-### Python API
+Exit codes: `0` on success, `1` on any failure.
 
 ### Python API
 
 ```python
 import asyncio
 from text_to_sql_planner import run
+from text_to_sql_planner.main import TextToSQLSuccess
+
+schema = """\
+CREATE TABLE Employees (emp_id INT, name VARCHAR, salary DECIMAL);
+"""
 
 async def main():
-    question = "Which students have taken one or more Computer Science courses?"
-    schema = """
-    CREATE TABLE Students (s_id INT, name VARCHAR);
-    CREATE TABLE Enrolled (s_id INT, c_id INT);
-    CREATE TABLE Courses (c_id INT, c_type VARCHAR);
-    """
-
-    result = await run(question=question, schema=schema)
-
-    from text_to_sql_planner.main import TextToSQLSuccess, TextToSQLFailure
-
+    result = await run(
+        question="Show me the top 5 most-compensated employees",
+        schema=schema,
+    )
     if isinstance(result, TextToSQLSuccess):
-        print("SQL:", result.sql)
+        print(result.sql)
     else:
-        print("Error:", result.error)
+        print(f"[{result.code.value}] {result.error}")
 
 asyncio.run(main())
 ```
 
-Save as `example.py` and run:
+`run()` accepts an optional `config: PlannerConfig` to tune model, region,
+iteration caps, temperature schedule, and cvc5 timeout.
+
+### Examples folder
+
+`examples/example0.py` … `example3.py` are end-to-end runs against the
+included `example_schema.sql`. Use them as smoke tests:
 
 ```bash
-python3 example.py
+uv run python examples/example3.py
 ```
 
-### Configuration
-
-You can customize the region, model, planner limits, and equivalence checker timeout:
-
-```python
-from text_to_sql_planner.planner import PlannerConfig
-from text_to_sql_planner.planner.llm_client import LLMClientConfig
-from text_to_sql_planner.equivalence import EquivalenceCheckerConfig
-
-config = PlannerConfig(
-    max_iterations=50,
-    max_retries_per_iteration=5,
-    initial_temperature=0.0,
-    temperature_step=0.2,
-    llm_config=LLMClientConfig(
-        region="us-east-1",
-        model_id="global.anthropic.claude-opus-4-6-v1",
-        max_tokens=4096,
-    ),
-    equivalence_config=EquivalenceCheckerConfig(
-        cvc5_path="cvc5",
-        timeout_seconds=30.0,
-    ),
-)
-
-result = await run(question=question, schema=schema, config=config)
-```
-
-### AWS credentials
-
-The system uses boto3's standard credential resolution. Any of these work:
-
-- IAM instance role (if running on EC2/ECS/Lambda)
-- Environment variables: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`
-- Shared credentials file: `~/.aws/credentials`
-- AWS SSO / `aws configure sso`
-
-No Anthropic API key is needed.
-
-## Running the test suite
+### Tests
 
 ```bash
-# Run all tests
-uv run python -m pytest tests/ -v
-
-# Run a specific test file
-uv run python -m pytest tests/unit/test_parser.py -v
-
-# Run with short traceback on failure
-uv run python -m pytest tests/ --tb=short
+uv run pytest tests/ -q          # 275 tests, no external services needed
+uv run pytest tests/unit -v      # unit suite only
 ```
 
-The test suite (275 tests) covers:
-- Lexer tokenization
-- Parser (recursive descent, nesting depth, error reporting)
-- Lisp printer (serialization, all-or-nothing semantics)
-- Pretty printer (Unicode formatting, precedence)
-- Table converter (CREATE TABLE parsing)
-- All 6 RA operators (selection, join, projection, cartesian product, union, division)
-- SMT-LIB conversion
-- Equivalence checker (arity short-circuit, mock subprocess scenarios)
-- SQL converter (all operator mappings, nested operations, error cases)
-- Main entry point (input validation, orchestration with mocked LLM)
+LLM and cvc5 calls are mocked; the suite runs offline.
 
-Tests that exercise the LLM or cvc5 use mocks — no external services are needed to run the test suite.
+## Architecture
 
-## Project structure
+### High-level pipeline
+
+```mermaid
+flowchart TD
+    Q[Natural-language question]
+    S[Schema: CREATE TABLE statements]
+
+    QC[Question converter<br/>LLM → DRC + DISTINCT decision]
+    TC[Table converter<br/>schema → relation predicates]
+
+    P[Planner loop]
+    LLM[LLM operator chooser<br/>temperature escalation]
+    OPS[RA operators<br/>σ, ⋈, π, ×, ∪, ÷]
+    EQ[Equivalence checker<br/>cvc5 SMT-LIB]
+
+    SQL[SQL converter<br/>tree → SELECT statement]
+    SIMP[SQL simplifier<br/>rewrite rules to fixpoint]
+
+    OUT[Final SQL]
+
+    Q --> QC
+    S --> TC
+    S --> QC
+    QC -->|target DRC| P
+    TC -->|seed relations| P
+    P -->|propose op| LLM
+    LLM -->|operator + inputs| OPS
+    OPS -->|new relation| P
+    P -->|relation == target?| EQ
+    EQ -- not yet --> P
+    EQ -- proved equivalent --> SQL
+    SQL --> SIMP --> OUT
+```
+
+### What runs where
+
+| Stage              | Module                                                       | What it does                                                              |
+|--------------------|--------------------------------------------------------------|---------------------------------------------------------------------------|
+| Tokenize / parse   | `parser/lexer.py`, `parser/parser.py`                        | Lisp S-expr → DRC AST. `parse_query` accepts `(limit … (order-by … (drc …)))` wrappers. |
+| Print              | `printer/lisp_printer.py`, `printer/pretty_printer.py`       | DRC AST → Lisp form (machine-friendly) and Unicode form (`{x \| ∃y …}`).  |
+| Schema → relations | `converter/table_converter.py`                               | Each table becomes a predicate `T(a, b, c)`.                              |
+| Question → DRC     | `converter/question_converter.py`, `planner/llm_client.py`   | Bedrock Claude emits Lisp DRC; we re-prompt on parse error.               |
+| RA operators       | `operators/{selection,join,projection,cartesian_product,union,division}.py` | Each operator is a pure function `(params, inputs) → DRC`. |
+| Planner loop       | `planner/planner.py`                                         | LLM picks next op + inputs; we apply, check equivalence, escalate temp on retries. |
+| Equivalence        | `equivalence/{smt_converter,equivalence_checker}.py`         | DRC → SMT-LIB; parallel cvc5 (one for `unsat`, one for `sat`); first decisive answer wins. |
+| SQL emit           | `sql/sql_converter.py`                                       | Operation tree → flat SELECT, with `DISTINCT` / `ORDER BY` / `LIMIT` driven by the extended-DRC wrappers. |
+| SQL simplify       | `sql/simplifier.py`                                          | Rule-based rewrites (unwrap subqueries, inline rebindings, `CROSS JOIN`+`WHERE`→`JOIN ON`, …). |
+
+### Extended DRC
+
+Core DRC is set-based: `{x1, …, xn | φ}`. To represent ordering and
+size-bounded queries we layer non-relational wrappers *outside* the set:
+
+```text
+QueryExpression ::= LIMIT(N, QueryExpression)
+                  | ORDER_BY([(criterion, dir), ...], QueryExpression)
+                  | DRCExpression       -- core, set-based
+```
+
+In Lisp:
+
+```lisp
+(limit 5 (order-by ((salary desc)) (drc (emp_id name salary)
+                                        (in (emp_id name salary) Employees))))
+```
+
+The wrappers don't change the planner or the SMT layer — equivalence is
+checked on the *core* DRC. The wrappers are appended to the outer SELECT
+during SQL emission. This keeps the formalism honest: the things SMT can
+prove (set-membership) stay in the set-based layer; the things it can't
+(row order, row counts) live above it.
+
+### What "verified" means here
+
+For the target DRC `T = {x | φ_T(x)}` and the planner-built relation
+`R = {x | φ_R(x)}`, we ask cvc5 to decide:
+
+```text
+(set-logic ALL)
+(declare-fun ... ; relations as uninterpreted Bool functions
+(declare-const ... ; free vars used in φ_R or φ_T)
+(assert (not (forall (x1 ... xn) (= φ_R φ_T))))
+(check-sat)
+```
+
+`unsat` ⇒ no input makes them differ ⇒ the relations are equivalent over
+*every* possible interpretation of the schema's predicates, not just one
+specific database state. `sat` ⇒ cvc5 found a counter-example. `timeout`
+or `unknown` is treated as not-equivalent and the planner keeps searching.
+
+The planner short-circuits an obvious mismatch (different result-variable
+arity) without invoking cvc5.
+
+### Repository layout
 
 ```
 text_to_sql_planner/
-├── __init__.py              # Package entry point (exports `run`)
-├── main.py                  # Pipeline orchestrator
+├── __init__.py
+├── main.py                       # run(): full pipeline
+├── cli.py                        # argparse + Markdown report
 ├── types/
-│   ├── drc.py               # DRC AST node types
-│   ├── operators.py         # RA operator types
-│   ├── operation_tree.py    # Operation tree types
-│   └── errors.py            # Error types
+│   ├── drc.py                    # core DRC AST + LIMIT/ORDER_BY wrappers
+│   ├── operators.py              # RA operator parameter types
+│   ├── operation_tree.py         # planner's proven-correct tree shape
+│   └── errors.py
 ├── parser/
-│   ├── lexer.py             # Lisp S-expression tokenizer
-│   └── parser.py            # Recursive descent parser
+│   ├── lexer.py
+│   └── parser.py                 # parse() and parse_query()
 ├── printer/
-│   ├── lisp_printer.py      # AST → Lisp S-expression
-│   └── pretty_printer.py    # AST → Unicode notation (∀, ∃, ∧, ∨, ¬, ∈, →)
+│   ├── lisp_printer.py           # print_lisp(), print_query_lisp()
+│   └── pretty_printer.py         # pretty_print(), pretty_print_query()
 ├── converter/
-│   ├── table_converter.py   # CREATE TABLE → DRC
-│   └── question_converter.py # NL question → DRC (via LLM)
+│   ├── table_converter.py
+│   └── question_converter.py     # LLM-driven, with retry-on-parse-error
 ├── operators/
-│   ├── selection.py         # σ (filter)
-│   ├── join.py              # ⋈ (natural join)
-│   ├── projection.py        # π (column subset)
-│   ├── cartesian_product.py # × (cross product)
-│   ├── union_op.py          # ∪ (set union)
-│   └── division.py          # ÷ (relational division)
+│   ├── selection.py
+│   ├── join.py
+│   ├── projection.py
+│   ├── cartesian_product.py
+│   ├── union.py
+│   └── division.py
 ├── equivalence/
-│   ├── smt_converter.py     # DRC → SMT-LIB syntax
-│   └── equivalence_checker.py # Parallel cvc5 invocation
+│   ├── smt_converter.py          # DRC AST → SMT-LIB text
+│   └── equivalence_checker.py    # async parallel cvc5 driver
 ├── planner/
-│   ├── llm_client.py        # boto3 Bedrock wrapper for Claude
-│   └── planner.py           # Iterative planning loop
+│   ├── llm_client.py             # Bedrock + system prompts
+│   └── planner.py                # iteration loop with temperature escalation
 └── sql/
-    └── sql_converter.py     # Operation tree → SQL SELECT
+    ├── sql_converter.py          # tree → flat SELECT
+    └── simplifier.py              # rule-based fixed-point rewriter
+
+tests/
+├── unit/                         # 275 fast tests, mocks LLM and cvc5
+└── ...
+
+examples/                         # end-to-end smoke runs
 ```
+
+## Limitations
+
+- The planner is bounded by `max_iterations` (default 50) and a per-iteration
+  retry cap (default 5). Hard schemas that need long operator chains may
+  time out.
+- The cvc5 calls are time-boxed (30 s default). For deeply quantified
+  expressions cvc5 may return `unknown`, which we treat as
+  not-equivalent — the planner keeps trying with higher temperature.
+- ORDER BY / LIMIT are only meaningful at the top of the query; the
+  formalism doesn't currently support per-subquery ordering inside
+  joins.
+- Supported aggregates are `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`. There's no
+  `HAVING`, `WINDOW`, or `WITH` (CTE) yet.
+
+## License
+
+See `pyproject.toml`. Project metadata is `version = 0.1.0`.
