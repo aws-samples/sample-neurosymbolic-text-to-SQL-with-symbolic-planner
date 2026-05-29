@@ -278,25 +278,33 @@ def _fresh_name(base: str, all_names: set[str]) -> str:
 
 def _convert_quantifier(node: QuantifierNode, var_types: dict[str, str], scope: dict[str, str]) -> str:
     quantifier = node.kind  # "forall" or "exists"
-    
-    # Alpha-rename variables that shadow outer scope
-    all_in_scope = set(scope.values())
+
+    # A quantifier-bound variable shadows the outer scope if its name
+    # collides with either an outer key (an original name that's been
+    # substituted) or an outer value (a name we substituted to). Both
+    # cases must trigger alpha-rename, otherwise the body would either
+    # accidentally drop an outer substitution (when ``v`` equals an outer
+    # key) or capture an outer reference (when ``v`` equals an outer
+    # value).
+    outer_keys = set(scope.keys())
+    outer_values = set(scope.values())
+    forbidden = outer_keys | outer_values
+
     new_scope = dict(scope)  # copy outer scope
     renamed_vars: list[str] = []
-    
+
     for v in node.variables:
-        if v in all_in_scope:
-            # This variable shadows an outer one — rename it
-            fresh = _fresh_name(v, all_in_scope)
+        if v in forbidden:
+            fresh = _fresh_name(v, forbidden)
             new_scope[v] = fresh
-            all_in_scope.add(fresh)
+            forbidden.add(fresh)
             renamed_vars.append(fresh)
         else:
             new_scope[v] = v
-            all_in_scope.add(v)
+            forbidden.add(v)
             renamed_vars.append(v)
-    
-    bindings = " ".join(f"({rv} {var_types.get(orig, 'Int')})" 
+
+    bindings = " ".join(f"({rv} {var_types.get(orig, 'Int')})"
                         for rv, orig in zip(renamed_vars, node.variables))
     body = _convert_node(node.body, var_types, new_scope)
     return f"({quantifier} ({bindings}) {body})"

@@ -163,13 +163,26 @@ class _SqlGenerator:
     def __init__(self):
         self._aliases = _AliasGenerator()
 
-    def generate(self, tree: OperationTree, result_variables: list | None = None) -> SQLResult:
+    def generate(
+        self,
+        tree: OperationTree,
+        result_variables: list | None = None,
+        distinct: bool = False,
+        order_by: list | None = None,
+        limit: int | None = None,
+    ) -> SQLResult:
         """Generate SQL from an operation tree."""
         if tree is None or tree.root is None:
             return SQLFailure(error="Invalid operation tree: root is None")
         try:
             if result_variables:
-                return self._generate_with_result_vars(tree, result_variables)
+                return self._generate_with_result_vars(
+                    tree,
+                    result_variables,
+                    distinct=distinct,
+                    order_by=order_by,
+                    limit=limit,
+                )
             sql = self._convert_node(tree.root)
             return SQLSuccess(sql=sql)
         except _ConversionError as e:
@@ -445,11 +458,18 @@ class _SqlGenerator:
         """Render a projection column, resolving plain names via the var map.
 
         Aggregates pass through `_col_to_sql` unchanged. For plain column
-        names, only emit the qualified form when the requested name doesn't
-        directly correspond to a column in the inner relation (e.g.
-        suffixed forms like ``emp_id_1`` synthesized for self-join
-        disambiguation). In that case we emit ``alias.column AS name`` so
-        outer scopes can still reference the requested name.
+        names we always emit the *qualified* ``alias.column`` form, with
+        ``AS name`` appended when the requested name differs from the
+        underlying column (as happens with the ``_1`` / ``_2`` / ``_r2``
+        suffixes the operator layer introduces to disambiguate self-joins
+        and natural-join overlaps).
+
+        Always qualifying is necessary because the inner relation may join
+        multiple tables that share a column name — an unqualified
+        reference would be ambiguous and rejected by the database. A
+        qualified reference is always unambiguous, and the optional
+        ``AS name`` keeps the column visible to outer scopes under the
+        name they expect.
         """
         col = col.strip()
 
@@ -462,13 +482,6 @@ class _SqlGenerator:
         parts = col.split()
         if len(parts) == 2 and parts[0] in _AGGREGATE_FUNCS:
             return self._col_to_sql(col, var_map)
-
-        # Plain column. If the name maps directly to a column in the inner
-        # relation, prefer the bare name (matches existing convention). If
-        # only a base/suffix-stripped form maps, emit a qualified alias.
-        direct = var_map.get(col)
-        if direct is not None and direct.split(".", 1)[-1] == col:
-            return col
 
         resolved = self._resolve_var(col, var_map)
         if "." in resolved:
@@ -531,22 +544,76 @@ class _SqlGenerator:
 
     # --- Result variables (aggregates + GROUP BY) ---
 
-    def _generate_with_result_vars(self, tree: OperationTree, result_variables: list) -> SQLResult:
-        """Generate SQL when result_variables are provided (may include aggregates)."""
+    def _generate_with_result_vars(
+        self,
+        tree: OperationTree,
+        result_variables: list,
+        distinct: bool = False,
+        order_by: list | None = None,
+        limit: int | None = None,
+    ) -> SQLResult:
+        """Generate SQL when result_variables are provided (may include aggregates).
+
+        The ``result_variables`` come from the *target* DRC expression, not
+        from the operation tree. The planner is free to introduce suffixes
+        (``_1``, ``_2``, ``_r2``) onto the tree root's output columns
+        during operator application, so the names rarely match the
+        target's. They do, however, agree positionally: the equivalence
+        checker enforces equal arity and the operators preserve column
+        order. We therefore look each target result variable up *by
+        position* in the root's ``output_columns``, resolve that name in
+        the inner relation context, and emit ``AS target_name`` when the
+        underlying name differs from the target name.
+
+        ``distinct`` controls whether the outer SELECT uses ``DISTINCT``.
+        It defaults to ``False`` — duplicate elimination should be an
+        explicit decision driven by user intent (typically determined by
+        a separate analysis of the natural-language question), not an
+        unconditional artifact of mapping DRC's set semantics onto SQL's
+        bag semantics. When aggregates are present the flag is ignored:
+        ``GROUP BY`` (mixed columns and aggregates) or single-row
+        aggregation already produce a distinct result.
+        """
         has_aggregates = any(isinstance(rv, AggregateVariable) for rv in result_variables)
 
         ctx = self._build_context(tree.root)
+        root_columns = self._get_node_columns(tree.root)
+
+        def _lookup_at(idx: int, fallback_name: str) -> str:
+            """Resolve the ``idx``-th tree column, falling back to the
+            target name only if the tree lacks output columns."""
+            if 0 <= idx < len(root_columns):
+                return self._resolve_var(root_columns[idx], ctx.var_mapping)
+            return self._resolve_var(fallback_name, ctx.var_mapping)
 
         select_parts: list[str] = []
-        for rv in result_variables:
+        for i, rv in enumerate(result_variables):
             if isinstance(rv, ColumnVariable):
-                select_parts.append(self._resolve_var(rv.name, ctx.var_mapping))
+                qualified = _lookup_at(i, rv.name)
+                base = qualified.split(".", 1)[-1] if "." in qualified else qualified
+                if base != rv.name:
+                    select_parts.append(f"{qualified} AS {rv.name}")
+                else:
+                    select_parts.append(qualified)
             elif isinstance(rv, AggregateVariable):
-                qualified_col = self._resolve_var(rv.column, ctx.var_mapping)
+                qualified_col = _lookup_at(i, rv.column)
                 select_parts.append(f"{rv.function}({qualified_col})")
 
         select_str = ", ".join(select_parts)
-        parts = [f"SELECT {select_str}"]
+
+        # DRC ``{x1, ..., xn | C}`` is set semantics, but blindly emitting
+        # ``DISTINCT`` to match it changes COUNT-over-bag-cardinality
+        # results and obscures otherwise-suspicious duplication. We only
+        # emit ``DISTINCT`` when the caller explicitly asked for it (via
+        # the ``distinct`` flag, typically derived from a question-level
+        # analysis of user intent). When aggregates are present the flag
+        # is ignored: ``GROUP BY`` or the single-row aggregate result
+        # already make the projection distinct.
+        if has_aggregates or not distinct:
+            select_keyword = "SELECT"
+        else:
+            select_keyword = "SELECT DISTINCT"
+        parts = [f"{select_keyword} {select_str}"]
         parts.append(f"  FROM {ctx.from_clause}")
         for jc in ctx.join_clauses:
             parts.append(f"  {jc}")
@@ -554,13 +621,52 @@ class _SqlGenerator:
             parts.append(f"  WHERE {' AND '.join(ctx.where_conditions)}")
 
         if has_aggregates:
-            plain_cols = [
-                self._resolve_var(rv.name, ctx.var_mapping)
-                for rv in result_variables
-                if isinstance(rv, ColumnVariable)
-            ]
+            plain_cols: list[str] = []
+            for i, rv in enumerate(result_variables):
+                if isinstance(rv, ColumnVariable):
+                    plain_cols.append(_lookup_at(i, rv.name))
             if plain_cols:
                 parts.append(f"  GROUP BY {', '.join(plain_cols)}")
+
+        # ORDER BY / LIMIT layers are non-relational — they live outside
+        # the set comprehension. Each ORDER BY key references the target
+        # DRC's result-variable namespace, so we resolve via the same
+        # positional mapping ``_lookup_at`` uses for SELECT columns.
+        if order_by:
+            order_parts: list[str] = []
+            # Build a name-to-position map so we can find the column
+            # underlying a referenced result-variable name.
+            rv_name_to_idx: dict[str, int] = {}
+            for i, rv in enumerate(result_variables):
+                if isinstance(rv, ColumnVariable):
+                    rv_name_to_idx[rv.name] = i
+                elif isinstance(rv, AggregateVariable):
+                    rv_name_to_idx[rv.column] = i
+
+            for crit in order_by:
+                col = crit.column
+                if not col:
+                    return SQLFailure(error="ORDER BY criterion has empty column")
+                if col in rv_name_to_idx:
+                    qualified = _lookup_at(rv_name_to_idx[col], col)
+                else:
+                    # Not a result variable — fall back to direct
+                    # resolution against the inner var_map. This handles
+                    # ORDER BY on a column the user named outside the
+                    # SELECT list (rare but allowed in standard SQL).
+                    qualified = self._resolve_var(col, ctx.var_mapping)
+                if crit.aggregate:
+                    qualified = f"{crit.aggregate}({qualified})"
+                direction = (crit.direction or "asc").upper()
+                if direction not in ("ASC", "DESC"):
+                    return SQLFailure(error=f"Invalid ORDER BY direction: {crit.direction}")
+                order_parts.append(f"{qualified} {direction}")
+            parts.append(f"  ORDER BY {', '.join(order_parts)}")
+
+        if limit is not None:
+            if not isinstance(limit, int) or limit <= 0:
+                return SQLFailure(error=f"LIMIT must be a positive integer, got {limit!r}")
+            parts.append(f"  LIMIT {limit}")
 
         return SQLSuccess(sql="\n".join(parts))
 
@@ -863,7 +969,13 @@ class _SqlGenerator:
 # --- Public API ---
 
 
-def convert_to_sql(tree: OperationTree, result_variables: list | None = None) -> SQLResult:
+def convert_to_sql(
+    tree: OperationTree,
+    result_variables: list | None = None,
+    distinct: bool = False,
+    order_by: list | None = None,
+    limit: int | None = None,
+) -> SQLResult:
     """Convert an OperationTree into a flat SQL SELECT statement.
 
     If result_variables contains a mix of plain columns and aggregates,
@@ -872,6 +984,60 @@ def convert_to_sql(tree: OperationTree, result_variables: list | None = None) ->
     Args:
         tree: The operation tree.
         result_variables: The target DRC expression's result variables (optional).
+        distinct: If True (and no aggregates are present), emit
+            ``SELECT DISTINCT`` to enforce set semantics on the outer
+            projection. Defaults to False; the caller is expected to
+            decide based on user intent (e.g. via a question-level
+            analysis from the LLM).
+        order_by: Optional list of ``SortCriterion`` from an extended-DRC
+            ``ORDER BY`` wrapper. Emits ``ORDER BY`` on the outer SELECT.
+        limit: Optional positive integer from an extended-DRC ``LIMIT``
+            wrapper. Emits ``LIMIT`` on the outer SELECT.
     """
     gen = _SqlGenerator()
-    return gen.generate(tree, result_variables)
+    return gen.generate(
+        tree,
+        result_variables,
+        distinct=distinct,
+        order_by=order_by,
+        limit=limit,
+    )
+
+
+def convert_query_to_sql(
+    tree: OperationTree,
+    query,
+    distinct: bool = False,
+) -> SQLResult:
+    """Convert a tree + query (DRC, optionally wrapped in order-by/limit)
+    into a flat SQL SELECT statement.
+
+    The query's inner DRC supplies the result-variable list; the
+    ``ORDER BY`` / ``LIMIT`` layers (if any) become outer-SELECT clauses.
+    """
+    from text_to_sql_planner.types.drc import (
+        DRCExpression,
+        LimitExpression,
+        OrderByExpression,
+        query_inner_drc,
+        query_limit,
+        query_order_by,
+    )
+
+    if query is None:
+        return SQLFailure(error="query is None")
+
+    inner = query_inner_drc(query)
+    if not isinstance(inner, DRCExpression):
+        return SQLFailure(error=f"Unexpected query inner type: {type(inner).__name__}")
+
+    ob = query_order_by(query)
+    lim = query_limit(query)
+
+    return convert_to_sql(
+        tree,
+        result_variables=inner.result_variables,
+        distinct=distinct,
+        order_by=ob.criteria if ob is not None else None,
+        limit=lim.n if lim is not None else None,
+    )

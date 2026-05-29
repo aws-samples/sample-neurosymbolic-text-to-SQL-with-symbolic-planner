@@ -121,3 +121,102 @@ DRCCondition = Union[
 ]
 
 DRCNode = Union[DRCExpression, DRCCondition]
+
+
+# ---------------------------------------------------------------------------
+# Extended DRC: order/limit wrappers (non-relational layer)
+# ---------------------------------------------------------------------------
+#
+# Core DRC is set-based, so it has no notion of row order or result size.
+# To support questions like "the top 5 most-compensated employees" we wrap
+# a core DRC expression in non-DRC operators. The wrappers compose and the
+# pipeline always normalizes a query as
+#
+#     QueryExpression = LIMIT? · ORDER_BY? · DRCExpression
+#
+# i.e. an optional LIMIT outside an optional ORDER_BY outside the
+# set-comprehension. Either wrapper can be omitted.
+#
+# The wrappers are deliberately *not* part of ``DRCCondition`` — they live
+# at the query level because they cannot be expressed in first-order
+# predicate logic over relations. Equivalence checking peels them off and
+# compares the inner DRC; the SQL converter emits them as ``ORDER BY`` /
+# ``LIMIT`` clauses on the outermost SELECT.
+
+
+SortDirection = Literal["asc", "desc"]
+
+
+@dataclass
+class SortCriterion:
+    """A single ORDER BY key.
+
+    ``column`` must reference a result variable of the inner DRC (a plain
+    column name, or the underlying column of an aggregate result variable
+    such as ``column='salary'`` for ``(SUM salary)``).
+
+    ``aggregate`` is set when the key is an aggregate function over
+    ``column`` (mirroring ``AggregateVariable``); otherwise it's ``None``
+    and the key is the bare column.
+    """
+
+    column: str = ""
+    direction: SortDirection = "asc"
+    aggregate: Union[AggregateFunction, None] = None
+
+
+@dataclass
+class OrderByExpression:
+    """ORDER BY wrapper around a DRC set.
+
+    ``criteria`` is a non-empty list of sort keys, applied in order
+    (first key is primary, second tie-breaks, etc.).
+    """
+
+    criteria: list[SortCriterion] = field(default_factory=list)
+    inner: DRCExpression = None  # type: ignore
+
+
+@dataclass
+class LimitExpression:
+    """LIMIT wrapper around an ordered (or set) DRC expression.
+
+    ``n`` is the (positive) row count cap. ``inner`` is typically an
+    ``OrderByExpression`` — applying ``LIMIT`` to an unordered set is
+    non-deterministic but syntactically allowed for completeness.
+    """
+
+    n: int = 0
+    inner: Union[OrderByExpression, DRCExpression] = None  # type: ignore
+
+
+QueryExpression = Union[LimitExpression, OrderByExpression, DRCExpression]
+
+
+def query_inner_drc(query: QueryExpression) -> DRCExpression:
+    """Strip any LIMIT/ORDER BY wrappers and return the core DRCExpression.
+
+    Raises ``TypeError`` if the eventual core is not a ``DRCExpression``.
+    """
+    while not isinstance(query, DRCExpression):
+        if isinstance(query, LimitExpression) or isinstance(query, OrderByExpression):
+            query = query.inner
+        else:
+            raise TypeError(
+                f"Unexpected query node type: {type(query).__name__}"
+            )
+    return query
+
+
+def query_order_by(query: QueryExpression) -> Union[OrderByExpression, None]:
+    """Return the ORDER BY layer of ``query`` if present, else ``None``."""
+    if isinstance(query, LimitExpression):
+        return query.inner if isinstance(query.inner, OrderByExpression) else None
+    if isinstance(query, OrderByExpression):
+        return query
+    return None
+
+
+def query_limit(query: QueryExpression) -> Union[LimitExpression, None]:
+    """Return the LIMIT layer of ``query`` if present, else ``None``."""
+    return query if isinstance(query, LimitExpression) else None

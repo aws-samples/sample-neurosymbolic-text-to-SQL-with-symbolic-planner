@@ -267,6 +267,49 @@ Schema: CREATE TABLE Employees (emp_id INT, first_name VARCHAR, last_name VARCHA
 Answer: (drc (emp_id first_name last_name) (exists (dept_id) (and (in (emp_id first_name last_name dept_id) Employees) (not (exists (review_id rating) (in (review_id emp_id rating) Reviews))))))
 Note: dept_id is NOT a result variable so it's quantified. emp_id IS a result variable so it stays free.
 
+Cardinality patterns ("at least N", "two or more", "more than N", "exactly N"):
+- "at least N" / "N or more" / "two or more" → assert the existence of N distinct witnesses, joined by AND, all pairwise distinct. DO NOT add ``(not (exists ...))`` for an extra witness — that turns "≥N" into "exactly N" or "≥N+1".
+- "more than N" → same as "at least N+1".
+- "exactly N" → assert N distinct witnesses AND ``(not (exists ...))`` for an (N+1)-th witness distinct from all the prior ones.
+- Each witness must be wrapped in its own existential quantifier and constrained by an (in ...) membership.
+- Witnesses must be pairwise distinct via (!= ...) on the identifying columns.
+
+Question: "List all employees that have two or more performance reviews"
+Schema: CREATE TABLE Employees (emp_id INT, name VARCHAR); CREATE TABLE Reviews (review_id INT, emp_id INT, rating INT)
+Answer: (drc (emp_id name) (and (in (emp_id name) Employees) (exists (r1 rating1) (and (in (r1 emp_id rating1) Reviews) (exists (r2 rating2) (and (in (r2 emp_id rating2) Reviews) (!= r1 r2)))))))
+Note: TWO existential witnesses (r1 and r2), both bound to ``emp_id``, with ``(!= r1 r2)``. NO third witness, NO ``(not (exists ...))`` clause.
+
+Question: "List employees with exactly two performance reviews"
+Schema: CREATE TABLE Employees (emp_id INT, name VARCHAR); CREATE TABLE Reviews (review_id INT, emp_id INT, rating INT)
+Answer: (drc (emp_id name) (and (in (emp_id name) Employees) (and (exists (r1 rating1) (and (in (r1 emp_id rating1) Reviews) (exists (r2 rating2) (and (in (r2 emp_id rating2) Reviews) (!= r1 r2))))) (not (exists (r3 rating3) (and (in (r3 emp_id rating3) Reviews) (and (!= r3 r1) (!= r3 r2))))))))
+Note: TWO positive witnesses AND a (not (exists ...)) for a third one. The "exactly" is what introduces the negative clause.
+
+Question: "List all employees that have three or more performance reviews"
+Schema: CREATE TABLE Employees (emp_id INT, name VARCHAR); CREATE TABLE Reviews (review_id INT, emp_id INT, rating INT)
+Answer: (drc (emp_id name) (and (in (emp_id name) Employees) (exists (r1 rating1) (and (in (r1 emp_id rating1) Reviews) (exists (r2 rating2) (and (in (r2 emp_id rating2) Reviews) (and (!= r1 r2) (exists (r3 rating3) (and (in (r3 emp_id rating3) Reviews) (and (!= r3 r1) (!= r3 r2))))))))))
+Note: THREE positive witnesses, all pairwise distinct (r1≠r2, r3≠r1, r3≠r2). NO ``(not (exists ...))``.
+
+Ordering and limiting (extended DRC):
+- DRC itself is set-based — it has no row order or row count. To express "top N", "first N by ...", "the highest/lowest", "ranked by ...", etc., wrap the core DRC in non-relational operators:
+    (limit N (order-by ((key dir) (key2 dir2) ...) (drc (...) ...)))
+- ``key`` is either a bare column name from the result variables, or an aggregate sub-form ``(AGG col)`` mirroring an aggregate result variable.
+- ``dir`` is ``asc`` or ``desc``.
+- ``order-by`` is the inner wrapper, ``limit`` is outermost. Either may be omitted; LIMIT without ORDER BY is non-deterministic and should usually be avoided.
+- The wrappers DO NOT change the inner ``(drc ...)`` — keep result variables and condition exactly as they would be without the wrappers.
+
+Question: "Show me the top 5 most-compensated employees"
+Schema: CREATE TABLE Employees (emp_id INT, name VARCHAR, salary DECIMAL)
+Answer: (limit 5 (order-by ((salary desc)) (drc (emp_id name salary) (in (emp_id name salary) Employees))))
+
+Question: "List the 10 oldest employees by hire date"
+Schema: CREATE TABLE Employees (emp_id INT, name VARCHAR, hire_date DATE)
+Answer: (limit 10 (order-by ((hire_date asc)) (drc (emp_id name hire_date) (in (emp_id name hire_date) Employees))))
+
+Question: "Which 3 departments have the most employees?"
+Schema: CREATE TABLE Employees (emp_id INT, name VARCHAR, dept_id INT); CREATE TABLE Departments (dept_id INT, dept_name VARCHAR)
+Answer: (limit 3 (order-by (((COUNT emp_id) desc)) (drc (dept_name (COUNT emp_id)) (exists (dept_id) (and (in (dept_id dept_name) Departments) (exists (emp_id name) (and (in (emp_id name dept_id) Employees))))))))
+Note: The order-by key matches the aggregate result variable. The aggregate appears in BOTH the result variables of the inner DRC AND as the order-by key.
+
 Return ONLY the DRC expression in Lisp syntax, nothing else."""
 
 
@@ -380,3 +423,122 @@ async def summarize_relation(
             return block["text"].strip()
 
     return f"Relation with columns {columns}"
+
+
+_SYSTEM_PROMPT_DISTINCT = """You decide whether a natural-language database question requires SELECT DISTINCT in the generated SQL.
+
+Use DISTINCT when the question asks for a *set* of distinct entities and the join structure could otherwise produce duplicate rows. Common signals:
+- "list all X that ..." or "which X ..." where X is a single entity that can match the predicate multiple ways (e.g. "employees that have two or more reviews" — joining with reviews twice would duplicate the employee otherwise)
+- "find every / all distinct / unique ..."
+- The selected columns don't include a unique identifier of the joined-in entities
+
+Do NOT use DISTINCT when:
+- The question asks for one row per occurrence ("list all reviews", "list employees and their review IDs")
+- The question is an aggregation ("how many X", "average Y", "sum Z") — aggregates handle distinctness themselves
+- The question pairs multiple entities and each pair is meant to be a distinct row ("list employees with their departments")
+- The selected columns already include a unique identifier of every joined entity
+
+When in doubt, prefer not to use DISTINCT, since aggregations like COUNT count duplicates by design and unnecessary DISTINCT can hide bugs."""
+
+
+_DISTINCT_TOOL = {
+    "name": "decide_distinct",
+    "description": "Decide whether the SQL query should use SELECT DISTINCT.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "reasoning": {
+                "type": "string",
+                "description": "Short justification for the decision.",
+            },
+            "use_distinct": {
+                "type": "boolean",
+                "description": "True if the SQL should use SELECT DISTINCT, false otherwise.",
+            },
+        },
+        "required": ["reasoning", "use_distinct"],
+    },
+}
+
+
+@dataclass
+class DistinctDecision:
+    """Whether the user's question implies SELECT DISTINCT, with reasoning."""
+
+    use_distinct: bool
+    reasoning: str = ""
+
+
+async def decide_distinct(
+    question: str,
+    schema: str,
+    config: LLMClientConfig | None = None,
+) -> DistinctDecision:
+    """Ask the LLM whether the user's question implies SELECT DISTINCT.
+
+    The decision is based on the natural-language question and schema only —
+    the operation tree is not consulted, because user intent (set vs bag)
+    is a question-level concern, not a tree-structure concern.
+
+    Args:
+        question: The natural language question.
+        schema: The database schema (CREATE TABLE statements).
+        config: LLM client configuration.
+
+    Returns:
+        A DistinctDecision with the boolean and a short reasoning string.
+        Defaults to ``use_distinct=False`` on any error or unexpected
+        response, since unnecessary DISTINCT can hide bugs.
+    """
+    if config is None:
+        config = LLMClientConfig()
+
+    try:
+        client = _get_bedrock_client(config)
+    except ImportError:
+        return DistinctDecision(use_distinct=False, reasoning="boto3 unavailable")
+
+    user_message = f"Schema:\n{schema}\n\nQuestion: {question}"
+
+    request_body = {
+        "modelId": config.model_id,
+        "system": [{"text": _SYSTEM_PROMPT_DISTINCT}],
+        "messages": [
+            {"role": "user", "content": [{"text": user_message}]}
+        ],
+        "inferenceConfig": {
+            "maxTokens": 256,
+            "temperature": 0.0,
+        },
+        "toolConfig": {
+            "tools": [
+                {
+                    "toolSpec": {
+                        "name": _DISTINCT_TOOL["name"],
+                        "description": _DISTINCT_TOOL["description"],
+                        "inputSchema": {"json": _DISTINCT_TOOL["input_schema"]},
+                    }
+                }
+            ],
+            "toolChoice": {"tool": {"name": "decide_distinct"}},
+        },
+    }
+
+    try:
+        response = client.converse(**request_body)
+    except Exception as e:
+        return DistinctDecision(use_distinct=False, reasoning=f"LLM error: {e}")
+
+    output = response.get("output", {})
+    message = output.get("message", {})
+    content_blocks = message.get("content", [])
+
+    for block in content_blocks:
+        if block.get("toolUse") and block["toolUse"].get("name") == "decide_distinct":
+            args = block["toolUse"]["input"]
+            return DistinctDecision(
+                use_distinct=bool(args.get("use_distinct", False)),
+                reasoning=str(args.get("reasoning", "")),
+            )
+
+    return DistinctDecision(use_distinct=False, reasoning="No tool use in response")

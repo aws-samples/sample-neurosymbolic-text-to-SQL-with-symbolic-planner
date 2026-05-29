@@ -247,7 +247,9 @@ class TestProjection:
         result = convert_to_sql(tree)
 
         assert isinstance(result, SQLSuccess)
-        assert "SELECT name, age" in result.sql
+        # Columns are always qualified with the table alias to avoid
+        # ambiguity in the presence of joins.
+        assert "SELECT e1.name, e1.age" in result.sql
         assert "FROM employees" in result.sql
 
     def test_single_column(self):
@@ -259,7 +261,7 @@ class TestProjection:
         result = convert_to_sql(tree)
 
         assert isinstance(result, SQLSuccess)
-        assert "SELECT id" in result.sql
+        assert "SELECT e1.id" in result.sql
         assert "FROM employees" in result.sql
 
     def test_error_invalid_column(self):
@@ -411,7 +413,8 @@ class TestNestedOperations:
         result = convert_to_sql(tree)
 
         assert isinstance(result, SQLSuccess)
-        assert "SELECT name, age" in result.sql
+        # Projected columns are always qualified to avoid ambiguity.
+        assert "SELECT e1.name, e1.age" in result.sql
         assert "WHERE" in result.sql
         assert "age > 30" in result.sql
 
@@ -450,7 +453,7 @@ class TestNestedOperations:
         result = convert_to_sql(tree)
 
         assert isinstance(result, SQLSuccess)
-        assert "SELECT color" in result.sql
+        assert "SELECT c1.color" in result.sql
         assert "CROSS JOIN" in result.sql
 
 

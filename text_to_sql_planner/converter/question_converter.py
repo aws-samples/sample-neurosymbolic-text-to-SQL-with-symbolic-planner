@@ -5,21 +5,44 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Union
 
-from text_to_sql_planner.parser import parse, ParserSuccess, ParserFailure
+from text_to_sql_planner.parser import (
+    parse_query,
+    QueryParserSuccess,
+    QueryParserFailure,
+)
 from text_to_sql_planner.planner.llm_client import (
     LLMClientConfig,
     convert_question_to_drc,
+    decide_distinct,
 )
-from text_to_sql_planner.printer import pretty_print, pretty_print_indented, PrintSuccess
-from text_to_sql_planner.types.drc import DRCExpression
+from text_to_sql_planner.printer import (
+    pretty_print,
+    pretty_print_indented,
+    pretty_print_query,
+    PrintSuccess,
+)
+from text_to_sql_planner.types.drc import (
+    DRCExpression,
+    QueryExpression,
+    query_inner_drc,
+)
 
 
 @dataclass
 class ConversionSuccess:
     """Successful question-to-DRC conversion."""
 
-    expression: DRCExpression
+    expression: DRCExpression  # the inner core DRC, for backward compatibility
     lisp_syntax: str  # raw LLM output
+    query: QueryExpression | None = None  # the full extended-DRC query (None defaults to ``expression``)
+    use_distinct: bool = False  # whether the question implies SELECT DISTINCT
+    distinct_reasoning: str = ""
+
+    def __post_init__(self) -> None:
+        # If only the inner DRC was supplied (e.g. by tests), treat it as
+        # an unwrapped query.
+        if self.query is None:
+            self.query = self.expression
 
 
 @dataclass
@@ -99,27 +122,59 @@ async def convert_question(
             print(f"#### LLM raw output\n")
             print(f"```lisp\n{raw_lisp}\n```\n")
 
-            # Parse the Lisp syntax
-            result = parse(raw_lisp)
+            # Parse the Lisp syntax (extended DRC: optional limit / order-by
+            # wrappers around a core ``(drc ...)`` form).
+            result = parse_query(raw_lisp)
 
-            if isinstance(result, ParserSuccess):
-                # Validate: check for unquantified free variables
-                validation_error = _validate_free_variables(result.expression)
+            if isinstance(result, QueryParserSuccess):
+                query = result.query
+                inner_drc = query_inner_drc(query)
+                # Validate: check for unquantified free variables on the
+                # core DRC. The wrappers don't introduce new variables.
+                validation_error = _validate_free_variables(inner_drc)
                 if validation_error:
                     last_error = validation_error
                     print(f"⚠️ **Validation failed:** {validation_error}\n")
                     continue
 
                 print(f"✅ **Parse succeeded**\n")
-                pp = pretty_print_indented(result.expression)
+                pp = pretty_print_query(query)
                 if isinstance(pp, PrintSuccess):
-                    print(f"**DRC (pretty):**\n```\n{pp.output}\n```\n")
-                print(f"**DRC (lisp):**\n```lisp\n{raw_lisp}\n```\n")
+                    print(f"**Query (pretty):**\n```\n{pp.output}\n```\n")
+                else:
+                    pp_inner = pretty_print_indented(inner_drc)
+                    if isinstance(pp_inner, PrintSuccess):
+                        print(f"**DRC (pretty):**\n```\n{pp_inner.output}\n```\n")
+                print(f"**Query (lisp):**\n```lisp\n{raw_lisp}\n```\n")
+
+                # Decide whether the question implies SELECT DISTINCT.
+                # Done after a successful parse so we don't waste an LLM
+                # call on questions that won't produce SQL anyway.
+                try:
+                    distinct_decision = await decide_distinct(question, schema, config)
+                    print(
+                        f"**DISTINCT decision:** "
+                        f"{'yes' if distinct_decision.use_distinct else 'no'}"
+                        + (f" — {distinct_decision.reasoning}"
+                           if distinct_decision.reasoning else "")
+                        + "\n"
+                    )
+                except Exception as e:
+                    print(f"⚠️ **DISTINCT decision failed:** {e} — defaulting to no DISTINCT\n")
+                    from text_to_sql_planner.planner.llm_client import DistinctDecision
+                    distinct_decision = DistinctDecision(
+                        use_distinct=False,
+                        reasoning=f"error: {e}",
+                    )
+
                 return ConversionSuccess(
-                    expression=result.expression,
+                    expression=inner_drc,
+                    query=query,
                     lisp_syntax=raw_lisp,
+                    use_distinct=distinct_decision.use_distinct,
+                    distinct_reasoning=distinct_decision.reasoning,
                 )
-            elif isinstance(result, ParserFailure):
+            elif isinstance(result, QueryParserFailure):
                 last_error = str(result.error)
                 print(f"❌ **Parse failed:** {last_error}\n")
             else:

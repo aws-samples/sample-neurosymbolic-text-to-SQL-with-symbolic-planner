@@ -239,80 +239,109 @@ async def check_equivalence(
 def _build_equivalence_script(expr1: DRCExpression, expr2: DRCExpression, schema_types: dict[str, str] | None = None) -> str:
     """Build SMT-LIB script to check equivalence of two DRC expressions.
 
-    For {x1,...,xn | C1} and {x1,...,xn | C2}, we check:
-        (assert (not (forall ((x1 Int) ... (xn Int)) (= C1 C2))))
+    For ``{x1,...,xn | C1}`` and ``{y1,...,yn | C2}`` we check::
+
+        (assert (not (forall ((r1 Sort) ... (rn Sort)) (= C1' C2'))))
         (check-sat)
+
+    where ``r1..rn`` are *fresh* shared names, ``C1'`` is ``C1`` with each
+    result variable substituted to its shared name, and ``C2'`` is the
+    same for ``C2``. The substitution is essential: the two DRC
+    expressions may use different names for the same logical result
+    column (e.g. one side carries an operator-introduced ``_1`` suffix
+    while the other uses the bare column name). Without substitution,
+    ``C2`` would reference declared free constants instead of the
+    universally quantified result variables, and the equivalence check
+    would be vacuous.
 
     If unsat: the expressions define the same relation (equivalent).
     If sat: there exists a tuple where they differ (not equivalent).
     """
     from text_to_sql_planner.types.drc import ColumnVariable, AggregateVariable
-    from .smt_converter import convert_condition_to_formula, collect_symbols
+    from .smt_converter import collect_symbols
 
-    # Get the result variable names (these are the free variables we quantify over)
-    result_vars: list[str] = []
-    for rv in expr1.result_variables:
+    # Per-side names of the result variables (in positional order).
+    def _rv_name(rv) -> str:
         if isinstance(rv, ColumnVariable):
-            result_vars.append(rv.name)
-        elif isinstance(rv, AggregateVariable):
-            result_vars.append(rv.column)
+            return rv.name
+        if isinstance(rv, AggregateVariable):
+            return rv.column
+        raise ValueError(f"Unknown result variable type: {type(rv).__name__}")
 
-    # Convert both conditions to SMT-LIB formulas — done AFTER type computation
-    # (placeholder — actual conversion happens below after types are resolved)
+    rv_names_1 = [_rv_name(rv) for rv in expr1.result_variables]
+    rv_names_2 = [_rv_name(rv) for rv in expr2.result_variables]
 
-    # Collect all symbols (relations and variables) from both conditions
+    # Collect symbols and infer types from both sides.
     rels1, vars1 = collect_symbols(expr1.condition)
     rels2, vars2 = collect_symbols(expr2.condition)
 
-    # Infer variable types from both conditions
     from .smt_converter import collect_var_types, _collect_relation_sorts, _convert_node
     var_types1 = collect_var_types(expr1.condition)
     var_types2 = collect_var_types(expr2.condition)
-    # Merge: String wins over Int (more specific)
     all_var_types: dict[str, str] = {}
     for vt in (var_types1, var_types2):
         for v, t in vt.items():
             if t == "String" or v not in all_var_types:
                 all_var_types[v] = t
 
-    # Apply schema types (authoritative source — overrides inference)
     if schema_types:
         for v, t in schema_types.items():
             if t == "String":
                 all_var_types[v] = "String"
 
-    # Merge declarations
     all_relations: dict[str, int] = {}
     for name, arity in rels1.items():
         all_relations[name] = max(all_relations.get(name, 0), arity)
     for name, arity in rels2.items():
         all_relations[name] = max(all_relations.get(name, 0), arity)
 
-    # Collect relation sorts
     rel_sorts: dict[str, list[str]] = {}
     _collect_relation_sorts(expr1.condition, all_var_types, rel_sorts)
     _collect_relation_sorts(expr2.condition, all_var_types, rel_sorts)
-
-    # Propagate types from relation sorts back to variables
     _propagate_types_from_relations(expr1.condition, rel_sorts, all_var_types)
     _propagate_types_from_relations(expr2.condition, rel_sorts, all_var_types)
-
-    # Re-collect relation sorts with updated types
     rel_sorts = {}
     _collect_relation_sorts(expr1.condition, all_var_types, rel_sorts)
     _collect_relation_sorts(expr2.condition, all_var_types, rel_sorts)
 
-    # NOW convert formulas with the fully-resolved type information
-    formula1 = _convert_node(expr1.condition, all_var_types)
-    formula2 = _convert_node(expr2.condition, all_var_types)
+    # Pick fresh shared names for the universally quantified result
+    # variables. Avoid collisions with anything declared or referenced
+    # anywhere in either expression.
+    reserved = set(vars1) | set(vars2) | set(rv_names_1) | set(rv_names_2)
+    shared_names: list[str] = []
+    for i in range(len(rv_names_1)):
+        base = f"_rv_{i}"
+        candidate = base
+        counter = 2
+        while candidate in reserved:
+            candidate = f"{base}_{counter}"
+            counter += 1
+        shared_names.append(candidate)
+        reserved.add(candidate)
 
-    all_variables = vars1 | vars2
+    # Per-side scope maps so each formula's result-variable references
+    # resolve to the shared names.
+    scope1 = {orig: shared for orig, shared in zip(rv_names_1, shared_names)}
+    scope2 = {orig: shared for orig, shared in zip(rv_names_2, shared_names)}
 
-    # Build the script
+    # Determine the type for each shared name (String wins over Int).
+    def _shared_sort(idx: int) -> str:
+        n1 = rv_names_1[idx]
+        n2 = rv_names_2[idx]
+        t1 = all_var_types.get(n1, "Int")
+        t2 = all_var_types.get(n2, "Int")
+        if t1 == "String" or t2 == "String":
+            return "String"
+        return "Int"
+
+    # Convert each condition under its substitution scope.
+    formula1 = _convert_node(expr1.condition, all_var_types, scope1)
+    formula2 = _convert_node(expr2.condition, all_var_types, scope2)
+
+    # Build the script.
     lines: list[str] = []
     lines.append("(set-logic ALL)")
 
-    # Declare relations as uninterpreted functions returning Bool
     for rel_name, arity in sorted(all_relations.items()):
         if rel_name in rel_sorts:
             sorts = " ".join(rel_sorts[rel_name])
@@ -320,20 +349,22 @@ def _build_equivalence_script(expr1: DRCExpression, expr2: DRCExpression, schema
             sorts = " ".join(["Int"] * arity)
         lines.append(f"(declare-fun {rel_name} ({sorts}) Bool)")
 
-    # Declare free variables that are NOT the result variables
-    # (result variables will be universally quantified)
-    bound_vars = set(result_vars)
-    for var in sorted(all_variables - bound_vars):
+    # Free variables = everything used in either condition that wasn't a
+    # result variable on its own side. With substitution in place, the
+    # result variables vanish from the formula, replaced by the shared
+    # names, so they should NOT be declared as free constants.
+    bound_originals = set(rv_names_1) | set(rv_names_2)
+    all_variables = vars1 | vars2
+    for var in sorted(all_variables - bound_originals):
         sort = all_var_types.get(var, "Int")
         lines.append(f"(declare-const {var} {sort})")
 
-    # Build the universally quantified equivalence assertion:
-    # (assert (not (forall ((x1 Sort) ... (xn Sort)) (= C1 C2))))
-    if result_vars:
-        bindings = " ".join(f"({v} {all_var_types.get(v, 'Int')})" for v in result_vars)
+    if shared_names:
+        bindings = " ".join(
+            f"({name} {_shared_sort(i)})" for i, name in enumerate(shared_names)
+        )
         lines.append(f"(assert (not (forall ({bindings}) (= {formula1} {formula2}))))")
     else:
-        # No result variables — just compare directly
         lines.append(f"(assert (not (= {formula1} {formula2})))")
 
     lines.append("(check-sat)")

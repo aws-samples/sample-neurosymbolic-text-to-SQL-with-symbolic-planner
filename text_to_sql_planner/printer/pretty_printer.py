@@ -9,20 +9,24 @@ Uses all-or-nothing semantics: on error, no partial string is produced.
 from __future__ import annotations
 
 from text_to_sql_planner.types.drc import (
-    DRCExpression,
-    ColumnVariable,
     AggregateVariable,
-    QuantifierNode,
-    LogicalConnectiveNode,
-    NotNode,
-    ComparisonNode,
-    MembershipNode,
     ArithmeticNode,
-    LiteralNode,
-    VariableRefNode,
-    FunctionCallNode,
+    ColumnVariable,
+    ComparisonNode,
     DRCCondition,
+    DRCExpression,
+    FunctionCallNode,
+    LimitExpression,
+    LiteralNode,
+    LogicalConnectiveNode,
+    MembershipNode,
+    NotNode,
+    OrderByExpression,
+    QuantifierNode,
+    QueryExpression,
     ResultVariable,
+    SortCriterion,
+    VariableRefNode,
 )
 from text_to_sql_planner.types.errors import PrintError
 from text_to_sql_planner.printer.lisp_printer import PrintSuccess, PrintFailure, PrintResult
@@ -82,6 +86,63 @@ def pretty_print(expr: DRCExpression) -> PrintResult:
         return PrintSuccess(output=output)
     except _PrintInternalError as e:
         return PrintFailure(error=e.print_error)
+
+
+def pretty_print_query(query: QueryExpression) -> PrintResult:
+    """Pretty-print a query (DRC, optionally wrapped in order-by/limit).
+
+    Output examples::
+
+        {emp_id, name, salary | (emp_id, name, salary) ∈ Employees}
+        ORDER BY salary DESC {emp_id, name, salary | ...}
+        LIMIT 5 ORDER BY salary DESC {emp_id, name, salary | ...}
+    """
+    if query is None:
+        return PrintFailure(error=PrintError(message="Input query is None", node=None))
+
+    try:
+        return PrintSuccess(output=_pretty_query_node(query))
+    except _PrintInternalError as e:
+        return PrintFailure(error=e.print_error)
+
+
+def _pretty_query_node(query: QueryExpression) -> str:
+    if isinstance(query, DRCExpression):
+        result = pretty_print(query)
+        if isinstance(result, PrintFailure):
+            raise _PrintInternalError(result.error)
+        return result.output
+    if isinstance(query, OrderByExpression):
+        if not query.criteria:
+            raise _PrintInternalError(
+                PrintError(message="OrderByExpression has no criteria", node=query)
+            )
+        crit_str = ", ".join(_pretty_sort_criterion(c) for c in query.criteria)
+        inner_str = _pretty_query_node(query.inner)
+        return f"ORDER BY {crit_str} {inner_str}"
+    if isinstance(query, LimitExpression):
+        if query.n is None or query.n <= 0:
+            raise _PrintInternalError(
+                PrintError(message=f"LimitExpression n must be positive, got {query.n}", node=query)
+            )
+        inner_str = _pretty_query_node(query.inner)
+        return f"LIMIT {query.n} {inner_str}"
+    raise _PrintInternalError(
+        PrintError(message=f"Unknown query node type: {type(query).__name__}", node=query)
+    )
+
+
+def _pretty_sort_criterion(c: SortCriterion) -> str:
+    if c is None:
+        raise _PrintInternalError(PrintError(message="SortCriterion is None", node=None))
+    if not c.column:
+        raise _PrintInternalError(PrintError(message="SortCriterion has empty column", node=c))
+    if c.direction not in ("asc", "desc"):
+        raise _PrintInternalError(
+            PrintError(message=f"Invalid sort direction: {c.direction}", node=c)
+        )
+    head = f"{c.aggregate}({c.column})" if c.aggregate else c.column
+    return f"{head} {c.direction.upper()}"
 
 
 def _print_result_variables(variables: list[ResultVariable]) -> str:

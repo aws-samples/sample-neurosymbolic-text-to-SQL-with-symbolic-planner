@@ -10,7 +10,7 @@ from text_to_sql_planner.main import run, TextToSQLSuccess, TextToSQLFailure
 from text_to_sql_planner.planner.planner import PlannerConfig
 from text_to_sql_planner.planner.llm_client import LLMClientConfig
 from text_to_sql_planner.equivalence import EquivalenceCheckerConfig
-from text_to_sql_planner.printer import pretty_print, PrintSuccess
+from text_to_sql_planner.printer import pretty_print, pretty_print_query, PrintSuccess
 
 
 def main() -> None:
@@ -154,9 +154,9 @@ async def _run_pipeline(
         print(f"\n---\n")
         print(f"# Result\n")
         if verbose:
-            pp_result = pretty_print(result.target_expression)
+            pp_result = pretty_print_query(result.target_query)
             if isinstance(pp_result, PrintSuccess):
-                print(f"**Target DRC:**\n```\n{pp_result.output}\n```\n")
+                print(f"**Target Query:**\n```\n{pp_result.output}\n```\n")
 
         print(f"**Generated SQL:**\n")
         print(f"```sql\n{result.sql}\n```\n")

@@ -18,12 +18,16 @@ from text_to_sql_planner.types.drc import (
     DRCCondition,
     DRCExpression,
     FunctionCallNode,
+    LimitExpression,
     LiteralNode,
     LogicalConnectiveNode,
     MembershipNode,
     NotNode,
+    OrderByExpression,
     QuantifierNode,
+    QueryExpression,
     ResultVariable,
+    SortCriterion,
     VariableRefNode,
 )
 from text_to_sql_planner.types.errors import ParseError
@@ -50,6 +54,22 @@ class ParserFailure:
 
 
 ParserResult = Union[ParserSuccess, ParserFailure]
+
+
+@dataclass
+class QueryParserSuccess:
+    """Successful parse of a top-level query (DRC, optionally wrapped in
+    ORDER BY / LIMIT non-relational operators)."""
+
+    query: QueryExpression
+
+
+@dataclass
+class QueryParserFailure:
+    error: ParseError
+
+
+QueryParserResult = Union[QueryParserSuccess, QueryParserFailure]
 
 
 class _Parser:
@@ -132,6 +152,171 @@ class _Parser:
         self._leave()
 
         return DRCExpression(result_variables=result_vars, condition=condition)
+
+    def parse_query(self) -> QueryExpression:
+        """Parse a top-level query expression.
+
+        A query is a core DRC expression optionally wrapped in
+        ``order-by`` and/or ``limit`` operators. Both wrappers are
+        non-relational and live outside the set comprehension. The
+        canonical form is::
+
+            (limit N (order-by ((col dir) ...) (drc (...) ...)))
+
+        but either wrapper may be omitted, and ``limit`` need not be the
+        outermost layer (for completeness; the SQL emitter will normalize).
+        """
+        if self._current().type is not TokenType.LPAREN:
+            token = self._current()
+            raise ParseError(
+                offset=token.offset,
+                message=f"Expected '(' at start of query, got {token.type.name}",
+            )
+
+        # Peek the operator keyword without consuming.
+        if self._pos + 1 >= len(self._tokens):
+            raise ParseError(
+                offset=self._current().offset,
+                message="Unexpected end of input after '('",
+            )
+        head = self._tokens[self._pos + 1]
+        if head.type is not TokenType.SYMBOL:
+            raise ParseError(
+                offset=head.offset,
+                message=f"Expected operator symbol, got {head.type.name}",
+            )
+
+        if head.value == "drc":
+            return self.parse_top()
+        if head.value == "limit":
+            return self._parse_limit()
+        if head.value == "order-by":
+            return self._parse_order_by()
+
+        raise ParseError(
+            offset=head.offset,
+            message=(
+                f"Expected 'drc', 'order-by', or 'limit' at top level, "
+                f"got '{head.value}'"
+            ),
+        )
+
+    # ------------------------------------------------------------------
+    # Order-by / Limit parsing
+    # ------------------------------------------------------------------
+
+    def _parse_limit(self) -> LimitExpression:
+        """Parse (limit N <inner-query>)."""
+        self._expect(TokenType.LPAREN, "at start of limit")
+        self._enter()
+        head = self._expect(TokenType.SYMBOL, "expected 'limit' keyword")
+        if head.value != "limit":
+            raise ParseError(
+                offset=head.offset,
+                message=f"Expected 'limit' keyword, got '{head.value}'",
+            )
+
+        n_token = self._expect(TokenType.NUMBER, "expected positive integer N for limit")
+        try:
+            n = int(n_token.value)
+        except ValueError:
+            raise ParseError(
+                offset=n_token.offset,
+                message=f"limit N must be an integer, got '{n_token.value}'",
+            )
+        if n <= 0:
+            raise ParseError(
+                offset=n_token.offset,
+                message=f"limit N must be positive, got {n}",
+            )
+
+        inner = self.parse_query()
+
+        self._expect(TokenType.RPAREN, "at end of limit")
+        self._leave()
+        return LimitExpression(n=n, inner=inner)  # type: ignore[arg-type]
+
+    def _parse_order_by(self) -> OrderByExpression:
+        """Parse (order-by ((col dir) ...) <inner-query>) where each
+        criterion is either a bare column ``col`` or an aggregate form
+        ``(AGG col)``, followed by direction ``asc`` or ``desc``.
+        """
+        self._expect(TokenType.LPAREN, "at start of order-by")
+        self._enter()
+        head = self._expect(TokenType.SYMBOL, "expected 'order-by' keyword")
+        if head.value != "order-by":
+            raise ParseError(
+                offset=head.offset,
+                message=f"Expected 'order-by' keyword, got '{head.value}'",
+            )
+
+        # Parse criteria list: ((key1 dir1) (key2 dir2) ...)
+        self._expect(TokenType.LPAREN, "before order-by criteria list")
+        criteria: list[SortCriterion] = []
+        while self._current().type is not TokenType.RPAREN:
+            criteria.append(self._parse_sort_criterion())
+        self._expect(TokenType.RPAREN, "after order-by criteria list")
+        if not criteria:
+            token = self._current()
+            raise ParseError(
+                offset=token.offset,
+                message="order-by requires at least one sort criterion",
+            )
+
+        inner = self.parse_query()
+
+        self._expect(TokenType.RPAREN, "at end of order-by")
+        self._leave()
+        return OrderByExpression(criteria=criteria, inner=inner)  # type: ignore[arg-type]
+
+    def _parse_sort_criterion(self) -> SortCriterion:
+        """Parse a single ``(key dir)`` sort criterion.
+
+        ``key`` is either a bare column symbol or an aggregate form
+        ``(AGG col)``. ``dir`` is ``asc`` or ``desc``.
+        """
+        self._expect(TokenType.LPAREN, "at start of sort criterion")
+        self._enter()
+
+        # Key may be a bare symbol or an aggregate sub-form.
+        column = ""
+        aggregate: Union[AggregateFunction, None] = None  # type: ignore[assignment]
+        if self._current().type is TokenType.LPAREN:
+            # (AGG col)
+            self._expect(TokenType.LPAREN, "before aggregate in sort key")
+            self._enter()
+            agg_tok = self._expect(TokenType.SYMBOL, "expected aggregate function name")
+            if agg_tok.value not in _AGGREGATE_FUNCS:
+                raise ParseError(
+                    offset=agg_tok.offset,
+                    message=f"Unknown aggregate function in order-by: '{agg_tok.value}'",
+                )
+            col_tok = self._expect(TokenType.SYMBOL, "expected column name in aggregate sort key")
+            self._expect(TokenType.RPAREN, "after aggregate in sort key")
+            self._leave()
+            aggregate = agg_tok.value  # type: ignore[assignment]
+            column = col_tok.value
+        elif self._current().type is TokenType.SYMBOL:
+            tok = self._advance()
+            column = tok.value
+        else:
+            token = self._current()
+            raise ParseError(
+                offset=token.offset,
+                message=f"Expected sort key (column or aggregate), got {token.type.name}",
+            )
+
+        dir_tok = self._expect(TokenType.SYMBOL, "expected sort direction 'asc' or 'desc'")
+        direction = dir_tok.value.lower()
+        if direction not in ("asc", "desc"):
+            raise ParseError(
+                offset=dir_tok.offset,
+                message=f"Invalid sort direction '{dir_tok.value}'; expected 'asc' or 'desc'",
+            )
+
+        self._expect(TokenType.RPAREN, "at end of sort criterion")
+        self._leave()
+        return SortCriterion(column=column, direction=direction, aggregate=aggregate)  # type: ignore[arg-type]
 
     # ------------------------------------------------------------------
     # Result variables
@@ -350,3 +535,29 @@ def parse(source: str) -> ParserResult:
         return ParserSuccess(expression=expression)
     except ParseError as e:
         return ParserFailure(error=e)
+
+
+def parse_query(source: str) -> QueryParserResult:
+    """Parse a top-level query (DRC, optionally wrapped in order-by/limit).
+
+    Examples of accepted forms::
+
+        (drc (...) ...)
+        (order-by ((salary desc)) (drc (...) ...))
+        (limit 5 (order-by ((salary desc)) (drc (...) ...)))
+
+    Returns :class:`QueryParserSuccess` or :class:`QueryParserFailure`.
+    """
+    try:
+        tokens = Lexer.tokenize(source)
+        parser = _Parser(tokens)
+        query = parser.parse_query()
+        if not parser._at_end():
+            token = parser._current()
+            raise ParseError(
+                offset=token.offset,
+                message=f"Unexpected trailing token: {token.type.name}",
+            )
+        return QueryParserSuccess(query=query)
+    except ParseError as e:
+        return QueryParserFailure(error=e)

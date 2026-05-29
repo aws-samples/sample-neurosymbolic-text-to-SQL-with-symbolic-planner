@@ -10,20 +10,24 @@ from dataclasses import dataclass
 from typing import Union
 
 from text_to_sql_planner.types.drc import (
-    DRCExpression,
-    ColumnVariable,
     AggregateVariable,
-    QuantifierNode,
-    LogicalConnectiveNode,
-    NotNode,
-    ComparisonNode,
-    MembershipNode,
     ArithmeticNode,
-    LiteralNode,
-    VariableRefNode,
-    FunctionCallNode,
+    ColumnVariable,
+    ComparisonNode,
     DRCCondition,
+    DRCExpression,
+    FunctionCallNode,
+    LimitExpression,
+    LiteralNode,
+    LogicalConnectiveNode,
+    MembershipNode,
+    NotNode,
+    OrderByExpression,
+    QuantifierNode,
+    QueryExpression,
     ResultVariable,
+    SortCriterion,
+    VariableRefNode,
 )
 from text_to_sql_planner.types.errors import PrintError
 
@@ -63,6 +67,87 @@ def print_lisp(expr: DRCExpression) -> PrintResult:
         return PrintSuccess(output=output)
     except _PrintInternalError as e:
         return PrintFailure(error=e.print_error)
+
+
+def print_query_lisp(query: QueryExpression) -> PrintResult:
+    """Serialize a query (DRC, optionally wrapped in order-by/limit) to
+    Lisp S-expression format.
+
+    Examples of output::
+
+        (drc (...) ...)
+        (order-by ((salary desc)) (drc (...) ...))
+        (limit 5 (order-by ((salary desc)) (drc (...) ...)))
+    """
+    if query is None:
+        return PrintFailure(error=PrintError(message="Input query is None", node=None))
+
+    try:
+        return PrintSuccess(output=_print_query_node(query))
+    except _PrintInternalError as e:
+        return PrintFailure(error=e.print_error)
+
+
+def _print_query_node(query: QueryExpression) -> str:
+    if isinstance(query, DRCExpression):
+        result = print_lisp(query)
+        if isinstance(result, PrintFailure):
+            raise _PrintInternalError(result.error)
+        return result.output
+    if isinstance(query, OrderByExpression):
+        return _print_order_by(query)
+    if isinstance(query, LimitExpression):
+        return _print_limit(query)
+    raise _PrintInternalError(
+        PrintError(message=f"Unknown query node type: {type(query).__name__}", node=query)
+    )
+
+
+def _print_sort_criterion(c: SortCriterion) -> str:
+    if c is None:
+        raise _PrintInternalError(PrintError(message="SortCriterion is None", node=None))
+    if not c.column:
+        raise _PrintInternalError(
+            PrintError(message="SortCriterion has empty column", node=c)
+        )
+    if c.direction not in ("asc", "desc"):
+        raise _PrintInternalError(
+            PrintError(message=f"Invalid sort direction: {c.direction}", node=c)
+        )
+    if c.aggregate is not None:
+        if c.aggregate not in ("COUNT", "SUM", "AVG", "MIN", "MAX"):
+            raise _PrintInternalError(
+                PrintError(message=f"Invalid aggregate in sort key: {c.aggregate}", node=c)
+            )
+        return f"(({c.aggregate} {c.column}) {c.direction})"
+    return f"({c.column} {c.direction})"
+
+
+def _print_order_by(node: OrderByExpression) -> str:
+    if not node.criteria:
+        raise _PrintInternalError(
+            PrintError(message="OrderByExpression has no criteria", node=node)
+        )
+    if node.inner is None:
+        raise _PrintInternalError(
+            PrintError(message="OrderByExpression has no inner query", node=node)
+        )
+    crit_str = " ".join(_print_sort_criterion(c) for c in node.criteria)
+    inner_str = _print_query_node(node.inner)
+    return f"(order-by ({crit_str}) {inner_str})"
+
+
+def _print_limit(node: LimitExpression) -> str:
+    if node.n is None or node.n <= 0:
+        raise _PrintInternalError(
+            PrintError(message=f"LimitExpression n must be a positive int, got {node.n}", node=node)
+        )
+    if node.inner is None:
+        raise _PrintInternalError(
+            PrintError(message="LimitExpression has no inner query", node=node)
+        )
+    inner_str = _print_query_node(node.inner)
+    return f"(limit {node.n} {inner_str})"
 
 
 class _PrintInternalError(Exception):

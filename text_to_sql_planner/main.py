@@ -20,8 +20,12 @@ from text_to_sql_planner.planner.planner import (
     PlannerSuccess,
     plan,
 )
-from text_to_sql_planner.sql import SQLSuccess, convert_to_sql
-from text_to_sql_planner.types.drc import DRCExpression
+from text_to_sql_planner.sql import SQLSuccess, convert_query_to_sql
+from text_to_sql_planner.types.drc import (
+    DRCExpression,
+    QueryExpression,
+    query_inner_drc,
+)
 from text_to_sql_planner.types.errors import ErrorCode
 from text_to_sql_planner.types.operation_tree import OperationTree
 
@@ -32,7 +36,8 @@ class TextToSQLSuccess:
 
     sql: str
     operation_tree: OperationTree
-    target_expression: DRCExpression
+    target_expression: DRCExpression  # the inner core DRC the planner ran on
+    target_query: QueryExpression  # the full extended-DRC query (with any LIMIT/ORDER BY)
 
 
 @dataclass
@@ -104,7 +109,8 @@ async def run(
             code=ErrorCode.QUESTION_CONVERSION_FAILED,
         )
 
-    target_expression = question_result.expression
+    target_query = question_result.query
+    target_expression = question_result.expression  # core DRC for the planner
 
     # --- Step 2: Convert tables to DRC relations ---
     table_result = convert_tables(schema)
@@ -140,7 +146,11 @@ async def run(
         )
 
     # --- Step 4: Convert operation tree to SQL ---
-    sql_result = convert_to_sql(planner_result.operation_tree, result_variables=target_expression.result_variables)
+    sql_result = convert_query_to_sql(
+        planner_result.operation_tree,
+        target_query,
+        distinct=question_result.use_distinct,
+    )
 
     if not isinstance(sql_result, SQLSuccess):
         return TextToSQLFailure(
@@ -152,4 +162,5 @@ async def run(
         sql=sql_result.sql,
         operation_tree=planner_result.operation_tree,
         target_expression=target_expression,
+        target_query=target_query,
     )
