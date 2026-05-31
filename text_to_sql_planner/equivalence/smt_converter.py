@@ -373,6 +373,12 @@ def _date_string_to_int(s: str) -> int | None:
 def _convert_membership(node: MembershipNode, scope: dict[str, str] | None = None) -> str:
     if scope is None:
         scope = {}
+    if not node.variables:
+        # Zero-arity predicate (after slot pruning): render as a bare
+        # propositional symbol rather than ``(R )``, which is invalid
+        # SMT-LIB syntax. The corresponding ``declare-fun`` is also
+        # written without arguments by the caller.
+        return node.relation
     args = " ".join(scope.get(v, v) for v in node.variables)
     return f"({node.relation} {args})"
 

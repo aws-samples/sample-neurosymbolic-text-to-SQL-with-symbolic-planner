@@ -271,6 +271,23 @@ def _build_equivalence_script(expr1: DRCExpression, expr2: DRCExpression, schema
     rv_names_1 = [_rv_name(rv) for rv in expr1.result_variables]
     rv_names_2 = [_rv_name(rv) for rv in expr2.result_variables]
 
+    # ------------------------------------------------------------------
+    # Pre-SMT preprocessing: trivial-equality elimination + unused-slot
+    # pruning. The two conditions are processed *jointly* in pass 2 so
+    # that the predicate signature stays consistent across both sides.
+    # Result-variable names on either side are explicitly kept alive so
+    # the slot pruner doesn't drop them from membership terms.
+    # ------------------------------------------------------------------
+    from .smt_preprocessing import preprocess_for_smt_pair
+
+    keep_names = set(rv_names_1) | set(rv_names_2)
+    pre1, pre2 = preprocess_for_smt_pair(
+        [expr1.condition, expr2.condition],
+        keep_names=keep_names,
+    )
+    expr1 = type(expr1)(result_variables=expr1.result_variables, condition=pre1)
+    expr2 = type(expr2)(result_variables=expr2.result_variables, condition=pre2)
+
     # Collect symbols and infer types from both sides.
     rels1, vars1 = collect_symbols(expr1.condition)
     rels2, vars2 = collect_symbols(expr2.condition)

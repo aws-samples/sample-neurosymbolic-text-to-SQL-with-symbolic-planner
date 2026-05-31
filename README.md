@@ -155,7 +155,7 @@ flowchart TD
 
     P[Planner loop]
     LLM[LLM operator chooser<br/>temperature escalation]
-    OPS[RA operators<br/>σ, ⋈, π, ×, ∪, ÷]
+    OPS[RA operators<br/>σ, ⋈, π, ×, ∪, −, ÷]
     EQ[Equivalence checker<br/>cvc5 SMT-LIB]
 
     SQL[SQL converter<br/>tree → SELECT statement]
@@ -185,11 +185,40 @@ flowchart TD
 | Print              | `printer/lisp_printer.py`, `printer/pretty_printer.py`       | DRC AST → Lisp form (machine-friendly) and Unicode form (`{x \| ∃y …}`).  |
 | Schema → relations | `converter/table_converter.py`                               | Each table becomes a predicate `T(a, b, c)`.                              |
 | Question → DRC     | `converter/question_converter.py`, `planner/llm_client.py`   | Bedrock Claude emits Lisp DRC; we re-prompt on parse error.               |
-| RA operators       | `operators/{selection,join,projection,cartesian_product,union,division}.py` | Each operator is a pure function `(params, inputs) → DRC`. |
+| RA operators       | `operators/{selection,join,projection,cartesian_product,union,difference,division}.py` | Each operator is a pure function `(params, inputs) → DRC`. |
 | Planner loop       | `planner/planner.py`                                         | LLM picks next op + inputs; we apply, check equivalence, escalate temp on retries. |
 | Equivalence        | `equivalence/{smt_converter,equivalence_checker}.py`         | DRC → SMT-LIB; parallel cvc5 (one for `unsat`, one for `sat`); first decisive answer wins. |
 | SQL emit           | `sql/sql_converter.py`                                       | Operation tree → flat SELECT, with `DISTINCT` / `ORDER BY` / `LIMIT` driven by the extended-DRC wrappers. |
 | SQL simplify       | `sql/simplifier.py`                                          | Rule-based rewrites (unwrap subqueries, inline rebindings, `CROSS JOIN`+`WHERE`→`JOIN ON`, …). |
+
+### Relational algebra operators
+
+The planner builds the answer by composing seven classical relational
+algebra operators. Each one is a pure function `(params, inputs) → DRC`
+defined in its own module under `operators/`, with parameter types in
+`types/operators.py` (`RAOperatorType` literal: `"selection"`, `"join"`,
+`"projection"`, `"cartesian_product"`, `"union"`, `"difference"`,
+`"division"`).
+
+| Symbol | Operator          | Module                            | Inputs | Parameters                       | Output relation                                                                     |
+|--------|-------------------|-----------------------------------|--------|----------------------------------|-------------------------------------------------------------------------------------|
+| σ      | Selection         | `operators/selection.py`          | 1      | `condition: DRCCondition`        | Same columns; tuples filtered by `condition`.                                       |
+| ⋈      | Natural join      | `operators/join.py`               | 2      | `join_columns: list[str]`        | Columns from both inputs with `join_columns` shared once; non-join name collisions on the right are renamed with a `_r2` suffix. |
+| π      | Projection        | `operators/projection.py`         | 1      | `columns: list[str]`             | Restricts to the named columns; supports plain columns and aggregates `(AGG col)`.  |
+| ×      | Cartesian product | `operators/cartesian_product.py`  | 2      | (none)                           | Concatenates columns; overlapping names get `_1`/`_2` suffixes for self-joins.      |
+| ∪      | Union             | `operators/union.py`              | 2      | (none)                           | Combines tuples from same-arity inputs.                                             |
+| −      | Set difference    | `operators/difference.py`         | 2      | (none)                           | Tuples in the left input that are not in the right input. Right-side variables are positionally alpha-renamed to the left's column names so the negated subformula speaks about R's tuples. |
+| ÷      | Division          | `operators/division.py`           | 2      | (none)                           | Tuples in the left input that are paired with *every* tuple in the right.           |
+
+Operators are validated up front: arity checks, column-existence checks,
+and (for join/union/difference/division) compatibility between input
+schemas. Each operator returns a fresh `DRCExpression` so the
+equivalence checker can compare it against the target on the next
+iteration.
+
+The dispatcher is `operators.apply_operator(application)`, which routes
+an `OperatorApplication` to the right module based on
+`OperatorApplication.operator`.
 
 ### Extended DRC
 
@@ -263,6 +292,7 @@ text_to_sql_planner/
 │   ├── projection.py
 │   ├── cartesian_product.py
 │   ├── union.py
+│   ├── difference.py
 │   └── division.py
 ├── equivalence/
 │   ├── smt_converter.py          # DRC AST → SMT-LIB text

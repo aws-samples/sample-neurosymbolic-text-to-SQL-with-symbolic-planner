@@ -10,7 +10,7 @@ from text_to_sql_planner.types.drc import DRCExpression, DRCCondition
 
 RAOperatorType = Literal[
     "selection", "join", "projection",
-    "cartesian_product", "union", "division"
+    "cartesian_product", "union", "difference", "division"
 ]
 
 
@@ -43,13 +43,18 @@ class UnionParams:
 
 
 @dataclass
+class DifferenceParams:
+    type: Literal["difference"] = "difference"
+
+
+@dataclass
 class DivisionParams:
     type: Literal["division"] = "division"
 
 
 OperatorParams = Union[
     SelectionParams, JoinParams, ProjectionParams,
-    CartesianProductParams, UnionParams, DivisionParams
+    CartesianProductParams, UnionParams, DifferenceParams, DivisionParams
 ]
 
 

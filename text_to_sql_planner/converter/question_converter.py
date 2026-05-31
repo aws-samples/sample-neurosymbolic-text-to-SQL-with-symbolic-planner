@@ -103,13 +103,19 @@ async def convert_question(
                 print(f"```\n{user_msg}\n```\n")
                 raw_lisp = await convert_question_to_drc(question, schema, config)
             else:
-                # Include error feedback in subsequent attempts
+                # Retry with error feedback only — DO NOT include the prior
+                # malformed output. Models tend to anchor on the text they
+                # see and reproduce the same bug, so we describe what went
+                # wrong and ask for a fresh attempt.
                 enhanced_question = (
                     f"{question}\n\n"
-                    f"[Previous attempt produced invalid syntax. "
-                    f"Error: {last_error}. "
-                    f"Previous output: {last_raw_output}. "
-                    f"Please fix the syntax.]"
+                    f"[The previous attempt produced syntactically invalid "
+                    f"DRC Lisp. Parser error: {last_error}. "
+                    f"Common causes are unbalanced parentheses (more "
+                    f"closing than opening, or vice versa) and over-deep "
+                    f"nesting in the negation of an \"exactly N\" pattern. "
+                    f"Produce a fresh, well-formed expression, counting "
+                    f"the parentheses carefully.]"
                 )
                 user_msg = f"Schema:\n{schema}\n\nQuestion: {enhanced_question}"
                 print(f"#### LLM prompt (with error feedback)\n")

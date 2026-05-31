@@ -19,6 +19,7 @@ from text_to_sql_planner.planner.llm_client import (
     IntermediateRelation,
     LLMClientConfig,
     OperatorSelection,
+    RejectedProposal,
     select_operator,
     summarize_relation,
 )
@@ -31,6 +32,7 @@ from text_to_sql_planner.types.operation_tree import (
 )
 from text_to_sql_planner.types.operators import (
     CartesianProductParams,
+    DifferenceParams,
     DivisionParams,
     JoinParams,
     OperatorApplication,
@@ -107,6 +109,8 @@ def _build_operator_params(operator: str, params: dict) -> object:
         return CartesianProductParams()
     elif operator == "union":
         return UnionParams()
+    elif operator == "difference":
+        return DifferenceParams()
     elif operator == "division":
         return DivisionParams()
     return None
@@ -217,6 +221,32 @@ async def plan(
             print(f"```\n{drc_str}\n```\n")
         success_this_iteration = False
 
+        # Negative memory for this iteration: every retry that fails for any
+        # reason (bad params, duplicate output, operator failure, not-
+        # equivalent verdict, ...) gets recorded here and surfaced back to
+        # the LLM on the next retry so it doesn't loop on the same proposal.
+        # Reset between iterations because once a proposal succeeds we have
+        # a new starting point and old rejections may no longer apply.
+        rejected_proposals: list[RejectedProposal] = []
+
+        def _record_rejection(sel: OperatorSelection | None, reason: str) -> None:
+            """Append a rejection to the iteration's negative-memory list.
+
+            ``sel`` may be ``None`` when the LLM call itself failed before
+            returning a parseable selection — there's nothing to forbid in
+            that case so we only log.
+            """
+            if sel is None:
+                return
+            rejected_proposals.append(
+                RejectedProposal(
+                    operator=sel.operator,
+                    input_indices=list(sel.input_indices),
+                    params=dict(sel.params),
+                    reason=reason,
+                )
+            )
+
         for retry in range(config.max_retries_per_iteration):
             temperature = config.initial_temperature + (retry * config.temperature_step)
             temperature = min(temperature, 1.0)
@@ -224,6 +254,7 @@ async def plan(
             if retry > 0:
                 print(f"> ⚠️ Retry {retry}/{config.max_retries_per_iteration} (temp={temperature:.1f})\n")
 
+            selection: OperatorSelection | None = None
             try:
                 print(f"Asking LLM to select operator (temp={temperature:.1f})...\n", flush=True)
                 selection = await select_operator(
@@ -232,6 +263,7 @@ async def plan(
                     target_relation=target_lisp,
                     temperature=temperature,
                     config=config.llm_config,
+                    rejected_proposals=rejected_proposals,
                 )
                 print(f"**LLM selected:** `{selection.operator}` inputs=`{selection.input_indices}` params=`{selection.params}`\n")
                 # For joins, show a clearer breakdown
@@ -256,15 +288,21 @@ async def plan(
 
             # Validate input indices
             if not selection.input_indices:
+                _record_rejection(selection, "no input indices provided")
                 print(f"> ⚠️ Invalid: no input indices provided\n")
                 continue
             if any(idx < 0 or idx >= len(available) for idx in selection.input_indices):
+                _record_rejection(
+                    selection,
+                    f"input indices out of range (have {len(available)} available)",
+                )
                 print(f"> ⚠️ Invalid: input indices out of range (have {len(available)} available)\n")
                 continue
 
             # Build operator params
             op_params = _build_operator_params(selection.operator, selection.params)
             if op_params is None:
+                _record_rejection(selection, "could not build operator params")
                 print(f"> ⚠️ Invalid: could not build operator params\n")
                 continue
 
@@ -280,6 +318,7 @@ async def plan(
             op_result = apply_operator(application)
 
             if isinstance(op_result, OperatorFailure):
+                _record_rejection(selection, f"operator failed: {op_result.error}")
                 print(f"> ❌ Operator failed: `{op_result.error}`\n")
                 continue
 
@@ -298,13 +337,17 @@ async def plan(
                 print(f"```\n{new_pp.output}\n```\n")
 
             # Check for duplicates: skip if this expression already exists
-            is_duplicate = False
-            for existing_expr, existing_cols, _ in available:
+            duplicate_index: int | None = None
+            for existing_idx, (existing_expr, existing_cols, _) in enumerate(available):
                 existing_lisp = print_lisp(existing_expr)
                 if isinstance(existing_lisp, PrintSuccess) and existing_lisp.output == new_lisp_str:
-                    is_duplicate = True
+                    duplicate_index = existing_idx
                     break
-            if is_duplicate:
+            if duplicate_index is not None:
+                _record_rejection(
+                    selection,
+                    f"output is identical to existing relation [{duplicate_index}]",
+                )
                 print(f"> ⚠️ **DUPLICATE** — skipping (already have this relation)\n")
                 continue
 

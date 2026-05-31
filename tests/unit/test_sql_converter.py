@@ -16,6 +16,7 @@ from text_to_sql_planner.types.operators import (
     ProjectionParams,
     CartesianProductParams,
     UnionParams,
+    DifferenceParams,
     DivisionParams,
 )
 from text_to_sql_planner.types.drc import (
@@ -95,6 +96,18 @@ def _union_node(left, right, output_columns: list[str] | None = None) -> Operato
     return OperatorNode(
         operator="union",
         params=UnionParams(),
+        inputs=[left, right],
+        output_columns=output_columns,
+    )
+
+
+def _difference_node(left, right, output_columns: list[str] | None = None) -> OperatorNode:
+    """Create a set-difference operator node."""
+    if output_columns is None:
+        output_columns = _get_cols(left)
+    return OperatorNode(
+        operator="difference",
+        params=DifferenceParams(),
         inputs=[left, right],
         output_columns=output_columns,
     )
@@ -387,6 +400,36 @@ class TestUnion:
 
         assert isinstance(result, SQLSuccess)
         assert "SELECT" in result.sql
+        assert "FROM t1" in result.sql
+        assert "FROM t2" in result.sql
+
+
+class TestDifference:
+    def test_simple_difference(self):
+        """Difference produces EXCEPT of two SELECTs."""
+        left = _table_leaf("employees", ["id", "name"])
+        right = _table_leaf("contractors", ["id", "name"])
+        node = _difference_node(left, right)
+        tree = OperationTree(root=node)
+
+        result = convert_to_sql(tree)
+
+        assert isinstance(result, SQLSuccess)
+        assert "EXCEPT" in result.sql
+        assert "employees" in result.sql
+        assert "contractors" in result.sql
+
+    def test_difference_wraps_tables_as_selects(self):
+        """Difference wraps table references as full SELECT statements."""
+        left = _table_leaf("t1", ["id", "name"])
+        right = _table_leaf("t2", ["id", "name"])
+        node = _difference_node(left, right)
+        tree = OperationTree(root=node)
+
+        result = convert_to_sql(tree)
+
+        assert isinstance(result, SQLSuccess)
+        assert "EXCEPT" in result.sql
         assert "FROM t1" in result.sql
         assert "FROM t2" in result.sql
 

@@ -43,6 +43,22 @@ class IntermediateRelation:
     summary: str = ""  # one-sentence natural language description
 
 
+@dataclass
+class RejectedProposal:
+    """A previously-attempted operator selection that the planner rejected.
+
+    Surfaced back to the LLM on retry so it doesn't loop on the same
+    proposal. Carries enough information to make a counter-proposal:
+    which operator on which inputs with which params, and *why* it was
+    rejected.
+    """
+
+    operator: str  # RAOperatorType
+    input_indices: list[int]
+    params: dict
+    reason: str  # short human-readable rejection reason
+
+
 def _get_bedrock_client(config: LLMClientConfig):
     """Create a Bedrock Runtime client."""
     if boto3 is None:
@@ -64,6 +80,7 @@ Available operators:
 - join: Natural join on shared columns. Requires 2 inputs.
 - cartesian_product: Cross product of two relations. Requires 2 inputs.
 - union: Set union of two compatible relations. Requires 2 inputs.
+- difference: Set difference R minus S; tuples in R that are not in S. Requires 2 inputs of the same arity.
 - division: Relational division. Requires 2 inputs.
 
 DRC Notation Guide:
@@ -97,6 +114,7 @@ _OPERATOR_TOOL = {
                     "projection",
                     "cartesian_product",
                     "union",
+                    "difference",
                     "division",
                 ],
                 "description": "The operator to apply.",
@@ -108,7 +126,7 @@ _OPERATOR_TOOL = {
             },
             "params": {
                 "type": "object",
-                "description": "Operator-specific parameters. For selection: {condition: <lisp-string>}. For projection: {columns: [col1, col2]}. For join: {join_columns: [col]}. For cartesian_product/union/division: {}.",
+                "description": "Operator-specific parameters. For selection: {condition: <lisp-string>}. For projection: {columns: [col1, col2]}. For join: {join_columns: [col]}. For cartesian_product/union/difference/division: {}.",
             },
         },
         "required": ["reasoning", "operator", "input_indices", "params"],
@@ -122,6 +140,7 @@ async def select_operator(
     target_relation: str,
     temperature: float,
     config: LLMClientConfig | None = None,
+    rejected_proposals: list[RejectedProposal] | None = None,
 ) -> OperatorSelection:
     """Ask the LLM to select the next operator to apply.
 
@@ -134,6 +153,9 @@ async def select_operator(
         target_relation: The target DRC expression in Lisp syntax.
         temperature: Sampling temperature.
         config: LLM client configuration.
+        rejected_proposals: Operator picks already attempted within the
+            current iteration. The model is shown these and instructed
+            not to repeat them. Defaults to ``None`` (empty).
 
     Returns:
         OperatorSelection with the chosen operator and parameters.
@@ -173,6 +195,19 @@ async def select_operator(
         "existing relations listed above. Each new operator application must produce "
         "a genuinely new result that moves closer to the target.\n"
     )
+
+    if rejected_proposals:
+        relations_desc += (
+            "\nREJECTED PROPOSALS — these operator picks were already attempted "
+            "in this iteration and rejected. DO NOT repeat any of them; pick a "
+            "different operator, different input indices, or different params.\n"
+        )
+        for i, rp in enumerate(rejected_proposals, start=1):
+            relations_desc += (
+                f"  [{i}] {rp.operator} inputs={rp.input_indices} "
+                f"params={rp.params} — rejected: {rp.reason}\n"
+            )
+
     relations_desc += "\nSelect the next operator to apply."
 
     # Build the Bedrock converse request
@@ -270,9 +305,23 @@ Note: dept_id is NOT a result variable so it's quantified. emp_id IS a result va
 Cardinality patterns ("at least N", "two or more", "more than N", "exactly N"):
 - "at least N" / "N or more" / "two or more" → assert the existence of N distinct witnesses, joined by AND, all pairwise distinct. DO NOT add ``(not (exists ...))`` for an extra witness — that turns "≥N" into "exactly N" or "≥N+1".
 - "more than N" → same as "at least N+1".
-- "exactly N" → assert N distinct witnesses AND ``(not (exists ...))`` for an (N+1)-th witness distinct from all the prior ones.
+- "exactly N" → assert N distinct witnesses AND ``(not (exists ...))`` for a SINGLE (N+1)-th witness distinct from all the prior ones.
 - Each witness must be wrapped in its own existential quantifier and constrained by an (in ...) membership.
 - Witnesses must be pairwise distinct via (!= ...) on the identifying columns.
+
+CRITICAL — the negation in "exactly N" is ONE existential, NOT a chain.
+The shape is always:
+    (not (exists (r_{N+1} ...) (and (in (...) Reviews) (and (!= r_{N+1} r_1) ... (!= r_{N+1} r_N)))))
+with exactly one (exists ...) inside (not ...) and a flat AND-chain of (!= r_{N+1} r_k) inequalities — one per prior witness. Do NOT introduce r_{N+2}, r_{N+3}, etc. inside the negation. Doing so changes the meaning ("not ≥ N+M" instead of "not ≥ N+1") and produces deeply nested parentheses that are easy to miscount.
+
+Worked example for N=2 — the right shape:
+    (and
+      (exists (r1 ...) (and PR(r1, ...) (exists (r2 ...) (and PR(r2, ...) (!= r1 r2)))))
+      (not (exists (r3 ...) (and PR(r3, ...) (and (!= r3 r1) (!= r3 r2))))))
+
+Wrong shape (do NOT do this):
+    (not (exists (r3 ...) (and PR(r3, ...) (exists (r4 ...) ... (exists (r5 ...) ...)))))
+This says "not ≥ 5", not "not ≥ 3", and is the most common failure mode.
 
 Question: "List all employees that have two or more performance reviews"
 Schema: CREATE TABLE Employees (emp_id INT, name VARCHAR); CREATE TABLE Reviews (review_id INT, emp_id INT, rating INT)

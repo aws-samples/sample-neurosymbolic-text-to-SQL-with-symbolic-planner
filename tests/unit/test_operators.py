@@ -10,6 +10,7 @@ from text_to_sql_planner.types.drc import (
     MembershipNode,
     LogicalConnectiveNode,
     ComparisonNode,
+    NotNode,
     QuantifierNode,
     VariableRefNode,
     LiteralNode,
@@ -23,6 +24,7 @@ from text_to_sql_planner.types.operators import (
     ProjectionParams,
     CartesianProductParams,
     UnionParams,
+    DifferenceParams,
     DivisionParams,
 )
 from text_to_sql_planner.operators import apply_operator
@@ -31,6 +33,7 @@ from text_to_sql_planner.operators.join import apply_join
 from text_to_sql_planner.operators.projection import apply_projection
 from text_to_sql_planner.operators.cartesian_product import apply_cartesian_product
 from text_to_sql_planner.operators.union import apply_union
+from text_to_sql_planner.operators.difference import apply_difference
 from text_to_sql_planner.operators.division import apply_division
 
 
@@ -349,6 +352,76 @@ class TestUnion:
         assert isinstance(result, OperatorFailure)
 
 
+# --- Difference Tests ---
+
+class TestDifference:
+    def test_valid_difference(self):
+        """Difference produces correct columns for compatible relations."""
+        r1 = _make_relation(["id", "name"], "employees")
+        r2 = _make_relation(["id", "name"], "contractors")
+        params = DifferenceParams()
+
+        result = apply_difference(params, [r1, r2])
+
+        assert isinstance(result, OperatorSuccess)
+        assert _get_column_names(result.output) == ["id", "name"]
+
+    def test_difference_condition_is_and_not(self):
+        """Difference condition is (and r1_condition (not r2_condition))."""
+        r1 = _make_relation(["id"], "t1")
+        r2 = _make_relation(["id"], "t2")
+        params = DifferenceParams()
+
+        result = apply_difference(params, [r1, r2])
+
+        assert isinstance(result, OperatorSuccess)
+        cond = result.output.condition
+        assert isinstance(cond, LogicalConnectiveNode)
+        assert cond.operator == "and"
+        assert cond.left == r1.condition
+        assert isinstance(cond.right, NotNode)
+        assert cond.right.operand == r2.condition
+
+    def test_difference_alpha_renames_right_side(self):
+        """When right-side column names differ, they get rewritten to the
+        left-side names so the negated condition speaks about R's tuples."""
+        r1 = _make_relation(["a", "b"], "t1")
+        r2 = _make_relation(["x", "y"], "t2")
+        params = DifferenceParams()
+
+        result = apply_difference(params, [r1, r2])
+
+        assert isinstance(result, OperatorSuccess)
+        # The negated right side's MembershipNode should reference (a, b),
+        # not (x, y).
+        cond = result.output.condition
+        assert isinstance(cond.right, NotNode)
+        inner = cond.right.operand
+        assert isinstance(inner, MembershipNode)
+        assert inner.variables == ["a", "b"]
+        assert inner.relation == "t2"
+
+    def test_error_mismatched_arity(self):
+        """Difference fails when relations have different number of columns."""
+        r1 = _make_relation(["id", "name"], "employees")
+        r2 = _make_relation(["id"], "contractors")
+        params = DifferenceParams()
+
+        result = apply_difference(params, [r1, r2])
+
+        assert isinstance(result, OperatorFailure)
+        assert "arity" in result.error.lower()
+
+    def test_error_wrong_input_count(self):
+        """Difference fails with wrong number of inputs."""
+        r1 = _make_relation(["id"], "t1")
+        params = DifferenceParams()
+
+        result = apply_difference(params, [r1])
+
+        assert isinstance(result, OperatorFailure)
+
+
 # --- Division Tests ---
 
 class TestDivision:
@@ -478,6 +551,21 @@ class TestDispatcher:
         result = apply_operator(app)
 
         assert isinstance(result, OperatorSuccess)
+
+    def test_routes_difference(self):
+        """Dispatcher routes difference operator correctly."""
+        r1 = _make_relation(["id"], "t1")
+        r2 = _make_relation(["id"], "t2")
+        app = OperatorApplication(
+            operator="difference",
+            inputs=[r1, r2],
+            params=DifferenceParams(),
+        )
+
+        result = apply_operator(app)
+
+        assert isinstance(result, OperatorSuccess)
+        assert _get_column_names(result.output) == ["id"]
 
     def test_routes_division(self):
         """Dispatcher routes division operator correctly."""

@@ -22,6 +22,7 @@ from text_to_sql_planner.types.operators import (
     ProjectionParams,
     CartesianProductParams,
     UnionParams,
+    DifferenceParams,
     DivisionParams,
 )
 from text_to_sql_planner.types.drc import (
@@ -214,7 +215,9 @@ class _SqlGenerator:
         """Route operator to the appropriate handler."""
         params = node.params
         if isinstance(params, UnionParams):
-            return self._convert_union(node)
+            return self._convert_set_op(node, "UNION")
+        elif isinstance(params, DifferenceParams):
+            return self._convert_set_op(node, "EXCEPT")
         elif isinstance(params, DivisionParams):
             return self._convert_division(node)
         elif isinstance(params, ProjectionParams):
@@ -242,7 +245,7 @@ class _SqlGenerator:
             return self._ctx_join(node, params, inputs)
         elif isinstance(params, CartesianProductParams):
             return self._ctx_cartesian(node, params, inputs)
-        elif isinstance(params, (ProjectionParams, UnionParams, DivisionParams)):
+        elif isinstance(params, (ProjectionParams, UnionParams, DifferenceParams, DivisionParams)):
             # Non-flattenable operators get wrapped as a derived subquery
             return self._ctx_from_subquery(node)
         else:
@@ -491,18 +494,23 @@ class _SqlGenerator:
             return resolved
         return resolved
 
-    # --- Union ---
+    # --- Set operators (UNION, EXCEPT) ---
 
-    def _convert_union(self, node: OperatorNode) -> str:
-        """Union -> (...) UNION (...)."""
+    def _convert_set_op(self, node: OperatorNode, sql_op: str) -> str:
+        """Set-op operators (``UNION``, ``EXCEPT``) -> ``(...) <OP> (...)``.
+
+        Both inputs must already produce union-compatible row shapes; the
+        operator layer is responsible for that and the SQL we emit just
+        composes them with the SQL-level keyword.
+        """
         inputs = node.inputs
         if len(inputs) < 2:
-            raise _ConversionError("Union requires exactly 2 inputs")
+            raise _ConversionError(f"{sql_op} requires exactly 2 inputs")
         left_sql = self._convert_node(inputs[0])
         right_sql = self._convert_node(inputs[1])
         left_indented = self._indent_sql(left_sql, 2)
         right_indented = self._indent_sql(right_sql, 2)
-        return f"(\n{left_indented}\n)\nUNION\n(\n{right_indented}\n)"
+        return f"(\n{left_indented}\n)\n{sql_op}\n(\n{right_indented}\n)"
 
     # --- Division ---
 

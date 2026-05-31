@@ -16,6 +16,7 @@ from text_to_sql_planner.types.operators import (
     ProjectionParams,
     CartesianProductParams,
     UnionParams,
+    DifferenceParams,
     DivisionParams,
 )
 from text_to_sql_planner.operators.selection import apply_selection
@@ -23,6 +24,7 @@ from text_to_sql_planner.operators.join import apply_join
 from text_to_sql_planner.operators.projection import apply_projection
 from text_to_sql_planner.operators.cartesian_product import apply_cartesian_product
 from text_to_sql_planner.operators.union import apply_union
+from text_to_sql_planner.operators.difference import apply_difference
 from text_to_sql_planner.operators.division import apply_division
 
 
@@ -33,6 +35,7 @@ __all__ = [
     "apply_projection",
     "apply_cartesian_product",
     "apply_union",
+    "apply_difference",
     "apply_division",
 ]
 
@@ -41,7 +44,9 @@ __all__ = [
 _UNARY_OPERATORS = {"selection", "projection"}
 
 # Operators that require exactly 2 input relations
-_BINARY_OPERATORS = {"join", "cartesian_product", "union", "division"}
+_BINARY_OPERATORS = {"join", "cartesian_product", "union", "difference", "division"}
+
+_KNOWN_OPERATORS = _UNARY_OPERATORS | _BINARY_OPERATORS
 
 
 def apply_operator(application: OperatorApplication) -> OperatorResult:
@@ -63,7 +68,7 @@ def apply_operator(application: OperatorApplication) -> OperatorResult:
     params = application.params
 
     # Validate operator type
-    if operator not in ("selection", "join", "projection", "cartesian_product", "union", "division"):
+    if operator not in _KNOWN_OPERATORS:
         return OperatorFailure(error=f"Unknown operator type: '{operator}'")
 
     # Validate input count
@@ -91,6 +96,8 @@ def apply_operator(application: OperatorApplication) -> OperatorResult:
         return apply_cartesian_product(params, inputs)
     elif operator == "union":
         return apply_union(params, inputs)
+    elif operator == "difference":
+        return apply_difference(params, inputs)
     elif operator == "division":
         return apply_division(params, inputs)
 
