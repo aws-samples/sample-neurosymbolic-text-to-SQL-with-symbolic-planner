@@ -26,6 +26,10 @@ from text_to_sql_planner.types.drc import (
     QuantifierNode,
     VariableRefNode,
 )
+from text_to_sql_planner.operators.exactly_n import (
+    emit_canonical_exactly_n,
+    recognize_ge_n_pattern,
+)
 from text_to_sql_planner.types.operators import (
     DifferenceParams,
     OperatorFailure,
@@ -147,6 +151,25 @@ def apply_difference(
 
     r1_cols = _get_columns(r1)
     r2_cols = _get_columns(r2)
+
+    # Special-case ``≥N − ≥(N+1)`` for the same relation: emit the
+    # canonical "exactly N" form. This both produces a clean DRC for
+    # the LLM and SQL converter and aligns Skolem terms across both
+    # sides of an equivalence check (see
+    # :mod:`text_to_sql_planner.operators.exactly_n` for soundness
+    # discussion).
+    p1 = recognize_ge_n_pattern(r1)
+    p2 = recognize_ge_n_pattern(r2)
+    if (
+        p1 is not None
+        and p2 is not None
+        and p1.relation == p2.relation
+        and p1.witness_slot == p2.witness_slot
+        and p1.key_slots == p2.key_slots
+        and p1.slot_arity == p2.slot_arity
+        and len(p2.witnesses) == len(p1.witnesses) + 1
+    ):
+        return OperatorSuccess(output=emit_canonical_exactly_n(r1, p1))
 
     # Positional alpha-rename: every free reference to r2's i-th column
     # name becomes r1's i-th column name. If the names already match

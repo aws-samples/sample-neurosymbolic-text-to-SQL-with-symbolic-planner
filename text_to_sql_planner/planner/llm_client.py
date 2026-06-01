@@ -315,9 +315,10 @@ The shape is always:
 with exactly one (exists ...) inside (not ...) and a flat AND-chain of (!= r_{N+1} r_k) inequalities — one per prior witness. Do NOT introduce r_{N+2}, r_{N+3}, etc. inside the negation. Doing so changes the meaning ("not ≥ N+M" instead of "not ≥ N+1") and produces deeply nested parentheses that are easy to miscount.
 
 Worked example for N=2 — the right shape:
-    (and
-      (exists (r1 ...) (and PR(r1, ...) (exists (r2 ...) (and PR(r2, ...) (!= r1 r2)))))
-      (not (exists (r3 ...) (and PR(r3, ...) (and (!= r3 r1) (!= r3 r2))))))
+    (exists (r1 ...) (and PR(r1, ...)
+      (exists (r2 ...) (and PR(r2, ...)
+        (and (!= r1 r2)
+             (not (exists (r3 ...) (and PR(r3, ...) (and (!= r3 r1) (!= r3 r2))))))))))
 
 Wrong shape (do NOT do this):
     (not (exists (r3 ...) (and PR(r3, ...) (exists (r4 ...) ... (exists (r5 ...) ...)))))
@@ -330,8 +331,8 @@ Note: TWO existential witnesses (r1 and r2), both bound to ``emp_id``, with ``(!
 
 Question: "List employees with exactly two performance reviews"
 Schema: CREATE TABLE Employees (emp_id INT, name VARCHAR); CREATE TABLE Reviews (review_id INT, emp_id INT, rating INT)
-Answer: (drc (emp_id name) (and (in (emp_id name) Employees) (and (exists (r1 rating1) (and (in (r1 emp_id rating1) Reviews) (exists (r2 rating2) (and (in (r2 emp_id rating2) Reviews) (!= r1 r2))))) (not (exists (r3 rating3) (and (in (r3 emp_id rating3) Reviews) (and (!= r3 r1) (!= r3 r2))))))))
-Note: TWO positive witnesses AND a (not (exists ...)) for a third one. The "exactly" is what introduces the negative clause.
+Answer: (drc (emp_id name) (and (in (emp_id name) Employees) (exists (r1 rating1) (and (in (r1 emp_id rating1) Reviews) (exists (r2 rating2) (and (in (r2 emp_id rating2) Reviews) (and (!= r1 r2) (not (exists (r3 rating3) (and (in (r3 emp_id rating3) Reviews) (and (!= r3 r1) (!= r3 r2))))))))))))
+Note: TWO positive witnesses AND a (not (exists ...)) for a third one. CRITICAL: ``r1`` and ``r2`` MUST be bound by ``(exists ...)`` whose scope spans BOTH the positive ``(in ...)`` memberships AND the negated ``(not (exists ...))`` clause. Putting the negation as a SIBLING of the positive witnesses (i.e. outside the ``(exists r1 ...)`` and ``(exists r2 ...)`` scopes) makes the ``r1``/``r2`` references inside the negation refer to free constants instead of the chosen witnesses, which silently breaks the formula.
 
 Question: "List all employees that have three or more performance reviews"
 Schema: CREATE TABLE Employees (emp_id INT, name VARCHAR); CREATE TABLE Reviews (review_id INT, emp_id INT, rating INT)

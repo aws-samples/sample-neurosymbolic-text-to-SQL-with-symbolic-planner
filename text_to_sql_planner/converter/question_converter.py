@@ -212,16 +212,20 @@ async def convert_question(
 def _validate_free_variables(expr: DRCExpression) -> str | None:
     """Check that no variables are free in the condition except result variables.
 
+    Performs a scope-aware free-variable analysis: a reference to ``v``
+    is "free" at its position iff no enclosing quantifier binds ``v``.
+    A variable that's bound by *some* quantifier in the tree but
+    referenced *outside* that quantifier's scope is still free at the
+    reference site — and that's a bug worth catching, because it means
+    the LLM put ``(!= r3 r1)`` (or similar) outside the ``(exists r1
+    ...)`` whose witness it intended to reference.
+
     Returns an error message if invalid, None if valid.
     """
     from text_to_sql_planner.types.drc import (
-        ColumnVariable, AggregateVariable, QuantifierNode,
-        LogicalConnectiveNode, NotNode, ComparisonNode,
-        MembershipNode, ArithmeticNode, VariableRefNode,
-        LiteralNode, FunctionCallNode,
+        ColumnVariable, AggregateVariable,
     )
 
-    # Collect result variable names (these are allowed to be free)
     result_var_names: set[str] = set()
     for rv in expr.result_variables:
         if isinstance(rv, ColumnVariable):
@@ -229,24 +233,73 @@ def _validate_free_variables(expr: DRCExpression) -> str | None:
         elif isinstance(rv, AggregateVariable):
             result_var_names.add(rv.column)
 
-    # Collect all variables used in the condition
-    all_vars: set[str] = set()
-    _collect_vars(expr.condition, all_vars)
+    # Walk the condition with a running stack of currently-bound names.
+    # Anything referenced while not in the stack and not a result
+    # variable is genuinely free.
+    free_unbound: set[str] = set()
+    _collect_free_at_reference(expr.condition, frozenset(), result_var_names, free_unbound)
 
-    # Collect all quantified (bound) variables
-    bound_vars: set[str] = set()
-    _collect_bound_vars(expr.condition, bound_vars)
-
-    # Free variables = all_vars - bound_vars - result_var_names
-    free_vars = all_vars - bound_vars - result_var_names
-
-    if free_vars:
+    if free_unbound:
         return (
-            f"Unquantified free variables: {sorted(free_vars)}. "
-            f"These must be wrapped in (exists ...). "
-            f"Result variables are: {sorted(result_var_names)}"
+            f"Unquantified free variables: {sorted(free_unbound)}. "
+            f"These must be wrapped in (exists ...) whose scope spans "
+            f"every reference site, or be result variables. "
+            f"Result variables are: {sorted(result_var_names)}. "
+            f"Common cause: a ``(not (exists ...))`` clause placed as a "
+            f"sibling of the ``(exists r1 ...)`` whose witness it "
+            f"references — the negation must be INSIDE the outer "
+            f"existential, not next to it."
         )
     return None
+
+
+def _collect_free_at_reference(
+    node, bound_stack: frozenset, result_vars: set[str], free: set[str],
+) -> None:
+    """Walk the AST tracking the current bound-name set.
+
+    A reference is added to ``free`` iff its name is not in
+    ``bound_stack`` and not in ``result_vars``.
+    """
+    from text_to_sql_planner.types.drc import (
+        QuantifierNode, LogicalConnectiveNode, NotNode, ComparisonNode,
+        MembershipNode, ArithmeticNode, VariableRefNode, FunctionCallNode,
+    )
+
+    if node is None:
+        return
+    if isinstance(node, VariableRefNode):
+        if node.name not in bound_stack and node.name not in result_vars:
+            free.add(node.name)
+        return
+    if isinstance(node, MembershipNode):
+        for v in node.variables:
+            if v not in bound_stack and v not in result_vars:
+                free.add(v)
+        return
+    if isinstance(node, QuantifierNode):
+        new_bound = bound_stack | set(node.variables)
+        _collect_free_at_reference(node.body, new_bound, result_vars, free)
+        return
+    if isinstance(node, LogicalConnectiveNode):
+        _collect_free_at_reference(node.left, bound_stack, result_vars, free)
+        _collect_free_at_reference(node.right, bound_stack, result_vars, free)
+        return
+    if isinstance(node, NotNode):
+        _collect_free_at_reference(node.operand, bound_stack, result_vars, free)
+        return
+    if isinstance(node, ComparisonNode):
+        _collect_free_at_reference(node.left, bound_stack, result_vars, free)
+        _collect_free_at_reference(node.right, bound_stack, result_vars, free)
+        return
+    if isinstance(node, ArithmeticNode):
+        _collect_free_at_reference(node.left, bound_stack, result_vars, free)
+        _collect_free_at_reference(node.right, bound_stack, result_vars, free)
+        return
+    if isinstance(node, FunctionCallNode):
+        for a in node.arguments:
+            _collect_free_at_reference(a, bound_stack, result_vars, free)
+        return
 
 
 def _collect_vars(node, vars_set: set[str]) -> None:

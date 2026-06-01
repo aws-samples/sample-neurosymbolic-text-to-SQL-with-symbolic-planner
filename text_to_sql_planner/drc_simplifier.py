@@ -15,12 +15,15 @@ passes can compose in any order. Each pass is a pure function
 ``(DRCCondition) -> DRCCondition`` that returns the same node when it
 doesn't apply.
 
-Passes implemented (in order):
+Default passes (run unconditionally):
 
-1. ``_pass_merge_nested_quantifiers``
+1. ``_pass_reflexive_comparison``
+       ``(= x x) → True`` and friends.
+
+2. ``_pass_merge_nested_quantifiers``
        ``∃ X. ∃ Y. φ  →  ∃ X,Y. φ`` (and the same for ``∀``).
 
-2. ``_pass_eliminate_trivial_equalities``
+3. ``_pass_eliminate_trivial_equalities``
        ``∃ v, ... . φ ∧ (= v expr)  →  ∃ ... . φ[v := expr]``
        when ``expr`` does not reference ``v`` (no self-binding) and the
        equality is reachable through top-level conjunctions only (we
@@ -28,7 +31,7 @@ Passes implemented (in order):
        When two bound variables are unified ``(= u v)`` we keep the
        lexicographically-smaller name and drop the other.
 
-3. ``_pass_boolean_simplify``
+4. ``_pass_boolean_simplify``
        Local boolean rewrites:
        ``not (not φ) → φ``,
        ``and φ True → φ``,
@@ -38,23 +41,49 @@ Passes implemented (in order):
        ``implies True φ → φ``,
        ``implies False φ → True``.
 
-4. ``_pass_push_existentials_inward``
+5. ``_pass_push_existentials_inward``
        ``∃ x. (φ ∧ ψ)  →  φ ∧ (∃ x. ψ)`` when ``x`` is not free in
        ``φ``. This minimises each existential's scope, which improves
        SMT solver performance dramatically because cvc5's E-matching
        only has to instantiate over the smallest body that mentions
        ``x``.
 
-5. ``_pass_drop_unused_binders``
+6. ``_pass_drop_unused_binders``
        ``∃ x. φ`` where ``x`` is not free in ``φ`` → ``φ``.
        Also strips per-variable from ``∃ X. φ`` lists.
+
+7. ``_pass_canonical_and_or``
+       Flattens ``and``/``or`` chains, sorts operands by structural
+       signature, deduplicates structurally-equal operands.
+
+Opt-in pass (NOT run by default):
+
+0. ``_pass_negation_normal_form``
+       Pushes ``¬`` to the leaves: ``¬¬φ → φ``, ``¬(φ ∧ ψ) → ¬φ ∨ ¬ψ``,
+       ``¬∃X.φ → ∀X.¬φ``, ``¬(a = b) → (a != b)``, etc.
+       Run by passing ``simplify_drc(expr, normalize_negation=True)``.
+
+Why NNF is opt-in: it produces wide flat ``∀¬…`` disjunctions that
+are *worse* for cvc5's E-matching than the original ``¬∃…`` shape,
+because cvc5's quantifier-instantiation tactics handle ``∃`` more
+robustly than ``∀``. The planner therefore stores expressions in
+their natural ``¬∃`` form, and the equivalence checker / SMT
+preprocessor see them in that form. NNF stays available for callers
+that explicitly want a canonical form for offline deduplication.
+
+After the rewrite passes settle, every quantifier-bound variable is
+renamed to ``_v0, _v1, …`` in left-to-right traversal order. This
+alpha-canonicalisation makes structurally-identical-modulo-bound-name
+formulas collapse to literally identical trees.
 
 Soundness: every rewrite preserves the truth value of the formula
 under every interpretation. The trivial-equality elimination is a
 standard one-point rule from first-order logic, the boolean rewrites
-are tautologies, and existential pushdown is a well-known scoping
+are tautologies, existential pushdown is a well-known scoping
 identity (``∃x. φ ∧ ψ`` is equivalent to ``φ ∧ ∃x. ψ`` when ``x ∉
-FV(φ)``).
+FV(φ)``), De Morgan and quantifier-negation are classical FOL
+identities, and alpha-renaming is the standard rule of bound-variable
+renaming.
 """
 
 from __future__ import annotations
@@ -82,7 +111,11 @@ from text_to_sql_planner.types.drc import (
 # ---------------------------------------------------------------------------
 
 
-def simplify_drc(expr: DRCExpression) -> DRCExpression:
+def simplify_drc(
+    expr: DRCExpression,
+    *,
+    normalize_negation: bool = False,
+) -> DRCExpression:
     """Simplify a DRC expression to a fixed point of the rewrite pipeline,
     then alpha-canonicalise bound variables to a deterministic sequence.
 
@@ -93,15 +126,31 @@ def simplify_drc(expr: DRCExpression) -> DRCExpression:
     to literally identical trees, which is what powers duplicate
     detection in the planner and gives cvc5's E-matching consistent
     Skolem terms across both sides of an equivalence check.
+
+    ``normalize_negation`` controls whether the negation-normal-form
+    pass (``¬∃ → ∀¬``, ``¬∀ → ∃¬``, De Morgan, comparison flips) runs.
+    The default is ``False``: NNF produces wide flat disjunctions of
+    ``∀¬…`` clauses that are harder for cvc5's E-matching to align
+    against ``∃`` formulas in the typical "≥N − ≥M" pattern. Callers
+    that explicitly want a uniform NNF-canonical form (e.g. for
+    structural deduplication of equivalence classes the other passes
+    don't reach) can set this flag.
     """
+    if normalize_negation:
+        passes = _PASSES_WITH_NNF
+    else:
+        passes = _PASSES_NO_NNF
     simplified = DRCExpression(
         result_variables=expr.result_variables,
-        condition=_simplify_condition(expr.condition),
+        condition=_simplify_condition(expr.condition, passes),
     )
     return _alpha_canonicalize_expression(simplified)
 
 
-def _simplify_condition(node: DRCCondition) -> DRCCondition:
+def _simplify_condition(
+    node: DRCCondition,
+    passes: list[tuple[str, "Callable[[DRCCondition], DRCCondition]"]],
+) -> DRCCondition:
     """Run every rewrite pass until printed-Lisp output stabilises.
 
     Each iteration walks the tree once per pass; with N passes and a
@@ -113,7 +162,7 @@ def _simplify_condition(node: DRCCondition) -> DRCCondition:
         return node
     prev_signature: object = None
     for _ in range(_MAX_FIXED_POINT_ITERATIONS):
-        for _name, rule in _PASSES:
+        for _name, rule in passes:
             node = _walk(node, rule)
         signature = _signature(node)
         if signature == prev_signature:
@@ -709,8 +758,22 @@ def _collect_free_vars(
 #   and for cvc5's E-matching alignment.
 # - Unused-binder drop runs after pushdown so it can remove binders
 #   pushdown stranded.
-_PASSES: list[tuple[str, Callable[[DRCCondition], DRCCondition]]] = [
-    ("negation_normal_form", _pass_negation_normal_form),
+#
+# Two pass lists are exposed so callers can opt in or out of NNF:
+#
+#   ``_PASSES_NO_NNF``      — default, used by the planner's
+#                              ``simplify_drc(expr)`` call. Does NOT
+#                              push ``¬`` past quantifiers, so the
+#                              expression keeps its natural ``¬∃`` shape
+#                              that cvc5's E-matching aligns better.
+#
+#   ``_PASSES_WITH_NNF``    — opt-in via
+#                              ``simplify_drc(expr, normalize_negation=True)``.
+#                              Produces a strict negation-normal-form
+#                              canonical that's useful for offline
+#                              canonicalisation but not for the cvc5
+#                              equivalence path.
+_PASSES_NO_NNF: list[tuple[str, Callable[[DRCCondition], DRCCondition]]] = [
     ("reflexive_comparison", _pass_reflexive_comparison),
     ("merge_nested_quantifiers", _pass_merge_nested_quantifiers),
     ("eliminate_trivial_equalities", _pass_eliminate_trivial_equalities),
@@ -719,6 +782,10 @@ _PASSES: list[tuple[str, Callable[[DRCCondition], DRCCondition]]] = [
     ("drop_unused_binders", _pass_drop_unused_binders),
     ("canonical_and_or", _pass_canonical_and_or),
 ]
+
+_PASSES_WITH_NNF: list[tuple[str, Callable[[DRCCondition], DRCCondition]]] = [
+    ("negation_normal_form", _pass_negation_normal_form),
+] + _PASSES_NO_NNF
 
 
 # ---------------------------------------------------------------------------

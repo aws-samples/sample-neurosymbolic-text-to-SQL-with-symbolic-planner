@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal, Union
 
 from text_to_sql_planner.types.drc import DRCExpression
@@ -151,10 +151,42 @@ def _read_token_at(text: str, i: int) -> str:
 
 @dataclass
 class EquivalenceCheckerConfig:
-    """Configuration for the equivalence checker."""
+    """Configuration for the equivalence checker.
+
+    ``strategies`` is a list of cvc5 argument profiles to run in
+    parallel. Each profile is a list of CLI flags (without the binary
+    name and without the SMT-LIB script — those are added by the
+    runner). The first profile that returns a *decisive* verdict
+    (``sat`` or ``unsat``) wins; ``unknown`` and process errors are
+    treated as non-decisive and the driver waits for the others.
+
+    Default strategies cover three different quantifier-instantiation
+    tactics:
+
+    1. **Default E-matching** — fast on most formulas, weak on
+       deep quantifier alternation.
+    2. **Model-based quantifier instantiation (``--mbqi``)** — slower
+       on easy formulas but reliably handles ∀∃ alternation,
+       which is exactly the regime that defeats E-matching for
+       counting-style queries (``≥N`` vs ``exactly-N``).
+    3. **Full saturation (``--full-saturate-quant``)** — falls back
+       to exhaustive instantiation when the heuristics give up.
+       Slow but decisive on harder cases.
+
+    Running them in parallel costs one extra cvc5 process per check
+    (still cheap relative to the LLM calls in the planner loop) and
+    lifts most ``unknown`` outcomes to ``unsat``/``sat``.
+    """
 
     cvc5_path: str = "cvc5"
     timeout_seconds: float = 30.0
+    strategies: list[list[str]] = field(
+        default_factory=lambda: [
+            ["--lang=smt2"],
+            ["--lang=smt2", "--mbqi"],
+            ["--lang=smt2", "--full-saturate-quant"],
+        ]
+    )
 
 
 @dataclass
@@ -392,71 +424,137 @@ async def _run_parallel_checks(
     script: str,
     config: EquivalenceCheckerConfig,
 ) -> EquivalenceResult:
-    """Run two cvc5 processes in parallel on the same script."""
+    """Run cvc5 in parallel under several different quantifier-
+    instantiation strategies; the first *decisive* answer wins.
 
-    async def _run_cvc5() -> EquivalenceResult:
-        """Run cvc5 with the script and interpret the result."""
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                config.cvc5_path,
-                "--lang=smt2",
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await proc.communicate(input=script.encode())
-            output = stdout.decode(errors="replace").strip()
-            err_output = stderr.decode(errors="replace").strip()
-            returncode = proc.returncode or 0
+    A "decisive" answer is ``sat`` (NotEquivalent) or ``unsat``
+    (Equivalent). ``unknown`` and process errors are not decisive —
+    when one of the strategies returns one of those, we keep waiting
+    for the others. We stop only when:
 
-            if returncode != 0:
-                return IndeterminateResult(
-                    reason=f"cvc5 exited with code {returncode}: {err_output[:100]}"
-                )
+    - some strategy returns a decisive answer (cancel the rest, win),
+    - or all strategies have completed without a decisive answer
+      (return Indeterminate with the most informative reason),
+    - or the wall-clock budget is exhausted (return Indeterminate
+      "timeout").
 
-            if output == "unsat":
-                return EquivalentResult()
-            elif output == "sat":
-                return NotEquivalentResult()
-            else:
-                return IndeterminateResult(
-                    reason=f"Unexpected cvc5 output: {output[:100]}"
-                )
-        except FileNotFoundError:
-            return IndeterminateResult(reason=f"cvc5 binary not found at '{config.cvc5_path}'")
-        except Exception as e:
-            return IndeterminateResult(reason=str(e))
+    Running multiple strategies costs one extra cvc5 process per
+    check, but it lifts a large fraction of ``unknown`` outcomes —
+    in particular the "≥N vs exactly-N" pattern that defeats default
+    E-matching but is solved easily by ``--mbqi``.
+    """
+    strategies = list(config.strategies) or [["--lang=smt2"]]
+    tasks = [
+        asyncio.create_task(_run_cvc5_with_strategy(script, config, args))
+        for args in strategies
+    ]
 
-    # Create two parallel tasks for robustness (first to finish wins)
-    task1 = asyncio.create_task(_run_cvc5())
-    task2 = asyncio.create_task(_run_cvc5())
+    decisive_result: EquivalenceResult | None = None
+    last_indeterminate: IndeterminateResult | None = None
+
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + config.timeout_seconds
 
     try:
-        done, pending = await asyncio.wait(
-            {task1, task2},
-            timeout=config.timeout_seconds,
-            return_when=asyncio.FIRST_COMPLETED,
-        )
+        # Wait for tasks to complete one at a time; stop early on the
+        # first decisive result, but keep waiting on indeterminates.
+        # The wall-clock budget is shared across all strategies — we
+        # don't grant each strategy a fresh ``timeout_seconds`` window.
+        pending = set(tasks)
+        while pending:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                for p in pending:
+                    p.cancel()
+                print(f"[cvc5]   TIMEOUT after {config.timeout_seconds}s")
+                return IndeterminateResult(
+                    reason=f"Timeout waiting for cvc5 after {config.timeout_seconds}s"
+                )
+            done, pending = await asyncio.wait(
+                pending,
+                timeout=remaining,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not done:
+                # Wall-clock budget exhausted with no completions.
+                for p in pending:
+                    p.cancel()
+                print(f"[cvc5]   TIMEOUT after {config.timeout_seconds}s")
+                return IndeterminateResult(
+                    reason=f"Timeout waiting for cvc5 after {config.timeout_seconds}s"
+                )
 
-        if not done:
-            task1.cancel()
-            task2.cancel()
-            print(f"[cvc5]   TIMEOUT after {config.timeout_seconds}s")
-            return IndeterminateResult(reason="Timeout waiting for cvc5")
+            for task in done:
+                result = task.result()
+                if isinstance(result, (EquivalentResult, NotEquivalentResult)):
+                    decisive_result = result
+                    break
+                elif isinstance(result, IndeterminateResult):
+                    last_indeterminate = result
 
-        # Get the first completed result
-        for task in done:
-            result = task.result()
-            for p in pending:
-                p.cancel()
-            return result
+            if decisive_result is not None:
+                # Cancel any still-running strategies and return.
+                for p in pending:
+                    p.cancel()
+                return decisive_result
 
-        return IndeterminateResult(reason="No result from cvc5")
+        # All strategies completed without a decisive answer.
+        if last_indeterminate is not None:
+            return last_indeterminate
+        return IndeterminateResult(reason="No decisive cvc5 result from any strategy")
 
     except asyncio.CancelledError:
-        task1.cancel()
-        task2.cancel()
+        for t in tasks:
+            t.cancel()
         return IndeterminateResult(reason="Operation cancelled")
+    except Exception as e:
+        for t in tasks:
+            t.cancel()
+        return IndeterminateResult(reason=str(e))
+
+
+async def _run_cvc5_with_strategy(
+    script: str,
+    config: EquivalenceCheckerConfig,
+    args: list[str],
+) -> EquivalenceResult:
+    """Run cvc5 once with the given CLI arg list and interpret the result."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            config.cvc5_path,
+            *args,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate(input=script.encode())
+        output = stdout.decode(errors="replace").strip()
+        err_output = stderr.decode(errors="replace").strip()
+        returncode = proc.returncode or 0
+
+        if returncode != 0:
+            return IndeterminateResult(
+                reason=(
+                    f"cvc5({' '.join(args)}) exited with code {returncode}: "
+                    f"{err_output[:100]}"
+                )
+            )
+
+        if output == "unsat":
+            return EquivalentResult()
+        if output == "sat":
+            return NotEquivalentResult()
+        return IndeterminateResult(
+            reason=f"cvc5({' '.join(args)}) returned {output[:100]}"
+        )
+    except FileNotFoundError:
+        return IndeterminateResult(
+            reason=f"cvc5 binary not found at '{config.cvc5_path}'"
+        )
+    except asyncio.CancelledError:
+        # Bubble up cancellation cleanly so the driver's bookkeeping
+        # works.
+        raise
     except Exception as e:
         return IndeterminateResult(reason=str(e))
 

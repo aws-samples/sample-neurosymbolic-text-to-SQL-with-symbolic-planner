@@ -476,12 +476,14 @@ def test_reflexive_inequality_collapses_to_false():
 
 
 # ---------------------------------------------------------------------------
-# Negation normal form (De Morgan, quantifier flip)
+# Negation normal form (De Morgan, quantifier flip) — opt-in via
+# ``normalize_negation=True`` (NNF is NOT part of the default pipeline
+# because ``∀¬…`` is harder for cvc5 to align than ``¬∃…``).
 # ---------------------------------------------------------------------------
 
 
 def test_nnf_double_negation_eliminated():
-    """``¬¬R(x) → R(x)``."""
+    """``¬¬R(x) → R(x)`` — works in either mode (boolean simplifier handles it)."""
     body = NotNode(operand=NotNode(operand=MembershipNode(variables=["x"], relation="R")))
     out = simplify_drc(_expr(body, ["x"])).condition
     assert isinstance(out, MembershipNode)
@@ -489,7 +491,7 @@ def test_nnf_double_negation_eliminated():
 
 
 def test_nnf_de_morgan_and():
-    """``¬(R(x) ∧ S(x)) → ¬R(x) ∨ ¬S(x)``."""
+    """``¬(R(x) ∧ S(x)) → ¬R(x) ∨ ¬S(x)`` — only with ``normalize_negation=True``."""
     body = NotNode(
         operand=LogicalConnectiveNode(
             operator="and",
@@ -497,7 +499,7 @@ def test_nnf_de_morgan_and():
             right=MembershipNode(variables=["x"], relation="S"),
         ),
     )
-    out = simplify_drc(_expr(body, ["x"])).condition
+    out = simplify_drc(_expr(body, ["x"]), normalize_negation=True).condition
 
     assert isinstance(out, LogicalConnectiveNode)
     assert out.operator == "or"
@@ -507,7 +509,7 @@ def test_nnf_de_morgan_and():
 
 
 def test_nnf_de_morgan_or():
-    """``¬(R(x) ∨ S(x)) → ¬R(x) ∧ ¬S(x)``."""
+    """``¬(R(x) ∨ S(x)) → ¬R(x) ∧ ¬S(x)`` — only with ``normalize_negation=True``."""
     body = NotNode(
         operand=LogicalConnectiveNode(
             operator="or",
@@ -515,7 +517,7 @@ def test_nnf_de_morgan_or():
             right=MembershipNode(variables=["x"], relation="S"),
         ),
     )
-    out = simplify_drc(_expr(body, ["x"])).condition
+    out = simplify_drc(_expr(body, ["x"]), normalize_negation=True).condition
 
     assert isinstance(out, LogicalConnectiveNode)
     assert out.operator == "and"
@@ -524,7 +526,39 @@ def test_nnf_de_morgan_or():
 
 
 def test_nnf_quantifier_flip():
-    """``¬∃ x. R(x) → ∀ x. ¬R(x)``."""
+    """``¬∃ x. R(x) → ∀ x. ¬R(x)`` — only with ``normalize_negation=True``."""
+    body = NotNode(
+        operand=QuantifierNode(
+            kind="exists",
+            variables=["x"],
+            body=MembershipNode(variables=["x"], relation="R"),
+        ),
+    )
+    out = simplify_drc(_expr(body, ["dummy"]), normalize_negation=True).condition
+
+    assert isinstance(out, QuantifierNode)
+    assert out.kind == "forall"
+    assert isinstance(out.body, NotNode)
+
+
+def test_nnf_comparison_negation():
+    """``¬(< a b) → (>= a b)`` (and the symmetric flips) — only with NNF on."""
+    body = NotNode(
+        operand=ComparisonNode(
+            operator="<",
+            left=VariableRefNode(name="a"),
+            right=VariableRefNode(name="b"),
+        ),
+    )
+    out = simplify_drc(_expr(body, ["a", "b"]), normalize_negation=True).condition
+    assert isinstance(out, ComparisonNode)
+    assert out.operator == ">="
+
+
+def test_default_pipeline_preserves_negation_form():
+    """By default ``simplify_drc`` keeps ``¬∃`` rather than producing
+    ``∀¬``. The cvc5 path relies on this.
+    """
     body = NotNode(
         operand=QuantifierNode(
             kind="exists",
@@ -533,24 +567,10 @@ def test_nnf_quantifier_flip():
         ),
     )
     out = simplify_drc(_expr(body, ["dummy"])).condition
-
-    assert isinstance(out, QuantifierNode)
-    assert out.kind == "forall"
-    assert isinstance(out.body, NotNode)
-
-
-def test_nnf_comparison_negation():
-    """``¬(< a b) → (>= a b)`` (and the symmetric flips)."""
-    body = NotNode(
-        operand=ComparisonNode(
-            operator="<",
-            left=VariableRefNode(name="a"),
-            right=VariableRefNode(name="b"),
-        ),
-    )
-    out = simplify_drc(_expr(body, ["a", "b"])).condition
-    assert isinstance(out, ComparisonNode)
-    assert out.operator == ">="
+    # Outer node must still be NotNode wrapping an exists.
+    assert isinstance(out, NotNode)
+    assert isinstance(out.operand, QuantifierNode)
+    assert out.operand.kind == "exists"
 
 
 # ---------------------------------------------------------------------------
