@@ -584,7 +584,44 @@ class _SqlGenerator:
         """
         has_aggregates = any(isinstance(rv, AggregateVariable) for rv in result_variables)
 
-        ctx = self._build_context(tree.root)
+        # When the tree's root is itself a projection, ``_build_context``
+        # would wrap it as a derived subquery (via ``_ctx_from_subquery``)
+        # and we'd then emit ANOTHER SELECT around it for the result
+        # variables — producing a doubly-wrapped query like
+        # ``SELECT COUNT(s2.x) FROM (SELECT COUNT(x) FROM …) s2`` whose
+        # outer COUNT always evaluates to 1 (or 0 for an empty source).
+        #
+        # The result_variables passed in already encode the final
+        # projection (they come from the target DRC's projection), so a
+        # root-level Projection operator is redundant here — we walk
+        # through any chain of consecutive projections and build the
+        # context from the first non-projection node beneath them. The
+        # outer SELECT we emit below applies the aggregates / column
+        # list once.
+        #
+        # Soundness: a projection ``π_cols(R)`` followed by a
+        # projection that matches the target's result variables produces
+        # the same final tuples as the target projection applied
+        # directly to R, *as long as* the target projection's columns are
+        # a subset of ``R``'s columns. We rely on the caller's invariant
+        # that ``result_variables`` were validated against the tree
+        # root's ``output_columns``, which the planner enforces by
+        # construction (it only emits a projection chain whose final
+        # output matches the target's column list). The deeper node we
+        # use must therefore expose every name a result variable
+        # references — verified positionally by ``root_columns`` below.
+        effective_root = tree.root
+        while (
+            isinstance(effective_root, OperatorNode)
+            and isinstance(effective_root.params, ProjectionParams)
+            and effective_root.inputs
+        ):
+            effective_root = effective_root.inputs[0]
+
+        ctx = self._build_context(effective_root)
+        # ``root_columns`` — the names the result variables map to
+        # positionally — must come from the *original* tree root, since
+        # that's what the planner aligned against the target DRC.
         root_columns = self._get_node_columns(tree.root)
 
         def _lookup_at(idx: int, fallback_name: str) -> str:
@@ -1003,6 +1040,16 @@ def convert_to_sql(
             wrapper. Emits ``LIMIT`` on the outer SELECT.
     """
     gen = _SqlGenerator()
+    # Tidy up the operation tree before SQL emission: the planner
+    # sometimes emits a chain of redundant projections (e.g.
+    # ``π_[(COUNT emp_id)] · π_[emp_id] · σ · T``) which is
+    # semantically identical to ``π_[(COUNT emp_id)] · σ · T``.
+    # Collapsing the chain reduces noise in the operation tree
+    # printout and shrinks the converter's internal context-building
+    # work; the SQL generator's root-projection skip handles the
+    # remainder.
+    from text_to_sql_planner.operation_tree_simplifier import simplify_operation_tree
+    tree = simplify_operation_tree(tree)
     return gen.generate(
         tree,
         result_variables,

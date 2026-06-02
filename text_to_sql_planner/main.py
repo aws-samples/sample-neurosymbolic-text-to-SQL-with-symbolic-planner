@@ -146,8 +146,15 @@ async def run(
         )
 
     # --- Step 4: Convert operation tree to SQL ---
+    # Tidy up the operation tree: redundant intermediate projections
+    # the LLM sometimes inserts (e.g. ``π_[emp_id]`` immediately
+    # before ``π_[(COUNT emp_id)]``) collapse via the simplifier so
+    # both the generated SQL and the printed tree are clean.
+    from text_to_sql_planner.operation_tree_simplifier import simplify_operation_tree
+    simplified_tree = simplify_operation_tree(planner_result.operation_tree)
+
     sql_result = convert_query_to_sql(
-        planner_result.operation_tree,
+        simplified_tree,
         target_query,
         distinct=question_result.use_distinct,
     )
@@ -160,7 +167,7 @@ async def run(
 
     return TextToSQLSuccess(
         sql=sql_result.sql,
-        operation_tree=planner_result.operation_tree,
+        operation_tree=simplified_tree,
         target_expression=target_expression,
         target_query=target_query,
     )

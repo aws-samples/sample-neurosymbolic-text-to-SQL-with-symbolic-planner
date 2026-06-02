@@ -472,6 +472,50 @@ def _source_name(source: SqlSource | None) -> str:
     return ""
 
 
+# Aggregate-name patterns, used by several rules to decide whether an
+# inner SELECT collapses to one row (scalar aggregate without GROUP BY)
+# or whether substituting an inner column expression into the outer
+# scope would produce a nested-aggregate violation.
+_AGG_FUNCS = ("COUNT", "SUM", "AVG", "MIN", "MAX")
+_AGG_PATTERN = re.compile(
+    r"^\s*(?:" + "|".join(_AGG_FUNCS) + r")\s*\(",
+    re.IGNORECASE,
+)
+
+
+def _is_aggregate_expr(col: str) -> bool:
+    """True if ``col`` starts with an aggregate function call."""
+    return bool(_AGG_PATTERN.match(col))
+
+
+def _returns_exactly_one_row(node: SqlSelect) -> bool:
+    """True iff ``node`` is guaranteed to return exactly one row.
+
+    Two safe cases:
+
+    * ``LIMIT 1`` (and the source isn't empty in the strictest sense —
+      but ``COUNT`` and friends over an empty source still return one
+      row, which is the only context this helper is used in).
+    * Every column in the projection is a scalar aggregate AND there's
+      no ``GROUP BY``. Aggregate-without-GROUP BY collapses any
+      multiset (including the empty one) to exactly one row.
+
+    Returns False conservatively for shapes the rule doesn't model
+    (e.g. ``UNION`` would be visible as a non-SqlSelect form, but our
+    AST doesn't represent it explicitly).
+    """
+    # Case A: explicit LIMIT 1.
+    if node.limit.strip() == "1":
+        return True
+
+    # Case B: scalar-aggregate query with no GROUP BY.
+    if node.group_by:
+        return False
+    if not node.columns:
+        return False
+    return all(_is_aggregate_expr(c) for c in node.columns)
+
+
 # ---------------------------------------------------------------------------
 # Simplification rules
 #
@@ -560,6 +604,13 @@ def _rule_inline_rebinding_subquery(node: SqlSelect) -> SqlSelect:
       * The inner SELECT has no GROUP BY / ORDER BY / LIMIT (those would
         change the *set* of rows visible at the outer scope and so
         cannot generally be promoted past an outer SELECT/WHERE).
+      * The inner SELECT has no aggregate columns. A scalar-aggregate
+        query (aggregate without GROUP BY) collapses any source to
+        exactly one row — semantically different from the per-row
+        relation we'd produce by inlining the inner FROM into the
+        outer. Substituting ``alias.X`` with the aggregate expression
+        also produces nested aggregates at the outer scope, which is
+        invalid SQL.
       * Every inner SELECT column has a determinable public name
         (i.e. it's a bare identifier, ``alias.col``, or ``<expr> AS
         name``). Aggregates/expressions without ``AS`` are rejected
@@ -582,6 +633,16 @@ def _rule_inline_rebinding_subquery(node: SqlSelect) -> SqlSelect:
     # differ from the same clauses applied outside, so we mustn't fold
     # them away.
     if inner.group_by or inner.order_by or inner.limit:
+        return node
+
+    # Bail when the inner is a scalar-aggregate query (any column is
+    # an aggregate with no GROUP BY). Those queries return exactly
+    # one row; inlining their FROM into the outer would change the
+    # outer's row count, and substituting ``alias.X`` with the
+    # aggregate expression produces nested aggregates that are
+    # invalid SQL. The dedicated ``count_over_one_row_subquery`` rule
+    # handles the cases where this collapse IS sound.
+    if any(_is_aggregate_expr(c) for c in inner.columns):
         return node
 
     mapping = _build_alias_substitution(sub.alias, inner.columns)
@@ -630,6 +691,13 @@ def _rule_merge_groupby_through_subquery(node: SqlSelect) -> SqlSelect:
     Only fires when the outer adds nothing other than GROUP BY (plus
     optional ORDER BY / LIMIT, which compose cleanly with the merged
     GROUP BY).
+
+    Bails when the inner is a scalar-aggregate query (any column is
+    an aggregate with no GROUP BY). Promoting such an inner past the
+    outer's ``GROUP BY sub.X`` reference would leave a dangling
+    qualifier — the inner FROM/JOIN shape doesn't expose ``sub.X``.
+    The dedicated ``count_over_one_row_subquery`` rule handles cases
+    where the collapse is sound.
     """
     if not isinstance(node.from_source, SqlSubquery):
         return node
@@ -637,6 +705,8 @@ def _rule_merge_groupby_through_subquery(node: SqlSelect) -> SqlSelect:
         return node
     inner = node.from_source.query
     if inner.group_by:
+        return node
+    if any(_is_aggregate_expr(c) for c in inner.columns):
         return node
     return replace(
         node,
@@ -703,10 +773,226 @@ def _rule_unwrap_join_subquery(node: SqlSelect) -> SqlSelect:
     return replace(node, joins=new_joins)
 
 
+# ---------------------------------------------------------------------------
+# Subquery-shape rewrites
+# ---------------------------------------------------------------------------
+
+
+def _rule_drop_subquery_orderby_without_limit(node: SqlSelect) -> SqlSelect:
+    """``SELECT … FROM (… ORDER BY x) sub`` → ``SELECT … FROM (…) sub``
+    when the subquery has no ``LIMIT``.
+
+    Soundness: relational SQL is set-based at semicolons. ``ORDER BY``
+    only affects the visible row order of the *final* result. When an
+    ``ORDER BY`` lives inside a subquery without a ``LIMIT``, the
+    enclosing query consumes the subquery as an unordered multiset —
+    the ordering is unobservable and can be safely dropped.
+
+    The rule does NOT touch top-level ``ORDER BY`` (that's user-visible)
+    or any ``ORDER BY`` paired with a ``LIMIT`` in the same scope (the
+    pair selects which rows survive).
+
+    Applies in both the FROM source and any JOIN source.
+    """
+    new_from = node.from_source
+    changed_from = False
+    if (
+        isinstance(new_from, SqlSubquery)
+        and new_from.query.order_by
+        and not new_from.query.limit
+    ):
+        new_from = SqlSubquery(
+            query=replace(new_from.query, order_by=""),
+            alias=new_from.alias,
+        )
+        changed_from = True
+
+    new_joins: list[SqlJoin] = []
+    changed_joins = False
+    for j in node.joins:
+        if (
+            isinstance(j.source, SqlSubquery)
+            and j.source.query.order_by
+            and not j.source.query.limit
+        ):
+            new_joins.append(
+                replace(
+                    j,
+                    source=SqlSubquery(
+                        query=replace(j.source.query, order_by=""),
+                        alias=j.source.alias,
+                    ),
+                )
+            )
+            changed_joins = True
+        else:
+            new_joins.append(j)
+
+    if not (changed_from or changed_joins):
+        return node
+    return replace(node, from_source=new_from, joins=new_joins)
+
+
+# Aggregate-name patterns. We match ``AGG(...)`` at the start of the
+# trimmed column expression so qualified aliases like ``COUNT(emp_id)
+# AS n`` still match.
+_AGG_FUNCS = ("COUNT", "SUM", "AVG", "MIN", "MAX")
+_AGG_PATTERN = re.compile(
+    r"^\s*(?:" + "|".join(_AGG_FUNCS) + r")\s*\(",
+    re.IGNORECASE,
+)
+
+
+def _is_aggregate_expr(col: str) -> bool:
+    """True if ``col`` starts with an aggregate function call."""
+    return bool(_AGG_PATTERN.match(col))
+
+
+def _returns_exactly_one_row(node: SqlSelect) -> bool:
+    """True iff ``node`` is guaranteed to return exactly one row.
+
+    Two safe cases:
+
+    * ``LIMIT 1`` (and the source isn't empty in the strictest sense —
+      but ``COUNT`` and friends over an empty source still return one
+      row, which is the only context this helper is used in).
+    * Every column in the projection is a scalar aggregate AND there's
+      no ``GROUP BY``. Aggregate-without-GROUP BY collapses any
+      multiset (including the empty one) to exactly one row.
+
+    Returns False conservatively for shapes the rule doesn't model
+    (e.g. ``UNION`` would be visible as a non-SqlSelect form, but our
+    AST doesn't represent it explicitly).
+    """
+    # Case A: explicit LIMIT 1.
+    if node.limit.strip() == "1":
+        return True
+
+    # Case B: scalar-aggregate query with no GROUP BY.
+    if node.group_by:
+        return False
+    if not node.columns:
+        return False
+    return all(_is_aggregate_expr(c) for c in node.columns)
+
+
+def _rule_count_over_one_row_subquery(node: SqlSelect) -> SqlSelect:
+    """``SELECT COUNT(<expr>) FROM (<inner>) sub`` → ``SELECT 1``
+    when ``<inner>`` is guaranteed to return exactly one row AND
+    ``<expr>`` is guaranteed to be non-null in that row.
+
+    Soundness: ``COUNT(e)`` counts rows where ``e`` is non-null.
+    Over a one-row source it's 1 if ``e`` is non-null, 0 if ``e`` is
+    null. We therefore only rewrite when we can prove non-nullness
+    statically. Two safe cases:
+
+    * ``COUNT(*)`` — always counts rows regardless of column values,
+      so the result is exactly the row count (= 1 for one-row source).
+    * ``COUNT(sub.X)`` where the inner SELECT's column matching ``X``
+      is itself an aggregate ``COUNT(...)``. ``COUNT`` always returns
+      a non-null integer ≥ 0, so ``sub.X`` is non-null and the outer
+      ``COUNT`` returns 1.
+
+    Other ``COUNT(<expr>)`` forms (qualified column whose inner is a
+    SUM/AVG/MIN/MAX, or any unrelated expression) are NOT rewritten —
+    those aggregates can be null over an empty input, and the safety
+    proof breaks.
+
+    Pattern (all conditions required):
+
+    * Exactly one outer column whose expression is ``COUNT(*)`` or
+      ``COUNT(<sub-alias>.<col>)``.
+    * The FROM source is a subquery whose AST satisfies
+      ``_returns_exactly_one_row``.
+    * No outer JOINs, WHERE, GROUP BY, ORDER BY, or LIMIT (all of
+      these could change the count).
+
+    The replacement is the constant query ``SELECT 1`` (preserving the
+    outer column's ``AS alias`` if any). That bare SELECT (no FROM)
+    is valid in every dialect we target.
+    """
+    if len(node.columns) != 1:
+        return node
+    if node.joins or node.where or node.group_by or node.order_by or node.limit:
+        return node
+    if not isinstance(node.from_source, SqlSubquery):
+        return node
+
+    sub = node.from_source
+    inner = sub.query
+    if not _returns_exactly_one_row(inner):
+        return node
+
+    col = node.columns[0].strip()
+    if not _is_count_with_proven_nonnull_arg(col, sub.alias, inner.columns):
+        return node
+
+    # Preserve the outer column's alias if any (``COUNT(*) AS n`` →
+    # ``1 AS n``).
+    m = _AS_RENAME.match(col)
+    new_col = f"1 AS {m.group(2)}" if m else "1"
+
+    return SqlSelect(columns=[new_col])
+
+
+_COUNT_STAR_PATTERN = re.compile(
+    r"^\s*COUNT\s*\(\s*\*\s*\)\s*(?:AS\s+\w+\s*)?$",
+    re.IGNORECASE,
+)
+
+_COUNT_QUALIFIED_PATTERN = re.compile(
+    r"^\s*COUNT\s*\(\s*(\w+)\.(\w+)\s*\)\s*(?:AS\s+\w+\s*)?$",
+    re.IGNORECASE,
+)
+
+
+def _is_count_with_proven_nonnull_arg(
+    col: str, sub_alias: str, inner_columns: list[str],
+) -> bool:
+    """True if ``col`` is a ``COUNT(...)`` form whose argument we can
+    prove non-null statically.
+
+    See :func:`_rule_count_over_one_row_subquery` for the soundness
+    argument.
+    """
+    if _COUNT_STAR_PATTERN.match(col):
+        return True
+    m = _COUNT_QUALIFIED_PATTERN.match(col)
+    if not m:
+        return False
+    qualifier, column = m.group(1), m.group(2)
+    if qualifier != sub_alias:
+        return False
+    # Find the inner column that exposes ``column`` and check it's a
+    # COUNT(...) aggregate (always non-null).
+    for inner_col in inner_columns:
+        public = _column_public_name(inner_col)
+        if public != column:
+            continue
+        underlying = _column_underlying_expr(inner_col) or inner_col
+        if _COUNT_LIKE_INNER_PATTERN.match(underlying):
+            return True
+        return False
+    return False
+
+
+# A ``COUNT(...)`` aggregate, with any argument shape (``*``, qualified,
+# bare). Used to confirm that an inner column is COUNT-shaped before
+# concluding it's non-null.
+_COUNT_LIKE_INNER_PATTERN = re.compile(
+    r"^\s*COUNT\s*\(",
+    re.IGNORECASE,
+)
+
+
 _RULES: list[tuple[str, SimplifyRule]] = [
     # Recursion is itself a "rule" in the pipeline so it benefits from
     # the same fixed-point convergence as any other rewrite.
     ("recurse", _rule_recurse_into_subqueries),
+    # Subquery-shape cleanups that don't depend on outer-clause
+    # composition. Drop unobservable ``ORDER BY`` first so subsequent
+    # rules see a normalised inner.
+    ("drop_subquery_orderby_without_limit", _rule_drop_subquery_orderby_without_limit),
     # FROM-side rewrites, ordered from most specific (passthrough) to
     # most general (rebinding inline).
     ("unwrap_passthrough_from", _rule_unwrap_passthrough_from),
@@ -714,6 +1000,8 @@ _RULES: list[tuple[str, SimplifyRule]] = [
     ("inline_rebinding_subquery", _rule_inline_rebinding_subquery),
     ("collapse_redundant_wrapper", _rule_collapse_redundant_wrapper),
     ("merge_groupby_through_subquery", _rule_merge_groupby_through_subquery),
+    # Constant-folding for nested aggregates.
+    ("count_over_one_row_subquery", _rule_count_over_one_row_subquery),
     # Predicate-shape rewrites.
     ("cross_join_to_join_on", _rule_cross_join_to_join_on),
     # JOIN-side rewrites.

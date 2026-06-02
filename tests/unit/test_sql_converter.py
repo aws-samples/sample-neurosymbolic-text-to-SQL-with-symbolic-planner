@@ -601,3 +601,168 @@ class TestDivision:
         assert "student" in result.sql
         # Should have nested NOT EXISTS
         assert result.sql.count("NOT EXISTS") == 2
+
+
+
+# ---------------------------------------------------------------------------
+# Result-variable finalisation: avoid double-wrapping a root projection
+# ---------------------------------------------------------------------------
+#
+# When the operation tree's root is a projection and the caller passes
+# ``result_variables``, the converter must NOT wrap the projection in
+# another SELECT. Doing so produces ``SELECT COUNT(s2.x) FROM (SELECT
+# COUNT(x) FROM …) s2`` whose outer COUNT collapses to 1 — semantically
+# wrong. The fix walks through any chain of root-level projections and
+# builds the FROM context from the deepest non-projection ancestor;
+# ``result_variables`` then drives a single SELECT at the top.
+
+from text_to_sql_planner.types.drc import (
+    AggregateVariable,
+    ColumnVariable,
+)
+
+
+def test_aggregate_count_over_root_projection_no_double_wrap():
+    """Reproduces the nohup3.md "How many employees are at least 30
+    years old?" failure: tree root is ``projection [(COUNT emp_id)]``
+    over a ``projection [emp_id]`` over a selection.
+
+    Before the fix the SQL was
+
+        SELECT COUNT(s2.emp_id) FROM (
+          SELECT COUNT(emp_id) FROM (
+            SELECT e1.emp_id FROM Employees e1 WHERE …
+          ) s1
+        ) s2
+
+    whose outer ``COUNT`` always returns 1. After the fix the projection
+    chain is collapsed and the COUNT is applied once at the outer SELECT.
+    """
+    employees = _table_leaf(
+        "Employees",
+        ["emp_id", "first_name", "date_of_birth"],
+    )
+    cond = ComparisonNode(
+        operator="<=",
+        left=VariableRefNode(name="date_of_birth"),
+        right=LiteralNode(value=20000, data_type="number"),
+    )
+    sel = _selection_node(employees, cond)
+    proj_emp_id = _projection_node(sel, ["emp_id"])
+    proj_count = OperatorNode(
+        operator="projection",
+        params=ProjectionParams(columns=["(COUNT emp_id)"]),
+        inputs=[proj_emp_id],
+        output_columns=["emp_id"],
+    )
+    tree = OperationTree(root=proj_count)
+
+    result = convert_to_sql(
+        tree,
+        result_variables=[AggregateVariable(function="COUNT", column="emp_id")],
+    )
+    assert isinstance(result, SQLSuccess), result
+    sql = result.sql
+
+    # Exactly ONE COUNT(...) — not two.
+    assert sql.count("COUNT(") == 1, sql
+    # No nested ``SELECT COUNT(`` inside a derived subquery.
+    assert "FROM (\n" not in sql or "SELECT COUNT" not in sql.split("FROM (\n", 1)[1]
+    # The aggregate references the underlying column (qualified by alias).
+    assert "COUNT(e1.emp_id)" in sql or "COUNT(emp_id)" in sql
+
+
+def test_plain_column_finalisation_skips_root_projection():
+    """A non-aggregate result-variable list over a root-projection tree
+    also collapses — the projection is redundant when the outer SELECT
+    already supplies the column list."""
+    employees = _table_leaf("Employees", ["emp_id", "first_name", "last_name"])
+    proj = _projection_node(employees, ["emp_id", "first_name"])
+    tree = OperationTree(root=proj)
+
+    result = convert_to_sql(
+        tree,
+        result_variables=[
+            ColumnVariable(name="emp_id"),
+            ColumnVariable(name="first_name"),
+        ],
+    )
+    assert isinstance(result, SQLSuccess), result
+    sql = result.sql
+
+    # Top-level FROM is the bare ``Employees e1`` table, not a derived
+    # subquery wrapping a projection.
+    assert "FROM Employees" in sql
+    # No derived-table syntax around a SELECT.
+    assert "FROM (" not in sql
+
+
+def test_aggregate_over_table_leaf_emits_single_count():
+    """Sanity check: ``COUNT`` over a plain table leaf (no projection
+    chain) emits a single SELECT — proves the fix doesn't regress the
+    common case."""
+    employees = _table_leaf("Employees", ["emp_id"])
+    tree = OperationTree(root=employees)
+
+    result = convert_to_sql(
+        tree,
+        result_variables=[AggregateVariable(function="COUNT", column="emp_id")],
+    )
+    assert isinstance(result, SQLSuccess), result
+    sql = result.sql
+    assert sql.count("COUNT(") == 1
+    assert "SELECT COUNT(" in sql
+    assert "FROM (" not in sql
+
+
+def test_count_over_projection_over_selection():
+    """End-to-end: tree root is ``projection [(COUNT emp_id)]`` over
+    a selection. Result is a single aggregated SELECT with the WHERE
+    clause inline — no wrapper subquery."""
+    employees = _table_leaf("Employees", ["emp_id", "date_of_birth"])
+    cond = ComparisonNode(
+        operator="<=",
+        left=VariableRefNode(name="date_of_birth"),
+        right=LiteralNode(value=20000, data_type="number"),
+    )
+    sel = _selection_node(employees, cond)
+    proj_count = OperatorNode(
+        operator="projection",
+        params=ProjectionParams(columns=["(COUNT emp_id)"]),
+        inputs=[sel],
+        output_columns=["emp_id"],
+    )
+    tree = OperationTree(root=proj_count)
+
+    result = convert_to_sql(
+        tree,
+        result_variables=[AggregateVariable(function="COUNT", column="emp_id")],
+    )
+    assert isinstance(result, SQLSuccess), result
+    sql = result.sql
+
+    assert sql.count("COUNT(") == 1
+    assert "FROM Employees" in sql
+    assert "WHERE" in sql
+    assert "FROM (" not in sql  # no wrapper subquery
+
+
+def test_double_projection_chain_skipped():
+    """Even a chain of multiple projections at the root collapses.
+    The walk-through-projections logic must handle arbitrary depth.
+    """
+    employees = _table_leaf("Employees", ["emp_id", "first_name", "last_name"])
+    p1 = _projection_node(employees, ["emp_id", "first_name"])
+    p2 = _projection_node(p1, ["emp_id"])
+    p3 = _projection_node(p2, ["emp_id"])
+    tree = OperationTree(root=p3)
+
+    result = convert_to_sql(
+        tree,
+        result_variables=[ColumnVariable(name="emp_id")],
+    )
+    assert isinstance(result, SQLSuccess), result
+    sql = result.sql
+
+    assert "FROM Employees" in sql
+    assert "FROM (" not in sql

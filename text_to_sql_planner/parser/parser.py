@@ -453,15 +453,64 @@ class _Parser:
             body=body,
         )
 
-    def _parse_logical_binary(self, op: str) -> LogicalConnectiveNode:
-        """Parse (and left right), (or left right), (implies left right)."""
-        left = self._parse_condition()
-        right = self._parse_condition()
-        return LogicalConnectiveNode(
-            operator=op,  # type: ignore[arg-type]
-            left=left,
-            right=right,
-        )
+    def _parse_logical_binary(self, op: str) -> DRCCondition:
+        """Parse n-ary ``(and ...)``, ``(or ...)``, or ``(implies ...)``.
+
+        The DRC AST stores logical connectives as binary nodes
+        (``LogicalConnectiveNode`` with ``left`` and ``right`` fields),
+        so an n-ary input is left-folded into a chain of binary nodes:
+
+            (and X1 X2 X3)  →  (and (and X1 X2) X3)
+
+        Degenerate cases:
+
+        * ``(op X)`` — single operand. ``and`` and ``or`` of one
+          operand are equivalent to the operand itself, so we return
+          ``X`` directly. This also accommodates a common LLM mistake
+          of wrapping a single conjunct in ``(and ...)``.
+        * ``(op)`` — zero operands. Rejected as a ``ParseError`` (no
+          sensible identity for ``implies``, and an empty ``and``/``or``
+          is suspicious enough to flag).
+
+        ``implies`` requires exactly two operands; n-ary ``implies``
+        has no standard meaning.
+        """
+        operands: list[DRCCondition] = []
+        while self._current().type is not TokenType.RPAREN:
+            operands.append(self._parse_condition())
+
+        if not operands:
+            raise ParseError(
+                offset=self._current().offset,
+                message=f"'{op}' requires at least one operand",
+            )
+
+        if op == "implies":
+            if len(operands) != 2:
+                raise ParseError(
+                    offset=self._current().offset,
+                    message=(
+                        f"'implies' requires exactly 2 operands, got {len(operands)}"
+                    ),
+                )
+            return LogicalConnectiveNode(
+                operator=op,  # type: ignore[arg-type]
+                left=operands[0],
+                right=operands[1],
+            )
+
+        # ``and`` / ``or``: left-fold into a binary chain.
+        if len(operands) == 1:
+            return operands[0]
+
+        result: DRCCondition = operands[0]
+        for next_operand in operands[1:]:
+            result = LogicalConnectiveNode(
+                operator=op,  # type: ignore[arg-type]
+                left=result,
+                right=next_operand,
+            )
+        return result
 
     def _parse_not(self) -> NotNode:
         """Parse (not operand)."""

@@ -264,6 +264,7 @@ Syntax rules:
   - Aggregate: (COUNT col), (SUM col), (AVG col), (MIN col), (MAX col)
 - Membership: (in (var1 var2 ...) TableName) — asserts that the tuple (var1, var2, ...) is a row in TableName
 - Logical: (and cond1 cond2), (or cond1 cond2), (not cond), (implies cond1 cond2)
+  - ``and`` and ``or`` accept TWO OR MORE operands. NEVER write a unary ``(and X)`` or ``(or X)`` — if there is only one conjunct/disjunct, write the operand directly with no surrounding ``(and ...)`` or ``(or ...)``.
 - Comparison: (= x y), (!= x y), (< x y), (> x y), (<= x y), (>= x y)
 - Quantifiers: (exists (var1 var2 ...) body), (forall (var1 var2 ...) body)
   - Quantifiers just bind variables. Use (in ...) inside the body to constrain them to a relation.
@@ -301,6 +302,11 @@ Question: "Find employees who have no performance reviews"
 Schema: CREATE TABLE Employees (emp_id INT, first_name VARCHAR, last_name VARCHAR, dept_id INT); CREATE TABLE Reviews (review_id INT, emp_id INT, rating INT)
 Answer: (drc (emp_id first_name last_name) (exists (dept_id) (and (in (emp_id first_name last_name dept_id) Employees) (not (exists (review_id rating) (in (review_id emp_id rating) Reviews))))))
 Note: dept_id is NOT a result variable so it's quantified. emp_id IS a result variable so it stays free.
+
+Question: "Show employee names and salaries"
+Schema: CREATE TABLE Employees (emp_id INT, name VARCHAR); CREATE TABLE Compensation (comp_id INT, emp_id INT, salary DECIMAL)
+Answer: (drc (name salary) (exists (emp_id) (and (in (emp_id name) Employees) (exists (comp_id) (in (comp_id emp_id salary) Compensation)))))
+Note: The inner existential body has only ONE conjunct — the (in ...) membership — so it appears bare without a surrounding (and ...). Writing (exists (comp_id) (and (in (...) Compensation))) with a unary 'and' is INVALID — use the membership directly.
 
 Cardinality patterns ("at least N", "two or more", "more than N", "exactly N"):
 - "at least N" / "N or more" / "two or more" → assert the existence of N distinct witnesses, joined by AND, all pairwise distinct. DO NOT add ``(not (exists ...))`` for an extra witness — that turns "≥N" into "exactly N" or "≥N+1".

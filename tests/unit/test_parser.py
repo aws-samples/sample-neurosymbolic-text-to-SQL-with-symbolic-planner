@@ -408,3 +408,102 @@ class TestErrorCases:
         result = parse("(drc ((MEDIAN x)) y)")
         assert isinstance(result, ParserFailure)
         assert "Unknown aggregate function" in result.error.message
+
+
+class TestNAryAndOr:
+    """Parser accepts ``(and ...)`` / ``(or ...)`` with any arity ≥ 1.
+
+    The DRC AST stores connectives as binary nodes, so n-ary inputs
+    are left-folded into binary chains and unary ``(and X)`` /
+    ``(or X)`` collapses to ``X``. ``(implies …)`` keeps its strict
+    binary requirement.
+    """
+
+    def test_unary_and_collapses_to_operand(self):
+        """``(and X) ≡ X`` — common LLM mistake when an existential
+        body has a single conjunct."""
+        result = parse("(drc (x) (and (in (x) R)))")
+        assert isinstance(result, ParserSuccess)
+        cond = result.expression.condition
+        assert isinstance(cond, MembershipNode)
+        assert cond.relation == "R"
+        assert cond.variables == ["x"]
+
+    def test_unary_or_collapses_to_operand(self):
+        result = parse("(drc (x) (or (in (x) R)))")
+        assert isinstance(result, ParserSuccess)
+        cond = result.expression.condition
+        assert isinstance(cond, MembershipNode)
+        assert cond.relation == "R"
+
+    def test_ternary_and_left_folds(self):
+        """``(and X Y Z)`` becomes ``(and (and X Y) Z)``."""
+        result = parse(
+            "(drc (x) (and (in (x) R) (in (x) S) (in (x) T)))"
+        )
+        assert isinstance(result, ParserSuccess)
+        cond = result.expression.condition
+        # Outer is ``(and ... T)``.
+        assert isinstance(cond, LogicalConnectiveNode)
+        assert cond.operator == "and"
+        assert isinstance(cond.right, MembershipNode)
+        assert cond.right.relation == "T"
+        # Inner is ``(and R S)``.
+        assert isinstance(cond.left, LogicalConnectiveNode)
+        assert cond.left.operator == "and"
+        assert isinstance(cond.left.left, MembershipNode)
+        assert cond.left.left.relation == "R"
+        assert isinstance(cond.left.right, MembershipNode)
+        assert cond.left.right.relation == "S"
+
+    def test_quaternary_or_left_folds(self):
+        result = parse(
+            "(drc (x) (or (in (x) A) (in (x) B) (in (x) C) (in (x) D)))"
+        )
+        assert isinstance(result, ParserSuccess)
+        cond = result.expression.condition
+        # Walk down the left spine collecting relations in reverse order.
+        relations = []
+        while isinstance(cond, LogicalConnectiveNode) and cond.operator == "or":
+            assert isinstance(cond.right, MembershipNode)
+            relations.append(cond.right.relation)
+            cond = cond.left
+        # The final left after unwinding is the leftmost membership.
+        assert isinstance(cond, MembershipNode)
+        relations.append(cond.relation)
+        assert sorted(relations) == ["A", "B", "C", "D"]
+
+    def test_zero_operand_and_rejected(self):
+        result = parse("(drc (x) (and))")
+        assert isinstance(result, ParserFailure)
+
+    def test_zero_operand_or_rejected(self):
+        result = parse("(drc (x) (or))")
+        assert isinstance(result, ParserFailure)
+
+    def test_implies_still_strict_binary(self):
+        """``implies`` doesn't generalise — single-operand and three-
+        operand forms remain errors."""
+        result_unary = parse("(drc (x) (implies (in (x) R)))")
+        assert isinstance(result_unary, ParserFailure)
+
+        result_ternary = parse(
+            "(drc (x) (implies (in (x) R) (in (x) S) (in (x) T)))"
+        )
+        assert isinstance(result_ternary, ParserFailure)
+
+    def test_real_world_join_with_unary_and(self):
+        """Reproduces the exact failure from nohup3.md: join of
+        Employees and Compensation where the Compensation existential
+        has a unary ``(and (in ...))``.
+
+        Before the fix, this raised "Unexpected token: RPAREN" at the
+        offset of the lone ``)`` after the Compensation membership.
+        """
+        lisp = (
+            "(drc (emp_id first_name last_name base_salary)"
+            " (exists (email) (and (in (emp_id first_name last_name email) Employees)"
+            " (exists (comp_id) (and (in (comp_id emp_id base_salary) Compensation))))))"
+        )
+        result = parse(lisp)
+        assert isinstance(result, ParserSuccess)

@@ -107,13 +107,17 @@ async def convert_question(
                 # malformed output. Models tend to anchor on the text they
                 # see and reproduce the same bug, so we describe what went
                 # wrong and ask for a fresh attempt.
+                #
+                # The hint is tailored to the apparent failure mode based
+                # on the prior raw output: a generic hint about "exactly
+                # N" nesting is actively misleading when the actual bug
+                # is something else (e.g. a unary ``(and X)`` from a
+                # join expression with one conjunct).
+                hint = _retry_hint_for(last_raw_output, last_error)
                 enhanced_question = (
                     f"{question}\n\n"
                     f"[The previous attempt produced syntactically invalid "
-                    f"DRC Lisp. Parser error: {last_error}. "
-                    f"Common causes are unbalanced parentheses (more "
-                    f"closing than opening, or vice versa) and over-deep "
-                    f"nesting in the negation of an \"exactly N\" pattern. "
+                    f"DRC Lisp. Parser error: {last_error}. {hint} "
                     f"Produce a fresh, well-formed expression, counting "
                     f"the parentheses carefully.]"
                 )
@@ -207,6 +211,118 @@ async def convert_question(
         attempts=max_attempts,
         last_raw_output=last_raw_output,
     )
+
+
+def _retry_hint_for(last_raw_output: str, last_error: str) -> str:
+    """Tailor the retry hint to the apparent failure mode in
+    ``last_raw_output``.
+
+    The previous prompt always included a hint about "over-deep nesting
+    in the negation of an 'exactly N' pattern", which is irrelevant
+    (and actively misleading) for queries that don't involve
+    negation-of-existential. This helper inspects the prior output and
+    error to pick a more useful hint.
+
+    Heuristics:
+
+    * Unary ``(and X)`` / ``(or X)`` — the most common LLM mistake
+      when joining tables with a single existential body. We accept
+      this in the parser now, but for older error traces we still
+      surface a hint so the next attempt avoids it.
+    * Imbalanced parens — count opens vs closes; if they differ,
+      surface that fact directly.
+    * Negation of an existential — only when the output actually
+      contains ``(not (exists`` do we mention exactly-N nesting.
+    * Otherwise — generic balanced-parens hint.
+    """
+    text = last_raw_output or ""
+
+    # Look for unary ``(and X)`` or ``(or X)``: a single sub-expression
+    # between the operator and its matching close-paren. We use a
+    # cheap depth-tracking textual scan rather than an AST scan
+    # because the input failed to parse.
+    if _has_unary_and_or(text):
+        return (
+            "The prior output contained a unary 'and' or 'or' "
+            "expression like (and X) with a single operand. Use the "
+            "operand directly instead of wrapping it; an existential "
+            "with a single membership conjunct is just "
+            "(in (...) Table) with no surrounding (and ...)."
+        )
+
+    # Balanced-paren check.
+    opens = text.count("(")
+    closes = text.count(")")
+    if opens != closes:
+        diff = closes - opens
+        direction = (
+            "more closes than opens" if diff > 0 else "more opens than closes"
+        )
+        return (
+            f"The prior output had unbalanced parentheses "
+            f"({direction}, off by {abs(diff)}). Re-count carefully."
+        )
+
+    # Negation-of-existential — surface the exactly-N hint only when
+    # the output actually contains (not (exists ...).
+    if "(not (exists" in text or "(not(exists" in text:
+        return (
+            "If the question involves an \"exactly N\" pattern, "
+            "the negation should be a SINGLE (not (exists r_{N+1} ...)) "
+            "with one extra witness pairwise-distinct from the prior N "
+            "witnesses — not a chain of nested existentials inside the "
+            "negation."
+        )
+
+    return "Re-balance the parentheses and re-emit the expression."
+
+
+def _has_unary_and_or(text: str) -> bool:
+    """Detect ``(and X)`` or ``(or X)`` with exactly one immediate
+    operand inside the matching parens.
+
+    Walks the matching close-paren by tracking depth, counting top-level
+    operands inside each ``(and …)`` / ``(or …)`` form. An "operand"
+    is either a parenthesised sub-form or a contiguous run of non-paren
+    non-space characters. Stops at the first match (we only need to
+    know if any unary form exists).
+    """
+    for keyword in ("(and ", "(or "):
+        i = 0
+        while True:
+            i = text.find(keyword, i)
+            if i < 0:
+                break
+            j = i + len(keyword)
+            depth = 1  # we're inside the outer (and / (or
+            operand_count = 0
+            in_word = False
+            while j < len(text) and depth > 0:
+                c = text[j]
+                if c == "(":
+                    if depth == 1:
+                        operand_count += 1
+                        in_word = False
+                    depth += 1
+                elif c == ")":
+                    depth -= 1
+                    in_word = False
+                    if depth == 0:
+                        break
+                elif c.isspace():
+                    in_word = False
+                else:
+                    if depth == 1 and not in_word:
+                        operand_count += 1
+                        in_word = True
+                j += 1
+            if depth == 0 and operand_count == 1:
+                return True
+            # Advance by one character so nested ``(and …)`` /
+            # ``(or …)`` occurrences inside the just-scanned range
+            # still get checked on subsequent iterations.
+            i += 1
+    return False
 
 
 def _validate_free_variables(expr: DRCExpression) -> str | None:

@@ -156,7 +156,7 @@ CREATE TABLE Job_History (
 );
 """
 
-# QUESTION = "How many employees work at location 'San Francisco'?"
+QUESTION = "How many employees work at location 'San Francisco'?"
 # QUESTION = "How many employees were born on or after Jan 1, 2000?"
 # QUESTION = "How many employees are at least 30 years old?"
 # QUESTION = "How many employees are there in each department?"
@@ -165,14 +165,14 @@ CREATE TABLE Job_History (
 # How many employees over the age of 30 and having been working at this company for
 # more than a year are there in each department?"""
 # schema doesn't support:
-#QUESTION = "How many employees have had more than one job at this company?"
+# QUESTION = "How many employees have had more than one job at this company?"
 # QUESTION = "How many employees report to each head of department?"
 # QUESTION = "List all employees that don't have a performance review"
 # QUESTION = "List all employees that don't have a performance review but have taken at least one training course"
 # QUESTION = "List all employees that have two or more performance reviews"
 # QUESTION = "List all employees that have three or more performance reviews"
 # QUESTION = "List the top 5 highest-compensated employees"
-QUESTION = "List all employees that have exactly two performance reviews"
+# QUESTION = "List all employees that have exactly two performance reviews"
 
 
 def main():
