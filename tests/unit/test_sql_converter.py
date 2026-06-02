@@ -766,3 +766,227 @@ def test_double_projection_chain_skipped():
 
     assert "FROM Employees" in sql
     assert "FROM (" not in sql
+
+
+
+# ---------------------------------------------------------------------------
+# Anti-join → NOT EXISTS
+# ---------------------------------------------------------------------------
+
+from text_to_sql_planner.types.operators import AntiJoinParams, DifferenceParams, JoinParams
+
+
+def test_antijoin_emits_not_exists():
+    """A bare anti-join tree emits ``SELECT … FROM L WHERE NOT EXISTS
+    (SELECT 1 FROM R …)`` — no derived-subquery wrap on either side
+    when both sides are bare tables."""
+    employees = _table_leaf("Employees", ["emp_id", "first_name", "last_name"])
+    reviews = _table_leaf("Performance_Reviews", ["review_id", "emp_id"])
+
+    anti = OperatorNode(
+        operator="anti_join",
+        params=AntiJoinParams(join_columns=["emp_id"]),
+        inputs=[employees, reviews],
+        output_columns=["emp_id", "first_name", "last_name"],
+    )
+    tree = OperationTree(root=anti)
+    result = convert_to_sql(
+        tree,
+        result_variables=[
+            ColumnVariable(name="emp_id"),
+            ColumnVariable(name="first_name"),
+            ColumnVariable(name="last_name"),
+        ],
+    )
+    assert isinstance(result, SQLSuccess), result
+    sql = result.sql
+
+    # The emitted SQL has NOT EXISTS, references both tables directly,
+    # and doesn't have a derived ``FROM (SELECT … ) sN`` wrapper.
+    assert "NOT EXISTS" in sql
+    assert "FROM Employees" in sql
+    assert "FROM Performance_Reviews" in sql
+    # No derived subquery wrap (neither outer nor in the NOT EXISTS).
+    assert "FROM (\n" not in sql
+
+
+def test_antijoin_via_join_difference_pattern_end_to_end():
+    """End-to-end: a tree shaped ``Join(Employees, Difference(π_emp_id(Employees),
+    π_emp_id(Performance_Reviews)), key=emp_id)`` runs through the
+    operation-tree simplifier (collapsing to AntiJoin) and the SQL
+    converter (emitting NOT EXISTS) — producing the user's expected
+    "employees with no performance reviews" form.
+    """
+    employees = _table_leaf("Employees", ["emp_id", "first_name", "last_name"])
+    reviews = _table_leaf("Performance_Reviews", ["review_id", "emp_id"])
+
+    emp_proj = OperatorNode(
+        operator="projection",
+        params=ProjectionParams(columns=["emp_id"]),
+        inputs=[employees],
+        output_columns=["emp_id"],
+    )
+    rev_proj = OperatorNode(
+        operator="projection",
+        params=ProjectionParams(columns=["emp_id"]),
+        inputs=[reviews],
+        output_columns=["emp_id"],
+    )
+    diff = OperatorNode(
+        operator="difference",
+        params=DifferenceParams(),
+        inputs=[emp_proj, rev_proj],
+        output_columns=["emp_id"],
+    )
+    join = OperatorNode(
+        operator="join",
+        params=JoinParams(join_columns=["emp_id"]),
+        inputs=[employees, diff],
+        output_columns=["emp_id", "first_name", "last_name"],
+    )
+    tree = OperationTree(root=join)
+
+    result = convert_to_sql(
+        tree,
+        result_variables=[
+            ColumnVariable(name="emp_id"),
+            ColumnVariable(name="first_name"),
+            ColumnVariable(name="last_name"),
+        ],
+    )
+    assert isinstance(result, SQLSuccess), result
+    sql = result.sql
+
+    assert "NOT EXISTS" in sql
+    # No EXCEPT — the difference operator was eliminated.
+    assert "EXCEPT" not in sql
+    assert "FROM Employees" in sql
+    assert "FROM Performance_Reviews" in sql
+    # No derived subqueries.
+    assert "FROM (\n" not in sql
+
+
+
+def test_difference_join_pattern_end_to_end():
+    """End-to-end: ``Difference(Employees, π_cols(Employees ⋈
+    Performance_Reviews))`` runs through the operation-tree
+    simplifier (collapsing to AntiJoin via the difference-join pass)
+    and the SQL converter (emitting NOT EXISTS).
+    """
+    employees = _table_leaf(
+        "Employees", ["emp_id", "first_name", "last_name"]
+    )
+    reviews = _table_leaf(
+        "Performance_Reviews", ["review_id", "emp_id"]
+    )
+
+    join_inner = OperatorNode(
+        operator="join",
+        params=JoinParams(join_columns=["emp_id"]),
+        inputs=[employees, reviews],
+        output_columns=[
+            "emp_id", "first_name", "last_name", "review_id",
+        ],
+    )
+    join_proj = OperatorNode(
+        operator="projection",
+        params=ProjectionParams(
+            columns=["emp_id", "first_name", "last_name"],
+        ),
+        inputs=[join_inner],
+        output_columns=["emp_id", "first_name", "last_name"],
+    )
+    diff = OperatorNode(
+        operator="difference",
+        params=DifferenceParams(),
+        inputs=[employees, join_proj],
+        output_columns=["emp_id", "first_name", "last_name"],
+    )
+    tree = OperationTree(root=diff)
+
+    result = convert_to_sql(
+        tree,
+        result_variables=[
+            ColumnVariable(name="emp_id"),
+            ColumnVariable(name="first_name"),
+            ColumnVariable(name="last_name"),
+        ],
+    )
+    assert isinstance(result, SQLSuccess), result
+    sql = result.sql
+
+    assert "NOT EXISTS" in sql
+    assert "EXCEPT" not in sql
+    assert "FROM Employees" in sql
+    assert "FROM Performance_Reviews" in sql
+    # No derived subqueries.
+    assert "FROM (\n" not in sql
+
+
+
+def test_three_way_join_difference_pattern_end_to_end():
+    """End-to-end: ``Join(Employees, Difference(π_emp_id(Training_Enrollment),
+    π_emp_id(Performance_Reviews)))`` with DISTINCT.
+
+    Should produce ``SELECT DISTINCT ... FROM Employees JOIN
+    Training_Enrollment ... WHERE NOT EXISTS (... Performance_Reviews
+    ...)``.
+    """
+    employees = _table_leaf(
+        "Employees", ["emp_id", "first_name", "last_name"]
+    )
+    training = _table_leaf(
+        "Training_Enrollment", ["enrollment_id", "emp_id"]
+    )
+    reviews = _table_leaf(
+        "Performance_Reviews", ["review_id", "emp_id"]
+    )
+
+    te_proj = OperatorNode(
+        operator="projection",
+        params=ProjectionParams(columns=["emp_id"]),
+        inputs=[training],
+        output_columns=["emp_id"],
+    )
+    pr_proj = OperatorNode(
+        operator="projection",
+        params=ProjectionParams(columns=["emp_id"]),
+        inputs=[reviews],
+        output_columns=["emp_id"],
+    )
+    diff = OperatorNode(
+        operator="difference",
+        params=DifferenceParams(),
+        inputs=[te_proj, pr_proj],
+        output_columns=["emp_id"],
+    )
+    join = OperatorNode(
+        operator="join",
+        params=JoinParams(join_columns=["emp_id"]),
+        inputs=[employees, diff],
+        output_columns=["emp_id", "first_name", "last_name"],
+    )
+    tree = OperationTree(root=join)
+
+    result = convert_to_sql(
+        tree,
+        result_variables=[
+            ColumnVariable(name="emp_id"),
+            ColumnVariable(name="first_name"),
+            ColumnVariable(name="last_name"),
+        ],
+        distinct=True,
+    )
+    assert isinstance(result, SQLSuccess), result
+    sql = result.sql
+
+    # NOT EXISTS for the anti-join half.
+    assert "NOT EXISTS" in sql
+    # Regular JOIN for the semi-join half.
+    assert "JOIN Training_Enrollment" in sql or "JOIN (\n    SELECT" in sql
+    assert "FROM Employees" in sql
+    assert "Performance_Reviews" in sql
+    # DISTINCT at the top level.
+    assert "DISTINCT" in sql
+    # No EXCEPT.
+    assert "EXCEPT" not in sql

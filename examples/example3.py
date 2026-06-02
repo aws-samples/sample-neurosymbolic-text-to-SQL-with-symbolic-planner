@@ -156,7 +156,7 @@ CREATE TABLE Job_History (
 );
 """
 
-QUESTION = "How many employees work at location 'San Francisco'?"
+# QUESTION = "How many employees work at location 'San Francisco'?"
 # QUESTION = "How many employees were born on or after Jan 1, 2000?"
 # QUESTION = "How many employees are at least 30 years old?"
 # QUESTION = "How many employees are there in each department?"
@@ -172,7 +172,7 @@ QUESTION = "How many employees work at location 'San Francisco'?"
 # QUESTION = "List all employees that have two or more performance reviews"
 # QUESTION = "List all employees that have three or more performance reviews"
 # QUESTION = "List the top 5 highest-compensated employees"
-# QUESTION = "List all employees that have exactly two performance reviews"
+QUESTION = "List all employees that have exactly two performance reviews"
 
 
 def main():

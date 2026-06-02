@@ -24,6 +24,7 @@ from text_to_sql_planner.types.operators import (
     UnionParams,
     DifferenceParams,
     DivisionParams,
+    AntiJoinParams,
 )
 from text_to_sql_planner.types.drc import (
     ComparisonNode,
@@ -220,6 +221,8 @@ class _SqlGenerator:
             return self._convert_set_op(node, "EXCEPT")
         elif isinstance(params, DivisionParams):
             return self._convert_division(node)
+        elif isinstance(params, AntiJoinParams):
+            return self._convert_anti_join(node, params)
         elif isinstance(params, ProjectionParams):
             return self._convert_projection(node, params)
         else:
@@ -245,7 +248,7 @@ class _SqlGenerator:
             return self._ctx_join(node, params, inputs)
         elif isinstance(params, CartesianProductParams):
             return self._ctx_cartesian(node, params, inputs)
-        elif isinstance(params, (ProjectionParams, UnionParams, DifferenceParams, DivisionParams)):
+        elif isinstance(params, (ProjectionParams, UnionParams, DifferenceParams, DivisionParams, AntiJoinParams)):
             # Non-flattenable operators get wrapped as a derived subquery
             return self._ctx_from_subquery(node)
         else:
@@ -512,6 +515,245 @@ class _SqlGenerator:
         right_indented = self._indent_sql(right_sql, 2)
         return f"(\n{left_indented}\n)\n{sql_op}\n(\n{right_indented}\n)"
 
+    # --- Anti-join ---
+
+    def _convert_anti_join(self, node: OperatorNode, params: AntiJoinParams) -> str:
+        """Anti-join: ``T1 ▷ T2`` on key ``k`` — rows of ``T1`` whose
+        key is not present in ``T2``.
+
+        Emitted as::
+
+            SELECT <left.cols>
+              FROM <flattened left context>
+              WHERE NOT EXISTS (
+                SELECT 1 FROM <right>
+                  WHERE <right.k> = <left.k>  [AND ...]
+              )
+
+        The right-hand side is rendered as its own SELECT (via the
+        inner ``_convert_node`` call) so it can be any tree shape — a
+        plain table, a projection chain, a selection, a sub-anti-join,
+        etc. Soundness: ``T1 ▷ T2 = {t ∈ T1 | ¬∃ r ∈ T2. r.k = t.k}``,
+        which is exactly the ``NOT EXISTS`` correlated subquery shape.
+        """
+        inputs = node.inputs
+        if len(inputs) != 2:
+            raise _ConversionError("Anti-join requires exactly 2 inputs")
+        if not params.join_columns:
+            raise _ConversionError("Anti-join requires at least one join column")
+
+        # Build the left-side context. The anti-join is a *filter* on
+        # the left side, so its output column shape is the left's
+        # output column shape — we use the node's declared
+        # ``output_columns`` for the SELECT list (matching the
+        # operator-tree's column contract).
+        left_ctx = self._build_context(inputs[0])
+        out_cols = node.output_columns or self._get_node_columns(inputs[0])
+        select_cols = [self._resolve_var(c, left_ctx.var_mapping) for c in out_cols]
+
+        # Right side gets its own SELECT, wrapped in a fresh alias so
+        # the correlated WHERE can reference its key columns cleanly.
+        # When the right input is a bare table, reference it directly
+        # instead of wrapping it in a derived ``(SELECT … FROM T) a1``
+        # shape — the latter is functionally identical but noisy.
+        right = inputs[1]
+        from text_to_sql_planner.types.operation_tree import TableLeafNode
+        right_alias = self._aliases.next_alias("anti")
+        if isinstance(right, TableLeafNode):
+            right_from = f"{right.table_name} {right_alias}"
+        else:
+            right_sql = self._convert_node(right)
+            right_indented = self._indent_sql(right_sql, 4)
+            right_from = f"(\n{right_indented}\n    ) {right_alias}"
+
+        # Build the correlated WHERE conditions: for each join column
+        # k, ``<right_alias>.k = <left.k>``.
+        on_parts: list[str] = []
+        for k in params.join_columns:
+            left_ref = self._resolve_var(k, left_ctx.var_mapping)
+            on_parts.append(f"{right_alias}.{k} = {left_ref}")
+        on_clause = " AND ".join(on_parts)
+
+        not_exists = (
+            f"NOT EXISTS (\n"
+            f"    SELECT 1 FROM {right_from}\n"
+            f"    WHERE {on_clause}\n"
+            f"  )"
+        )
+
+        parts = [f"SELECT {', '.join(select_cols)}"]
+        parts.append(f"  FROM {left_ctx.from_clause}")
+        for jc in left_ctx.join_clauses:
+            parts.append(f"  {jc}")
+        existing_where = (
+            " AND ".join(left_ctx.where_conditions)
+            if left_ctx.where_conditions
+            else ""
+        )
+        if existing_where:
+            parts.append(f"  WHERE {existing_where} AND {not_exists}")
+        else:
+            parts.append(f"  WHERE {not_exists}")
+        return "\n".join(parts)
+
+    def _render_antijoin_with_result_vars(
+        self,
+        anti_node: OperatorNode,
+        original_root: OperationNode,
+        result_variables: list,
+        *,
+        distinct: bool,
+        order_by: list | None,
+        limit: int | None,
+    ) -> SQLResult:
+        """Render an anti-join *root* node as a single top-level SELECT
+        whose projection list is the supplied ``result_variables``.
+
+        Unlike :meth:`_convert_anti_join`, this method emits the anti-
+        join's natural ``SELECT … FROM L WHERE NOT EXISTS (…)`` shape
+        directly — no derived-subquery wrap, no synthetic alias. The
+        result is a clean top-level query that doesn't double up
+        SELECTs.
+
+        ``original_root`` is used to read the operator-tree's
+        ``output_columns`` for positional resolution of result
+        variables — same convention as :meth:`_generate_with_result_vars`.
+
+        Aggregates / ORDER BY / LIMIT / DISTINCT are all supported
+        here so an aggregate-with-anti-join (e.g. "count of employees
+        with no reviews") flows through the same path as the plain
+        anti-join.
+        """
+        params = anti_node.params
+        if not isinstance(params, AntiJoinParams):
+            return SQLFailure(error="Internal: not an anti-join")
+        if len(anti_node.inputs) != 2:
+            return SQLFailure(error="Anti-join requires exactly 2 inputs")
+        if not params.join_columns:
+            return SQLFailure(error="Anti-join requires at least one join column")
+
+        has_aggregates = any(isinstance(rv, AggregateVariable) for rv in result_variables)
+
+        left = anti_node.inputs[0]
+        right = anti_node.inputs[1]
+        left_ctx = self._build_context(left)
+
+        # Positional resolution from result_variables → left.output_columns.
+        # The original tree root's output_columns drive this, mirroring
+        # the standard finalisation logic.
+        root_columns = self._get_node_columns(original_root)
+
+        def _lookup_at(idx: int, fallback_name: str) -> str:
+            if 0 <= idx < len(root_columns):
+                return self._resolve_var(root_columns[idx], left_ctx.var_mapping)
+            return self._resolve_var(fallback_name, left_ctx.var_mapping)
+
+        select_parts: list[str] = []
+        for i, rv in enumerate(result_variables):
+            if isinstance(rv, ColumnVariable):
+                qualified = _lookup_at(i, rv.name)
+                base = qualified.split(".", 1)[-1] if "." in qualified else qualified
+                if base != rv.name:
+                    select_parts.append(f"{qualified} AS {rv.name}")
+                else:
+                    select_parts.append(qualified)
+            elif isinstance(rv, AggregateVariable):
+                qualified_col = _lookup_at(i, rv.column)
+                select_parts.append(f"{rv.function}({qualified_col})")
+        select_str = ", ".join(select_parts)
+
+        # NOT EXISTS subquery against the right side. When the right
+        # input is a bare table, reference it directly instead of
+        # wrapping it in a derived ``(SELECT … FROM T) a1`` shape —
+        # the latter is functionally identical but visually noisy.
+        from text_to_sql_planner.types.operation_tree import TableLeafNode
+        if isinstance(right, TableLeafNode):
+            right_alias = self._aliases.next_alias("anti")
+            on_parts: list[str] = []
+            for k in params.join_columns:
+                left_ref = self._resolve_var(k, left_ctx.var_mapping)
+                on_parts.append(f"{right_alias}.{k} = {left_ref}")
+            on_clause = " AND ".join(on_parts)
+            not_exists = (
+                f"NOT EXISTS (\n"
+                f"    SELECT 1 FROM {right.table_name} {right_alias}\n"
+                f"    WHERE {on_clause}\n"
+                f"  )"
+            )
+        else:
+            right_alias = self._aliases.next_alias("anti")
+            right_sql = self._convert_node(right)
+            right_indented = self._indent_sql(right_sql, 4)
+            on_parts: list[str] = []
+            for k in params.join_columns:
+                left_ref = self._resolve_var(k, left_ctx.var_mapping)
+                on_parts.append(f"{right_alias}.{k} = {left_ref}")
+            on_clause = " AND ".join(on_parts)
+            not_exists = (
+                f"NOT EXISTS (\n"
+                f"    SELECT 1 FROM (\n{right_indented}\n    ) {right_alias}\n"
+                f"    WHERE {on_clause}\n"
+                f"  )"
+            )
+
+        if has_aggregates or not distinct:
+            select_keyword = "SELECT"
+        else:
+            select_keyword = "SELECT DISTINCT"
+
+        parts = [f"{select_keyword} {select_str}"]
+        parts.append(f"  FROM {left_ctx.from_clause}")
+        for jc in left_ctx.join_clauses:
+            parts.append(f"  {jc}")
+        existing_where = (
+            " AND ".join(left_ctx.where_conditions)
+            if left_ctx.where_conditions
+            else ""
+        )
+        if existing_where:
+            parts.append(f"  WHERE {existing_where} AND {not_exists}")
+        else:
+            parts.append(f"  WHERE {not_exists}")
+
+        if has_aggregates:
+            plain_cols: list[str] = []
+            for i, rv in enumerate(result_variables):
+                if isinstance(rv, ColumnVariable):
+                    plain_cols.append(_lookup_at(i, rv.name))
+            if plain_cols:
+                parts.append(f"  GROUP BY {', '.join(plain_cols)}")
+
+        if order_by:
+            order_parts: list[str] = []
+            rv_name_to_idx: dict[str, int] = {}
+            for i, rv in enumerate(result_variables):
+                if isinstance(rv, ColumnVariable):
+                    rv_name_to_idx[rv.name] = i
+                elif isinstance(rv, AggregateVariable):
+                    rv_name_to_idx[rv.column] = i
+            for crit in order_by:
+                col = crit.column
+                if not col:
+                    return SQLFailure(error="ORDER BY criterion has empty column")
+                if col in rv_name_to_idx:
+                    qualified = _lookup_at(rv_name_to_idx[col], col)
+                else:
+                    qualified = self._resolve_var(col, left_ctx.var_mapping)
+                if crit.aggregate:
+                    qualified = f"{crit.aggregate}({qualified})"
+                direction = (crit.direction or "asc").upper()
+                if direction not in ("ASC", "DESC"):
+                    return SQLFailure(error=f"Invalid ORDER BY direction: {crit.direction}")
+                order_parts.append(f"{qualified} {direction}")
+            parts.append(f"  ORDER BY {', '.join(order_parts)}")
+
+        if limit is not None:
+            if not isinstance(limit, int) or limit <= 0:
+                return SQLFailure(error=f"LIMIT must be a positive integer, got {limit!r}")
+            parts.append(f"  LIMIT {limit}")
+
+        return SQLSuccess(sql="\n".join(parts))
+
     # --- Division ---
 
     def _convert_division(self, node: OperatorNode) -> str:
@@ -617,6 +859,26 @@ class _SqlGenerator:
             and effective_root.inputs
         ):
             effective_root = effective_root.inputs[0]
+
+        # Special case: when the effective root is an anti-join, render
+        # it directly as the outer SELECT instead of wrapping it as a
+        # derived subquery. The anti-join is a filter on its left
+        # input; its output column shape equals the left input's, and
+        # the result-variable list maps positionally onto those
+        # columns. Emitting a wrapping SELECT just adds an unnecessary
+        # ``SELECT s1.X FROM (anti-join) s1`` layer.
+        if (
+            isinstance(effective_root, OperatorNode)
+            and isinstance(effective_root.params, AntiJoinParams)
+        ):
+            return self._render_antijoin_with_result_vars(
+                effective_root,
+                tree.root,
+                result_variables,
+                distinct=distinct,
+                order_by=order_by,
+                limit=limit,
+            )
 
         ctx = self._build_context(effective_root)
         # ``root_columns`` — the names the result variables map to

@@ -242,3 +242,184 @@ def _gather_order_bys(node: SqlSelect) -> list[str]:
         if isinstance(j.source, SqlSubquery):
             out.extend(_gather_order_bys(j.source.query))
     return out
+
+
+
+# ---------------------------------------------------------------------------
+# unwrap_join_subquery_with_where
+# ---------------------------------------------------------------------------
+#
+# ``JOIN (SELECT cols FROM T WHERE p) AS sub ON cond``
+# →
+# ``JOIN T sub ON cond AND p``
+#
+# Lifts the inner WHERE up into the join's ON clause so the derived
+# subquery disappears. Soundness: ``A JOIN (σ_p T) ON cond ≡ A JOIN T
+# ON cond ∧ p`` because both sides produce the multiset
+# ``{(a, t) | a ∈ A ∧ t ∈ T ∧ p(t) ∧ cond(a, t)}``.
+
+
+def test_join_subquery_with_where_unwraps():
+    """The user-provided example: a count over Employees joined with a
+    WHERE-filtered Locations subquery."""
+    sql = (
+        "SELECT COUNT(e1.emp_id) "
+        "FROM Employees e1 "
+        "JOIN ("
+        "SELECT l1.location_id FROM Locations l1 "
+        "WHERE l1.location_name = 'San Francisco'"
+        ") s1 ON e1.location_id = s1.location_id"
+    )
+    result = simplify_sql(sql)
+    # The derived subquery is gone — no ``SELECT`` inside parens.
+    assert "(SELECT" not in result.replace("\n", "").replace(" ", "")
+    # The inner table is now joined directly.
+    assert "JOIN Locations" in result
+    # The lifted predicate appears either in WHERE or in the ON clause.
+    assert "location_name" in result
+    assert "'San Francisco'" in result
+
+
+def test_join_subquery_with_where_no_outer_where_initially():
+    """When the outer query has no WHERE, the lifted predicate should
+    still appear (in WHERE or ON)."""
+    sql = (
+        "SELECT t1.a "
+        "FROM T1 t1 "
+        "JOIN (SELECT t2.b FROM T2 t2 WHERE t2.b > 5) s ON t1.a = s.b"
+    )
+    result = simplify_sql(sql)
+    ast = parse_sql(result)
+    # FROM source is the bare T1 table.
+    assert isinstance(ast.from_source, SqlTable)
+    assert ast.from_source.name == "T1"
+    # One JOIN remains, against the bare T2 table (alias ``s``).
+    assert len(ast.joins) == 1
+    assert isinstance(ast.joins[0].source, SqlTable)
+    assert ast.joins[0].source.name == "T2"
+    # Predicate was lifted somewhere.
+    full = result.lower()
+    assert "b > 5" in full
+
+
+def test_join_subquery_with_where_combines_with_outer_where():
+    """An existing outer WHERE conjoins with the lifted predicate
+    (after the lift-singletable rule moves it from ON to WHERE)."""
+    sql = (
+        "SELECT t1.a "
+        "FROM T1 t1 "
+        "JOIN (SELECT t2.b FROM T2 t2 WHERE t2.b > 5) s ON t1.a = s.b "
+        "WHERE t1.a < 100"
+    )
+    result = simplify_sql(sql)
+    full = result.lower()
+    # Both predicates present.
+    assert "b > 5" in full
+    assert "a < 100" in full
+
+
+def test_join_subquery_no_where_uses_passthrough_path():
+    """Without an inner WHERE, the older passthrough rule fires —
+    the new with-where rule must NOT double-apply."""
+    sql = (
+        "SELECT t1.a "
+        "FROM T1 t1 "
+        "JOIN (SELECT t2.b FROM T2 t2) s ON t1.a = s.b"
+    )
+    result = simplify_sql(sql)
+    ast = parse_sql(result)
+    # Single join against a bare table.
+    assert isinstance(ast.joins[0].source, SqlTable)
+    assert ast.joins[0].source.name == "T2"
+
+
+def test_join_subquery_with_groupby_not_unwrapped():
+    """Inner GROUP BY blocks the lift: aggregating before the join
+    changes which rows are present, can't be commuted with the outer
+    join."""
+    sql = (
+        "SELECT t1.a "
+        "FROM T1 t1 "
+        "JOIN ("
+        "SELECT t2.b, COUNT(*) FROM T2 t2 WHERE t2.b > 5 GROUP BY t2.b"
+        ") s ON t1.a = s.b"
+    )
+    result = simplify_sql(sql)
+    ast = parse_sql(result)
+    # Subquery preserved.
+    assert isinstance(ast.joins[0].source, SqlSubquery)
+
+
+def test_join_subquery_with_aggregate_not_unwrapped():
+    """Inner aggregate without GROUP BY (scalar aggregate) returns one
+    row — completely different shape from the bare table. Don't lift."""
+    sql = (
+        "SELECT t1.a "
+        "FROM T1 t1 "
+        "JOIN (SELECT COUNT(*) AS c FROM T2 t2 WHERE t2.b > 5) s ON t1.a = s.c"
+    )
+    result = simplify_sql(sql)
+    ast = parse_sql(result)
+    assert isinstance(ast.joins[0].source, SqlSubquery)
+
+
+# ---------------------------------------------------------------------------
+# lift_singletable_join_predicates
+# ---------------------------------------------------------------------------
+#
+# ``JOIN T t ON p1 AND p2`` where ``p2`` references only one alias
+# →
+# ``JOIN T t ON p1 WHERE p2``
+#
+# Soundness for INNER JOIN: predicate placement is interchangeable;
+# the multiset of joined rows is identical. NOT applied to OUTER JOINs
+# because ``ON`` filters before NULL-extension while ``WHERE`` filters
+# after.
+
+
+def test_lift_filter_from_inner_join_on_to_where():
+    """Single-table predicate in ON moves to WHERE."""
+    sql = (
+        "SELECT e1.emp_id "
+        "FROM Employees e1 "
+        "JOIN Locations l1 ON e1.location_id = l1.location_id "
+        "AND l1.location_name = 'San Francisco'"
+    )
+    result = simplify_sql(sql)
+    ast = parse_sql(result)
+    # The join's ON clause kept only the multi-table predicate.
+    assert "location_name" not in ast.joins[0].on_condition.lower()
+    # The single-table predicate moved to WHERE.
+    assert "location_name" in ast.where.lower()
+
+
+def test_lift_does_not_touch_multitable_predicates():
+    """A predicate referencing both sides of the join stays in ON."""
+    sql = (
+        "SELECT e1.emp_id "
+        "FROM Employees e1 "
+        "JOIN Compensation c1 ON e1.emp_id = c1.emp_id"
+    )
+    result = simplify_sql(sql)
+    ast = parse_sql(result)
+    # The join predicate stayed in ON; WHERE is empty.
+    assert "e1.emp_id" in ast.joins[0].on_condition
+    assert "c1.emp_id" in ast.joins[0].on_condition
+    assert not ast.where.strip()
+
+
+def test_lift_handles_quoted_string_with_dot():
+    """A predicate involving a string literal containing a dot must NOT
+    confuse the alias-detector. Email-like literals are the common case."""
+    sql = (
+        "SELECT e1.emp_id "
+        "FROM Employees e1 "
+        "JOIN Locations l1 ON e1.location_id = l1.location_id "
+        "AND l1.contact = 'a.b@x.com'"
+    )
+    result = simplify_sql(sql)
+    ast = parse_sql(result)
+    # The single-table predicate moved to WHERE despite the dotted
+    # literal.
+    assert "contact" in ast.where.lower()
+    assert "'a.b@x.com'" in ast.where

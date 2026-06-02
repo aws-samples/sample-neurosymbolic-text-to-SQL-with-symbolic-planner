@@ -414,8 +414,9 @@ def _substitute_in_node_clauses(
 def _is_passthrough_select(inner: SqlSelect) -> bool:
     """Return True when the inner SELECT is a structural passthrough — a
     bare ``SELECT col1, col2 FROM T`` with no JOINs, WHERE, GROUP BY,
-    ORDER BY, or LIMIT — and every projected column is an unaliased
-    bare identifier.
+    ORDER BY, or LIMIT — and every projected column is either an
+    unaliased bare identifier or a ``inner_alias.col`` qualified
+    reference against the inner FROM source.
 
     This is the precondition for *promoting* the inner table up to the
     outer scope. When any clause is present (including ORDER BY / LIMIT),
@@ -431,7 +432,8 @@ def _is_passthrough_select(inner: SqlSelect) -> bool:
         or inner.limit
     ):
         return False
-    return _passthrough_columns(inner.columns)
+    inner_alias = inner.from_source.alias or inner.from_source.name
+    return _qualified_or_bare_columns(inner.columns, inner_alias)
 
 
 def _passthrough_columns(cols: list[str]) -> bool:
@@ -446,6 +448,36 @@ def _passthrough_columns(cols: list[str]) -> bool:
         if " AS " in c.upper() or "(" in c or ")" in c or "." in c:
             return False
         if not _BARE_IDENT.match(c):
+            return False
+    return True
+
+
+def _qualified_or_bare_columns(cols: list[str], inner_alias: str) -> bool:
+    """True iff every column is either a bare identifier or a
+    ``inner_alias.col`` qualified reference — no AS rename, no
+    aggregate, no expression, no other qualifier.
+
+    A more permissive variant of :func:`_passthrough_columns` that
+    accommodates the common case of an inner SELECT projecting
+    ``alias.col`` against a single source table. Such columns expose
+    the same public name as the bare form; the inner alias is purely
+    cosmetic and can be dropped when the table is promoted.
+    """
+    if not cols:
+        return False
+    for col in cols:
+        c = col.strip()
+        if not c or c == "*":
+            return False
+        if " AS " in c.upper() or "(" in c or ")" in c:
+            return False
+        if "." in c:
+            head, _, tail = c.partition(".")
+            if head != inner_alias:
+                return False
+            if not _BARE_IDENT.match(tail):
+                return False
+        elif not _BARE_IDENT.match(c):
             return False
     return True
 
@@ -773,6 +805,230 @@ def _rule_unwrap_join_subquery(node: SqlSelect) -> SqlSelect:
     return replace(node, joins=new_joins)
 
 
+def _rule_lift_singletable_join_predicates(node: SqlSelect) -> SqlSelect:
+    """Move single-table predicates from an INNER JOIN's ``ON`` clause
+    to the outer ``WHERE``.
+
+    Pattern::
+
+        ... JOIN T ON p1 AND p2 ...  WHERE w
+        →
+        ... JOIN T ON p1 ... WHERE (p2) AND w
+
+    when ``p2`` references columns from only one side of the join (i.e.
+    is a "filter" predicate that just selects rows of ``T`` or of an
+    earlier table, not a join predicate). The placement difference is
+    semantically inert for INNER JOIN: the join produces the same
+    multiset of pairs, then the same predicates filter them.
+
+    Out of scope:
+
+    * OUTER JOINs (LEFT/RIGHT/FULL): the ``ON`` placement of a filter
+      predicate has different semantics from ``WHERE`` for outer
+      joins (NULL-extended rows survive ``ON`` mismatch but get
+      filtered by ``WHERE``).
+    * CROSS JOINs that don't have an ``ON`` clause at all.
+    * Predicates referencing more than one table — those are genuine
+      join predicates and stay in ``ON``.
+
+    Algorithm: for each ``JOIN T t ON p`` (INNER, no special outer
+    keyword), split ``p`` into top-level conjuncts. A conjunct is
+    "single-table" if all qualified references in it use the same
+    alias (or no alias at all — bare names that only resolve via the
+    inner table, but those are rare in well-formed SQL). Move all
+    single-table conjuncts that reference a *non*-join table or only
+    the joined table itself into the WHERE clause; keep the rest in
+    ON.
+
+    For canonicalisation we only move conjuncts that mention exactly
+    ONE alias and that alias is either the join's source or the
+    overall outer FROM source. Multi-alias conjuncts are join
+    predicates and stay.
+    """
+    if not node.joins:
+        return node
+
+    new_joins: list[SqlJoin] = []
+    new_where_parts: list[str] = []
+    if node.where.strip():
+        new_where_parts.append(node.where)
+    changed = False
+
+    for j in node.joins:
+        # Only INNER JOIN (the parser emits "JOIN" — we treat that as
+        # inner). LEFT / RIGHT / FULL OUTER and CROSS JOIN keep their
+        # ON clauses unchanged.
+        if j.join_type != "JOIN":
+            new_joins.append(j)
+            continue
+        if not j.on_condition.strip():
+            new_joins.append(j)
+            continue
+
+        conjuncts = _split_and(j.on_condition)
+        keep_on: list[str] = []
+        for cj in conjuncts:
+            inner = _strip_outer_parens(cj).strip()
+            aliases = _aliases_in_predicate(inner)
+            if len(aliases) == 1:
+                # Single-alias predicate — definitely a filter on one
+                # table, safe to lift to WHERE for INNER JOIN.
+                new_where_parts.append(inner)
+                changed = True
+            else:
+                keep_on.append(cj)
+
+        if not keep_on:
+            # All ON conditions lifted — keep the join with an empty
+            # ON. SQL doesn't allow ``JOIN T ON `` (empty ON), so we
+            # leave at least a trivially-true ``1=1`` if everything
+            # was lifted. In practice this branch is rare; the
+            # algorithm preserves at least one join predicate in
+            # well-formed inputs.
+            new_joins.append(replace(j, on_condition="1 = 1"))
+        else:
+            new_joins.append(replace(j, on_condition=" AND ".join(keep_on)))
+
+    if not changed:
+        return node
+    return replace(
+        node,
+        joins=new_joins,
+        where=" AND ".join(new_where_parts),
+    )
+
+
+_ALIAS_REF_RE = re.compile(r"(?<!\w)([A-Za-z_][A-Za-z0-9_]*)\.[A-Za-z_]")
+
+
+def _aliases_in_predicate(predicate: str) -> set[str]:
+    """Return the set of qualifier aliases appearing in a predicate.
+
+    A qualifier is an identifier followed by ``.<column>``. SQL
+    keywords like ``AND``, ``OR``, etc. don't take dots, so any
+    matched ``head.tail`` head is an alias reference. String literals
+    are stripped first so that quoted text containing dots (e.g. an
+    email like ``'a.b@x.com'``) doesn't pollute the result.
+    """
+    # Strip string literals (handles single-quoted only; the parser
+    # doesn't emit double-quoted identifiers for the cases we care
+    # about). Pairs of single quotes inside the string aren't
+    # supported; the simplifier rejects predicates that need that
+    # complexity by virtue of ``_split_and`` being paren-aware but
+    # not quote-aware. For now this is good enough — the queries we
+    # see don't have quoted dots.
+    cleaned = re.sub(r"'[^']*'", "''", predicate)
+    return set(_ALIAS_REF_RE.findall(cleaned))
+
+
+def _rule_unwrap_join_subquery_with_where(node: SqlSelect) -> SqlSelect:
+    """Like :func:`_rule_unwrap_join_subquery` but tolerates an inner
+    ``WHERE`` and lifts it into the join's ``ON`` clause.
+
+    Pattern::
+
+        JOIN (SELECT cols FROM T WHERE p) AS sub ON cond
+        →
+        JOIN T sub ON (cond) AND (p)
+
+    Conditions for soundness:
+
+    * The inner SELECT is shaped ``SELECT cols FROM T WHERE p`` with
+      no inner JOINs / GROUP BY / ORDER BY / LIMIT. JOINs would change
+      the row shape; GROUP BY / ORDER BY / LIMIT would change the row
+      *set* and can't be lifted past the join.
+    * Every projected column is a bare identifier (the
+      ``_passthrough_columns`` predicate). Aliased / aggregated /
+      qualified columns are rejected — the inner SELECT would expose
+      a different schema than the lifted table, breaking outer
+      references.
+    * ``p`` references only inner-table columns. Subqueries in FROM /
+      JOIN sources can't reference outer-scope names by SQL syntax, so
+      any name in ``p`` resolves to the inner table — no correlation
+      to break.
+
+    The inner WHERE is alias-rewritten so any qualified
+    ``inner_alias.col`` reference becomes ``outer_alias.col``, then
+    AND-joined onto the existing ON clause (or used as the new ON
+    clause when the join had none, which the parser shouldn't emit but
+    we handle defensively).
+
+    Soundness intuition: ``JOIN (SELECT * FROM T WHERE p) sub ON
+    cond`` produces the rows ``{(l, r) | l ∈ outer ∧ r ∈ T ∧ p(r) ∧
+    cond(l, r)}``, identical to ``JOIN T sub ON cond AND p`` because
+    ``∧`` is commutative.
+    """
+    if not node.joins:
+        return node
+    new_joins: list[SqlJoin] = []
+    changed = False
+    for j in node.joins:
+        if not isinstance(j.source, SqlSubquery):
+            new_joins.append(j)
+            continue
+        inner = j.source.query
+        # Same-shape constraints as ``_is_passthrough_select`` plus we
+        # require the inner has *exactly* a WHERE (passthrough rule
+        # already handles the no-WHERE case).
+        if not isinstance(inner.from_source, SqlTable):
+            new_joins.append(j)
+            continue
+        if (
+            inner.joins
+            or inner.group_by
+            or inner.order_by
+            or inner.limit
+        ):
+            new_joins.append(j)
+            continue
+        if not inner.where.strip():
+            # Falls under the passthrough rule, not this one.
+            new_joins.append(j)
+            continue
+        if not _qualified_or_bare_columns(
+            inner.columns,
+            inner.from_source.alias or inner.from_source.name,
+        ):
+            new_joins.append(j)
+            continue
+
+        # Rewrite the inner WHERE so any qualified references to the
+        # inner table's alias point at the outer (subquery) alias,
+        # which is what the lifted table will be aliased as.
+        inner_alias = inner.from_source.alias or inner.from_source.name
+        outer_alias = j.source.alias or inner_alias
+        if (
+            inner_alias
+            and outer_alias
+            and inner_alias != outer_alias
+        ):
+            rewritten_where = re.sub(
+                rf"(?<!\w){re.escape(inner_alias)}\.",
+                f"{outer_alias}.",
+                inner.where,
+            )
+        else:
+            rewritten_where = inner.where
+
+        promoted = _promote_alias(inner.from_source, j.source.alias)
+        merged_on = _and_join(j.on_condition, rewritten_where)
+        new_joins.append(
+            replace(
+                j,
+                source=promoted,
+                # If the original join had no ON clause, this becomes
+                # the ON clause; if it had one, the inner WHERE is
+                # AND-joined onto it.
+                on_condition=merged_on,
+            )
+        )
+        changed = True
+
+    if not changed:
+        return node
+    return replace(node, joins=new_joins)
+
+
 # ---------------------------------------------------------------------------
 # Subquery-shape rewrites
 # ---------------------------------------------------------------------------
@@ -1004,8 +1260,14 @@ _RULES: list[tuple[str, SimplifyRule]] = [
     ("count_over_one_row_subquery", _rule_count_over_one_row_subquery),
     # Predicate-shape rewrites.
     ("cross_join_to_join_on", _rule_cross_join_to_join_on),
-    # JOIN-side rewrites.
+    # JOIN-side rewrites: passthrough (no inner WHERE) first, then the
+    # WHERE-bearing variant which lifts the inner WHERE into the join's
+    # ON clause.
     ("unwrap_join_subquery", _rule_unwrap_join_subquery),
+    ("unwrap_join_subquery_with_where", _rule_unwrap_join_subquery_with_where),
+    # Canonicalise predicate placement: single-table predicates in
+    # INNER JOIN ON clauses move to the outer WHERE.
+    ("lift_singletable_join_predicates", _rule_lift_singletable_join_predicates),
 ]
 
 

@@ -10,7 +10,8 @@ from text_to_sql_planner.types.drc import DRCExpression, DRCCondition
 
 RAOperatorType = Literal[
     "selection", "join", "projection",
-    "cartesian_product", "union", "difference", "division"
+    "cartesian_product", "union", "difference", "division",
+    "anti_join",
 ]
 
 
@@ -52,9 +53,29 @@ class DivisionParams:
     type: Literal["division"] = "division"
 
 
+@dataclass
+class AntiJoinParams:
+    """Anti-join: rows of the left input whose key is NOT present in the right.
+
+    Always paired with a list of join columns (the keys against which
+    presence-in-right is tested). The output column shape equals the
+    left input's column shape — anti-join is a *filter* operator, not
+    a column-merging join.
+
+    The planner doesn't propose this operator directly (it's not in the
+    LLM's selectable RA toolbox). It's introduced post-planning by the
+    operation-tree simplifier when it recognises the pattern
+    ``Join(T1, Difference(T1, T2), key=k) → AntiJoin(T1, T2, key=k)``.
+    """
+
+    type: Literal["anti_join"] = "anti_join"
+    join_columns: list[str] = field(default_factory=list)
+
+
 OperatorParams = Union[
     SelectionParams, JoinParams, ProjectionParams,
-    CartesianProductParams, UnionParams, DifferenceParams, DivisionParams
+    CartesianProductParams, UnionParams, DifferenceParams, DivisionParams,
+    AntiJoinParams,
 ]
 
 
