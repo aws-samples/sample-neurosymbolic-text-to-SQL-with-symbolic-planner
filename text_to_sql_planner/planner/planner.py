@@ -39,6 +39,7 @@ from text_to_sql_planner.types.operators import (
     OperatorSuccess,
     OperatorFailure,
     ProjectionParams,
+    RenameParams,
     SelectionParams,
     UnionParams,
 )
@@ -113,6 +114,14 @@ def _build_operator_params(operator: str, params: dict) -> object:
         return DifferenceParams()
     elif operator == "division":
         return DivisionParams()
+    elif operator == "rename":
+        # ``mapping`` arrives as a dict ``{old_name: new_name, ...}``.
+        # Validation is delegated to ``apply_rename``; this just
+        # builds the params dataclass.
+        raw_mapping = params.get("mapping", {})
+        if not isinstance(raw_mapping, dict):
+            return None
+        return RenameParams(mapping=dict(raw_mapping))
     return None
 
 

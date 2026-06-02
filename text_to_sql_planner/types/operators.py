@@ -11,6 +11,7 @@ from text_to_sql_planner.types.drc import DRCExpression, DRCCondition
 RAOperatorType = Literal[
     "selection", "join", "projection",
     "cartesian_product", "union", "difference", "division",
+    "rename",
     "anti_join",
 ]
 
@@ -54,6 +55,30 @@ class DivisionParams:
 
 
 @dataclass
+class RenameParams:
+    """Rename one or more columns of a relation.
+
+    ``mapping`` is a dictionary of ``old_name -> new_name`` entries.
+    Each ``old_name`` must exist in the input relation's columns;
+    each ``new_name`` must NOT collide with any other input column
+    that isn't being renamed away in the same operation. The
+    operator preserves the input's row set unchanged — it's a pure
+    schema rewrite.
+
+    Why an explicit operator: relational algebra historically uses
+    rename (``ρ``) to disambiguate self-joins (e.g.
+    ``Performance_Reviews ⋈ ρ_{review_id ← review_id_2}(Performance_Reviews)``).
+    Without it, natural join collapses on every shared column and
+    the planner has to fall back on cartesian product + selection.
+    The planner can use this operator to do the standard "make a
+    second copy of T with renamed columns" pattern.
+    """
+
+    type: Literal["rename"] = "rename"
+    mapping: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
 class AntiJoinParams:
     """Anti-join: rows of the left input whose key is NOT present in the right.
 
@@ -75,6 +100,7 @@ class AntiJoinParams:
 OperatorParams = Union[
     SelectionParams, JoinParams, ProjectionParams,
     CartesianProductParams, UnionParams, DifferenceParams, DivisionParams,
+    RenameParams,
     AntiJoinParams,
 ]
 

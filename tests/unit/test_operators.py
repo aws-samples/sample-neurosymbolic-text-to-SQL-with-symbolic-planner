@@ -628,3 +628,213 @@ class TestDispatcher:
 
         assert isinstance(result, OperatorFailure)
         assert "2" in result.error
+
+
+
+# ---------------------------------------------------------------------------
+# Rename operator
+# ---------------------------------------------------------------------------
+
+from text_to_sql_planner.operators.rename import apply_rename
+from text_to_sql_planner.types.operators import RenameParams
+
+
+class TestRename:
+    """``ρ_{mapping}(R)`` — renames one or more columns of a relation.
+
+    The output's row set equals the input's; only result-variable
+    names and free references inside the condition tree change.
+    """
+
+    def _table_relation(
+        self, table: str, columns: list[str],
+    ) -> DRCExpression:
+        """Build ``{cols | (cols ∈ table)}``."""
+        return DRCExpression(
+            result_variables=[ColumnVariable(name=c) for c in columns],
+            condition=MembershipNode(variables=list(columns), relation=table),
+        )
+
+    def test_simple_rename(self):
+        rel = self._table_relation("R", ["a", "b"])
+        result = apply_rename(
+            RenameParams(mapping={"a": "x"}),
+            [rel],
+        )
+        assert isinstance(result, OperatorSuccess)
+        out = result.output
+        # Result variables: a → x, b unchanged.
+        names = [rv.name for rv in out.result_variables]
+        assert names == ["x", "b"]
+        # Membership slot: a → x, b unchanged.
+        assert isinstance(out.condition, MembershipNode)
+        assert out.condition.variables == ["x", "b"]
+        assert out.condition.relation == "R"
+
+    def test_rename_multiple_columns(self):
+        rel = self._table_relation("R", ["a", "b", "c"])
+        result = apply_rename(
+            RenameParams(mapping={"a": "x", "c": "z"}),
+            [rel],
+        )
+        assert isinstance(result, OperatorSuccess)
+        names = [rv.name for rv in result.output.result_variables]
+        assert names == ["x", "b", "z"]
+
+    def test_simultaneous_swap(self):
+        """``a ↔ b`` performed as a single simultaneous swap (the
+        operator must NOT do ``a → b`` first then ``b → a`` and end
+        up with both columns named the same)."""
+        rel = self._table_relation("R", ["a", "b"])
+        result = apply_rename(
+            RenameParams(mapping={"a": "b", "b": "a"}),
+            [rel],
+        )
+        assert isinstance(result, OperatorSuccess)
+        out = result.output
+        names = [rv.name for rv in out.result_variables]
+        # Position 0 (was "a") now "b"; position 1 (was "b") now "a".
+        assert names == ["b", "a"]
+        # Membership slots reflect the swap.
+        assert out.condition.variables == ["b", "a"]
+
+    def test_rename_capture_avoiding(self):
+        """Inner quantifier-bound names that happen to coincide with a
+        renamed column are not touched. Only free references move."""
+        # {a | ∃ a. (a ∈ S) ∧ (a ∈ R)}  -- the outer "a" is the result
+        # var, the inner "a" is a quantifier-bound shadow.
+        # Construct the inner shadow more carefully so we can tell the
+        # rewrite from the leaf:
+        outer_membership = MembershipNode(variables=["a"], relation="R")
+        inner_existential = QuantifierNode(
+            kind="exists",
+            variables=["a"],
+            body=MembershipNode(variables=["a"], relation="S"),
+        )
+        condition = LogicalConnectiveNode(
+            operator="and",
+            left=outer_membership,
+            right=inner_existential,
+        )
+        rel = DRCExpression(
+            result_variables=[ColumnVariable(name="a")],
+            condition=condition,
+        )
+        result = apply_rename(
+            RenameParams(mapping={"a": "x"}),
+            [rel],
+        )
+        assert isinstance(result, OperatorSuccess)
+        out = result.output
+
+        # Result variable renamed.
+        assert [rv.name for rv in out.result_variables] == ["x"]
+
+        # Outer membership: free a → x.
+        outer = out.condition.left
+        assert isinstance(outer, MembershipNode)
+        assert outer.variables == ["x"]
+
+        # Inner existential: bound a unchanged (it's shadowed).
+        inner = out.condition.right
+        assert isinstance(inner, QuantifierNode)
+        assert inner.variables == ["a"]
+        body = inner.body
+        assert isinstance(body, MembershipNode)
+        assert body.variables == ["a"]
+        assert body.relation == "S"
+
+    def test_rejects_empty_mapping(self):
+        rel = self._table_relation("R", ["a"])
+        result = apply_rename(RenameParams(mapping={}), [rel])
+        assert isinstance(result, OperatorFailure)
+        assert "non-empty" in result.error.lower()
+
+    def test_rejects_unknown_column(self):
+        rel = self._table_relation("R", ["a", "b"])
+        result = apply_rename(
+            RenameParams(mapping={"missing": "x"}),
+            [rel],
+        )
+        assert isinstance(result, OperatorFailure)
+        assert "missing" in result.error.lower()
+
+    def test_rejects_duplicate_targets(self):
+        rel = self._table_relation("R", ["a", "b"])
+        result = apply_rename(
+            RenameParams(mapping={"a": "x", "b": "x"}),
+            [rel],
+        )
+        assert isinstance(result, OperatorFailure)
+        assert "distinct" in result.error.lower()
+
+    def test_rejects_target_collision_with_surviving_column(self):
+        """Renaming ``a`` to ``b`` when ``b`` is also a column (not
+        being renamed away) creates a name collision."""
+        rel = self._table_relation("R", ["a", "b"])
+        result = apply_rename(
+            RenameParams(mapping={"a": "b"}),
+            [rel],
+        )
+        assert isinstance(result, OperatorFailure)
+        assert "collid" in result.error.lower()
+
+    def test_rejects_aggregate_input(self):
+        """Aggregate result variables can't be renamed by this operator."""
+        from text_to_sql_planner.types.drc import AggregateVariable
+
+        rel = DRCExpression(
+            result_variables=[
+                ColumnVariable(name="a"),
+                AggregateVariable(function="COUNT", column="b"),
+            ],
+            condition=MembershipNode(variables=["a", "b"], relation="R"),
+        )
+        result = apply_rename(
+            RenameParams(mapping={"a": "x"}),
+            [rel],
+        )
+        assert isinstance(result, OperatorFailure)
+        assert "aggregate" in result.error.lower()
+
+    def test_rejects_wrong_input_count(self):
+        rel = self._table_relation("R", ["a"])
+        result = apply_rename(
+            RenameParams(mapping={"a": "x"}),
+            [rel, rel],
+        )
+        assert isinstance(result, OperatorFailure)
+
+
+class TestRenameDispatcher:
+    """The dispatcher routes ``rename`` through ``apply_operator``."""
+
+    def test_dispatcher_routes_rename(self):
+        rel = DRCExpression(
+            result_variables=[ColumnVariable(name="a")],
+            condition=MembershipNode(variables=["a"], relation="R"),
+        )
+        result = apply_operator(
+            OperatorApplication(
+                operator="rename",
+                inputs=[rel],
+                params=RenameParams(mapping={"a": "x"}),
+            ),
+        )
+        assert isinstance(result, OperatorSuccess)
+        names = [rv.name for rv in result.output.result_variables]
+        assert names == ["x"]
+
+    def test_dispatcher_validates_input_count(self):
+        rel = DRCExpression(
+            result_variables=[ColumnVariable(name="a")],
+            condition=MembershipNode(variables=["a"], relation="R"),
+        )
+        result = apply_operator(
+            OperatorApplication(
+                operator="rename",
+                inputs=[rel, rel],
+                params=RenameParams(mapping={"a": "x"}),
+            ),
+        )
+        assert isinstance(result, OperatorFailure)

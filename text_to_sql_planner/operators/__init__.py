@@ -18,6 +18,7 @@ from text_to_sql_planner.types.operators import (
     UnionParams,
     DifferenceParams,
     DivisionParams,
+    RenameParams,
 )
 from text_to_sql_planner.operators.selection import apply_selection
 from text_to_sql_planner.operators.join import apply_join
@@ -26,6 +27,7 @@ from text_to_sql_planner.operators.cartesian_product import apply_cartesian_prod
 from text_to_sql_planner.operators.union import apply_union
 from text_to_sql_planner.operators.difference import apply_difference
 from text_to_sql_planner.operators.division import apply_division
+from text_to_sql_planner.operators.rename import apply_rename
 
 
 __all__ = [
@@ -37,11 +39,12 @@ __all__ = [
     "apply_union",
     "apply_difference",
     "apply_division",
+    "apply_rename",
 ]
 
 
 # Operators that require exactly 1 input relation
-_UNARY_OPERATORS = {"selection", "projection"}
+_UNARY_OPERATORS = {"selection", "projection", "rename"}
 
 # Operators that require exactly 2 input relations
 _BINARY_OPERATORS = {"join", "cartesian_product", "union", "difference", "division"}
@@ -100,6 +103,8 @@ def apply_operator(application: OperatorApplication) -> OperatorResult:
         return apply_difference(params, inputs)
     elif operator == "division":
         return apply_division(params, inputs)
+    elif operator == "rename":
+        return apply_rename(params, inputs)
 
     # Should never reach here due to validation above
     return OperatorFailure(error=f"Unhandled operator: '{operator}'")

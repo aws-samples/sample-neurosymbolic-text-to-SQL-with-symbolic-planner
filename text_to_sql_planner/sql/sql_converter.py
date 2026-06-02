@@ -24,6 +24,7 @@ from text_to_sql_planner.types.operators import (
     UnionParams,
     DifferenceParams,
     DivisionParams,
+    RenameParams,
     AntiJoinParams,
 )
 from text_to_sql_planner.types.drc import (
@@ -226,7 +227,7 @@ class _SqlGenerator:
         elif isinstance(params, ProjectionParams):
             return self._convert_projection(node, params)
         else:
-            # Selection, Join, CartesianProduct -> flatten
+            # Selection, Join, CartesianProduct, Rename -> flatten
             ctx = self._build_context(node)
             return self._render_context(ctx, node)
 
@@ -248,6 +249,8 @@ class _SqlGenerator:
             return self._ctx_join(node, params, inputs)
         elif isinstance(params, CartesianProductParams):
             return self._ctx_cartesian(node, params, inputs)
+        elif isinstance(params, RenameParams):
+            return self._ctx_rename(node, params, inputs)
         elif isinstance(params, (ProjectionParams, UnionParams, DifferenceParams, DivisionParams, AntiJoinParams)):
             # Non-flattenable operators get wrapped as a derived subquery
             return self._ctx_from_subquery(node)
@@ -293,6 +296,55 @@ class _SqlGenerator:
             # survive into the derived table's schema.
             bare = self._extract_underlying_column(col)
             ctx.var_mapping[bare] = f"{alias}.{bare}"
+        return ctx
+
+    def _ctx_rename(
+        self, node: OperatorNode, params: RenameParams, inputs: list,
+    ) -> _QueryContext:
+        """Build context for a rename ``ρ_{mapping}(R)``.
+
+        Rename is purely a schema rewrite: the output rows are the input
+        rows with renamed result variables. We flatten through the rename
+        by rebuilding the inner context's ``var_mapping`` so lookups for
+        the new column names resolve to the same underlying
+        ``alias.column`` references the input was using. The FROM clause,
+        WHERE conditions, and join clauses are inherited unchanged.
+
+        Soundness: the input's ``alias.column`` references continue to
+        point at the same physical columns. Only the *DRC-level* names
+        by which downstream contexts refer to those columns change.
+        SQL itself doesn't see the rename — it sees the original
+        ``alias.column`` references in SELECT / WHERE / ON clauses.
+
+        Simultaneous substitution: ``mapping`` is applied as a single
+        bulk swap so cycles (``a → b, b → a``) work without intermediate
+        clobbering.
+        """
+        if not inputs:
+            raise _ConversionError("Rename requires exactly 1 input")
+
+        ctx = self._build_context(inputs[0])
+        mapping = dict(params.mapping)
+        if not mapping:
+            return ctx
+
+        keys = set(mapping.keys())
+        new_var_mapping: dict[str, str] = {}
+        for name, qualified in ctx.var_mapping.items():
+            if name in keys:
+                # Old name being renamed away — drop it; the new name
+                # is added in the next loop.
+                continue
+            new_var_mapping[name] = qualified
+        for old, new in mapping.items():
+            if old not in ctx.var_mapping:
+                raise _ConversionError(
+                    f"Rename source column '{old}' missing from inner "
+                    f"context's var_mapping"
+                )
+            new_var_mapping[new] = ctx.var_mapping[old]
+
+        ctx.var_mapping = new_var_mapping
         return ctx
 
     def _ctx_selection(self, node: OperatorNode, params: SelectionParams, inputs: list) -> _QueryContext:

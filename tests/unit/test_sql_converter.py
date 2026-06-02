@@ -990,3 +990,97 @@ def test_three_way_join_difference_pattern_end_to_end():
     assert "DISTINCT" in sql
     # No EXCEPT.
     assert "EXCEPT" not in sql
+
+
+
+# ---------------------------------------------------------------------------
+# Rename operator
+# ---------------------------------------------------------------------------
+
+from text_to_sql_planner.types.operators import RenameParams
+
+
+def _rename_node(input_node, mapping: dict[str, str]) -> OperatorNode:
+    """Construct a rename operator node with derived output_columns."""
+    base_cols = (
+        list(input_node.columns)
+        if isinstance(input_node, TableLeafNode)
+        else list(input_node.output_columns)
+    )
+    new_cols = [mapping.get(c, c) for c in base_cols]
+    return OperatorNode(
+        operator="rename",
+        params=RenameParams(mapping=dict(mapping)),
+        inputs=[input_node],
+        output_columns=new_cols,
+    )
+
+
+def test_rename_flattens_into_inner_select():
+    """``ρ_{a → x}(R)`` flattens — the SQL just references ``alias.a``
+    where the outer query asked for ``x``. No subquery wrapper."""
+    r = _table_leaf("R", ["a", "b"])
+    renamed = _rename_node(r, {"a": "x"})
+    tree = OperationTree(root=renamed)
+
+    result = convert_to_sql(
+        tree,
+        result_variables=[
+            ColumnVariable(name="x"),
+            ColumnVariable(name="b"),
+        ],
+    )
+    assert isinstance(result, SQLSuccess), result
+    sql = result.sql
+    # The SELECT projects x AS x (the inner alias's a column under
+    # the new name), and b unchanged.
+    assert "FROM R" in sql
+    # Inner alias.column reference is preserved (no derived subquery).
+    assert "FROM (\n" not in sql
+
+
+def test_rename_used_for_self_join_disambiguation():
+    """Demonstrates the canonical use case: self-join two copies of
+    the same relation, each bound to a different alias via rename so
+    the natural join doesn't collapse on shared columns.
+
+    Tree: Join( Performance_Reviews_a,
+                ρ_{review_id ← review_id_2}(Performance_Reviews_b),
+                key=emp_id )
+
+    The SQL output should join the two PR instances on emp_id, with
+    one copy's ``review_id`` accessible as ``review_id_2`` so a later
+    selection can require ``review_id != review_id_2`` (or whatever).
+    """
+    pr_a = _table_leaf(
+        "Performance_Reviews", ["review_id", "emp_id"],
+    )
+    pr_b = _table_leaf(
+        "Performance_Reviews", ["review_id", "emp_id"],
+    )
+    pr_b_renamed = _rename_node(pr_b, {"review_id": "review_id_2"})
+
+    join = OperatorNode(
+        operator="join",
+        params=JoinParams(join_columns=["emp_id"]),
+        inputs=[pr_a, pr_b_renamed],
+        output_columns=["review_id", "emp_id", "review_id_2"],
+    )
+    tree = OperationTree(root=join)
+
+    result = convert_to_sql(
+        tree,
+        result_variables=[
+            ColumnVariable(name="review_id"),
+            ColumnVariable(name="emp_id"),
+            ColumnVariable(name="review_id_2"),
+        ],
+    )
+    assert isinstance(result, SQLSuccess), result
+    sql = result.sql
+
+    # Both Performance_Reviews instances appear in the FROM/JOIN
+    # (they get separate aliases automatically).
+    assert sql.count("Performance_Reviews") == 2
+    # No derived subquery wrapping the rename — it flattens.
+    assert "FROM (\n" not in sql
