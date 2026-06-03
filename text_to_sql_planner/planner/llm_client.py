@@ -77,6 +77,7 @@ _SYSTEM_PROMPT_OPERATOR = """You are a relational algebra planner. You select op
 Available operators:
 - selection: Filter rows using a condition. Requires 1 input.
 - projection: Select specific columns. Requires 1 input.
+- rename: Rename one or more columns of a relation. Requires 1 input. Use this BEFORE a self-join to disambiguate columns that would otherwise collide.
 - join: Natural join on shared columns. Requires 2 inputs.
 - cartesian_product: Cross product of two relations. Requires 2 inputs.
 - union: Set union of two compatible relations. Requires 2 inputs.
@@ -91,6 +92,34 @@ DRC Notation Guide:
 - (= x y), (!= x y), (< x y), (> x y), (<= x y), (>= x y) - comparison
 - (exists (vars...) body) - existential quantifier (use (in ...) in body to bind to a relation)
 - (forall (vars...) body) - universal quantifier (use (in ...) in body to bind to a relation)
+
+CRITICAL RULES — pick the right binary operator:
+
+1. **Prefer ``join`` over ``cartesian_product`` whenever the operands share a column whose values you want to be equal.**
+   ``join`` on ``[col]`` is equivalent to ``cartesian_product`` followed by ``selection WHERE T1.col = T2.col``, but it does the equality
+   in one step and keeps the tuple-binding tight. ``cartesian_product`` on operands that share a column name produces *renamed*
+   ``col_1`` / ``col_2`` outputs that are NOT bound together. If you then drop one of them via ``projection``, the binding is GONE
+   and the resulting relation no longer correctly represents the intended condition.
+
+2. **For self-joins (joining a relation with itself), use ``rename`` first to disambiguate.**
+   Standard pattern for "≥N reviews per employee":
+       a. Start with Performance_Reviews (or a projection thereof to ``review_id, emp_id``).
+       b. ``rename`` it to give one copy distinct review-id columns: ``rename {review_id: review_id_2}``.
+       c. ``join`` the original with the renamed copy on ``[emp_id]``. This produces pairs of reviews for the same employee
+          with two distinct review-id columns side by side, ready for a ``selection`` that requires ``review_id != review_id_2``.
+       d. Repeat for the third witness if needed (rename the next copy to ``review_id_3``, join, select distinctness).
+   Avoid ``cartesian_product`` of Performance_Reviews with itself — the shared ``emp_id`` column gets renamed to ``emp_id_1`` /
+   ``emp_id_2`` which BREAKS the binding, and recovering it via projection is unsound.
+
+3. **For "exactly N" patterns, use ``difference``: (≥N reviews) − (≥(N+1) reviews).**
+   Build the ≥N and ≥(N+1) relations by following rule (2). Once both have the same column shape (typically just ``emp_id``),
+   ``difference`` of them gives "exactly N". Then ``join`` with Employees on ``emp_id`` to attach names.
+
+4. **NEVER drop a binding column via ``projection`` when its values must remain tied to another column's values for correctness.**
+   Specifically: after ``cartesian_product`` of two relations that share a column, the projection MUST either keep both copies
+   (with distinct names) or be preceded by a ``selection`` that asserts the equality. If you skip the selection and just project,
+   the resulting relation is logically a "there exists *some* tuple" check, not "*this* tuple" — and equivalence with the target
+   will fail for non-trivial reasons.
 
 Select the next operator to apply to move closer to the target expression.
 Provide your reasoning, the operator type, which input relations to use (by index), and the operator parameters."""
@@ -112,6 +141,7 @@ _OPERATOR_TOOL = {
                     "selection",
                     "join",
                     "projection",
+                    "rename",
                     "cartesian_product",
                     "union",
                     "difference",
@@ -126,7 +156,7 @@ _OPERATOR_TOOL = {
             },
             "params": {
                 "type": "object",
-                "description": "Operator-specific parameters. For selection: {condition: <lisp-string>}. For projection: {columns: [col1, col2]}. For join: {join_columns: [col]}. For cartesian_product/union/difference/division: {}.",
+                "description": "Operator-specific parameters. For selection: {condition: <lisp-string>}. For projection: {columns: [col1, col2]}. For join: {join_columns: [col]}. For rename: {mapping: {old_name: new_name, ...}}. For cartesian_product/union/difference/division: {}.",
             },
         },
         "required": ["reasoning", "operator", "input_indices", "params"],
