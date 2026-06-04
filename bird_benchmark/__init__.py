@@ -15,17 +15,15 @@ The ``run_single`` / ``run_suite`` entry points are wired in by tasks 9.1 /
 
 from bird_benchmark.expected_fail import ExpectedFailLoadError
 from bird_benchmark.loader import BirdLoader, BirdLoadError
+from bird_benchmark.runner import SingleSelectorError, run_single, run_suite
 from bird_benchmark.types import (
     ConverterError,
     RunOptions,
     RunResult,
+    SingleSelector,
     TestCase,
     Verdict,
 )
-
-# TODO(task 9.1 / 12.1): re-export ``run_single`` and ``run_suite`` from
-#                        ``bird_benchmark.runner`` once the runner is
-#                        implemented.
 
 __all__ = [
     "BirdLoader",
@@ -34,6 +32,10 @@ __all__ = [
     "ExpectedFailLoadError",
     "RunOptions",
     "RunResult",
+    "SingleSelector",
+    "SingleSelectorError",
     "TestCase",
     "Verdict",
+    "run_single",
+    "run_suite",
 ]

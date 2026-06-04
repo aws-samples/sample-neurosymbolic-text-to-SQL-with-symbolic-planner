@@ -80,12 +80,20 @@ class Token:
       - For ``EOF``: the empty string.
       - For ``LEX_ERROR``: a human-readable message describing the
         malformation.
+
+    The ``quoted`` field is ``True`` only for ``IDENT`` tokens that came
+    from a SQLite-style double-quoted source token (e.g. ``"name"``). The
+    translator uses this to apply Req 13.2 / 13.3: a double-quoted token
+    resolves as an identifier only when it matches a name in the active
+    schema, and otherwise falls back to a string literal. All other
+    token kinds, and unquoted identifiers, set ``quoted = False``.
     """
 
     kind: TokenKind
     text: str
     line: int
     column: int
+    quoted: bool = False
 
 
 # Reserved words. Recognised case-insensitively against the upper-cased
@@ -240,7 +248,7 @@ def tokenize(sql: str) -> list[Token]:
                 tokens.append(Token(TokenKind.EOF, "", line, col))
                 return tokens
             tokens.append(
-                Token(TokenKind.IDENT, "".join(buf), start_line, start_col)
+                Token(TokenKind.IDENT, "".join(buf), start_line, start_col, quoted=True)
             )
             continue
 

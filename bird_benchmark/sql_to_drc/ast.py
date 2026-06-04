@@ -40,6 +40,14 @@ class ColumnRef:
     qualifier: str | None
     name: str
     pos: Position
+    # ``quoted`` is True when the column name (the unqualified leaf token)
+    # came from a SQLite-style double-quoted token like ``"name"``. The
+    # translator applies SQLite's identifier-fallback behaviour (Req 13.2 /
+    # 13.3): if the token resolves against the active schema it is treated
+    # as a column reference; otherwise it is rewritten as a string Literal.
+    # Qualified references such as ``t."col"`` are *not* marked because
+    # their qualifier disambiguates them as identifiers.
+    quoted: bool = False
 
 
 @dataclass

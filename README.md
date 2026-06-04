@@ -13,10 +13,19 @@ The pipeline:
 3. After every step, an SMT solver (cvc5) is asked to *prove* that the
    relation built so far is logically equivalent to the target DRC. The
    planner iterates until cvc5 returns `unsat` for "the two could differ".
-4. The proven operation tree is lowered to SQL.
+4. The proven operation tree is simplified at the tree level, lowered to
+   SQL, and simplified again at the SQL level.
 
 The result is SQL that is provably equivalent to a formal specification of
 the question, not just empirically similar.
+
+This repository ships **two top-level packages**:
+
+- [`text_to_sql_planner/`](text_to_sql_planner) — the planner itself.
+- [`bird_benchmark/`](bird_benchmark) — a standalone test harness that
+  evaluates the planner against the public BIRD benchmark
+  (https://bird-bench.github.io). See the [BIRD
+  Benchmark](#bird-benchmark) section.
 
 ## Goals
 
@@ -62,7 +71,7 @@ uv run python -m text_to_sql_planner \
 
 - Python 3.11+ (uses `tomllib`, `asyncio.TaskGroup`, etc.)
 - `cvc5` on `PATH` (any 1.x release; tested with 1.3.4)
-- AWS credentials with `bedrock:InvokeModel` for `global.anthropic.claude-opus-4-6-v1`
+- AWS credentials with `bedrock:InvokeModel` for the configured Claude model
 
 The Python dependencies are pinned in `pyproject.toml`:
 
@@ -135,7 +144,7 @@ uv run python examples/example3.py
 ### Tests
 
 ```bash
-uv run pytest tests/ -q          # 275 tests, no external services needed
+uv run pytest tests/ -q          # 491 tests, no external services needed
 uv run pytest tests/unit -v      # unit suite only
 ```
 
@@ -155,9 +164,10 @@ flowchart TD
 
     P[Planner loop]
     LLM[LLM operator chooser<br/>temperature escalation]
-    OPS[RA operators<br/>σ, ⋈, π, ×, ∪, −, ÷]
+    OPS[RA operators<br/>σ, ⋈, π, ×, ∪, −, ÷, ρ, ▷]
     EQ[Equivalence checker<br/>cvc5 SMT-LIB]
 
+    TREE[Tree simplifier<br/>tree-level rewrites]
     SQL[SQL converter<br/>tree → SELECT statement]
     SIMP[SQL simplifier<br/>rewrite rules to fixpoint]
 
@@ -173,7 +183,8 @@ flowchart TD
     OPS -->|new relation| P
     P -->|relation == target?| EQ
     EQ -- not yet --> P
-    EQ -- proved equivalent --> SQL
+    EQ -- proved equivalent --> TREE
+    TREE --> SQL
     SQL --> SIMP --> OUT
 ```
 
@@ -185,20 +196,24 @@ flowchart TD
 | Print              | `printer/lisp_printer.py`, `printer/pretty_printer.py`       | DRC AST → Lisp form (machine-friendly) and Unicode form (`{x \| ∃y …}`).  |
 | Schema → relations | `converter/table_converter.py`                               | Each table becomes a predicate `T(a, b, c)`.                              |
 | Question → DRC     | `converter/question_converter.py`, `planner/llm_client.py`   | Bedrock Claude emits Lisp DRC; we re-prompt on parse error.               |
-| RA operators       | `operators/{selection,join,projection,cartesian_product,union,difference,division}.py` | Each operator is a pure function `(params, inputs) → DRC`. |
+| RA operators       | `operators/{selection,join,projection,cartesian_product,union,difference,division,rename}.py` (plus internal anti-join) | Each operator is a pure function `(params, inputs) → DRC`. |
 | Planner loop       | `planner/planner.py`                                         | LLM picks next op + inputs; we apply, check equivalence, escalate temp on retries. |
-| Equivalence        | `equivalence/{smt_converter,equivalence_checker}.py`         | DRC → SMT-LIB; parallel cvc5 (one for `unsat`, one for `sat`); first decisive answer wins. |
-| SQL emit           | `sql/sql_converter.py`                                       | Operation tree → flat SELECT, with `DISTINCT` / `ORDER BY` / `LIMIT` driven by the extended-DRC wrappers. |
-| SQL simplify       | `sql/simplifier.py`                                          | Rule-based rewrites (unwrap subqueries, inline rebindings, `CROSS JOIN`+`WHERE`→`JOIN ON`, …). |
+| DRC simplifier     | `drc_simplifier.py`                                          | Per-step DRC rewrites: merge nested quantifiers, eliminate trivial equalities, drop unused binders, etc. |
+| Equivalence        | `equivalence/{smt_converter,equivalence_checker}.py`         | DRC → SMT-LIB; parallel cvc5 strategies; first decisive answer wins.       |
+| Tree simplifier    | `operation_tree_simplifier.py`                               | Pre-SQL tree rewrites: drop redundant projections, recognise `Join(L, L−R)` as anti-join, recognise three-way differences. |
+| SQL emit           | `sql/sql_converter.py`                                       | Operation tree → flat SELECT, with `DISTINCT` / `ORDER BY` / `LIMIT` driven by the extended-DRC wrappers; anti-join → `NOT EXISTS`. |
+| SQL simplify       | `sql/simplifier.py`                                          | Rule-based rewrites (unwrap subqueries, inline rebindings, `CROSS JOIN`+`WHERE`→`JOIN ON`, lift single-table predicates from ON to WHERE, …). |
 
 ### Relational algebra operators
 
-The planner builds the answer by composing seven classical relational
-algebra operators. Each one is a pure function `(params, inputs) → DRC`
-defined in its own module under `operators/`, with parameter types in
-`types/operators.py` (`RAOperatorType` literal: `"selection"`, `"join"`,
-`"projection"`, `"cartesian_product"`, `"union"`, `"difference"`,
-`"division"`).
+The planner builds the answer by composing eight relational-algebra
+operators that the LLM can select directly, plus an internal anti-join
+introduced by the operation-tree simplifier. Each operator is a pure
+function `(params, inputs) → DRC` defined in its own module under
+`operators/`, with parameter types in `types/operators.py`
+(`RAOperatorType` literal: `"selection"`, `"join"`, `"projection"`,
+`"cartesian_product"`, `"union"`, `"difference"`, `"division"`,
+`"rename"`, `"anti_join"`).
 
 | Symbol | Operator          | Module                            | Inputs | Parameters                       | Output relation                                                                     |
 |--------|-------------------|-----------------------------------|--------|----------------------------------|-------------------------------------------------------------------------------------|
@@ -209,6 +224,8 @@ defined in its own module under `operators/`, with parameter types in
 | ∪      | Union             | `operators/union.py`              | 2      | (none)                           | Combines tuples from same-arity inputs.                                             |
 | −      | Set difference    | `operators/difference.py`         | 2      | (none)                           | Tuples in the left input that are not in the right input. Right-side variables are positionally alpha-renamed to the left's column names so the negated subformula speaks about R's tuples. |
 | ÷      | Division          | `operators/division.py`           | 2      | (none)                           | Tuples in the left input that are paired with *every* tuple in the right.           |
+| ρ      | Rename            | `operators/rename.py`             | 1      | `mapping: dict[str, str]`        | Same rows; renames one or more columns. Used before self-joins so the natural join doesn't collapse on shared names. Capture-avoiding free-variable rename via `operators/_rename.py`. |
+| ▷      | Anti-join         | (synthesised in `operation_tree_simplifier.py`) | 2 | `join_columns: list[str]`     | Tuples in the left input whose key has no match in the right. Not directly LLM-selectable; introduced by the tree simplifier when it recognises `Join(L, Difference(L, R))` or `Difference(L, Join(L, R))` shapes. Emitted as `NOT EXISTS` in SQL. |
 
 Operators are validated up front: arity checks, column-existence checks,
 and (for join/union/difference/division) compatibility between input
@@ -218,7 +235,18 @@ iteration.
 
 The dispatcher is `operators.apply_operator(application)`, which routes
 an `OperatorApplication` to the right module based on
-`OperatorApplication.operator`.
+`OperatorApplication.operator`. The operation-tree simplifier in
+`operation_tree_simplifier.py` runs after the planner loop completes
+and rewrites the proven tree into a more idiomatic shape (collapsing
+redundant projections, recognising anti-join patterns, etc.) before SQL
+emission.
+
+There's also a single-relation **DRC simplifier** in `drc_simplifier.py`
+that runs after each operator application: it merges nested quantifiers,
+eliminates trivial equalities, drops unused binders, and applies
+boolean / reflexive-comparison rewrites. This keeps the relations the
+equivalence checker sees as small as possible, which improves cvc5's
+behaviour.
 
 ### Extended DRC
 
@@ -263,7 +291,9 @@ specific database state. `sat` ⇒ cvc5 found a counter-example. `timeout`
 or `unknown` is treated as not-equivalent and the planner keeps searching.
 
 The planner short-circuits an obvious mismatch (different result-variable
-arity) without invoking cvc5.
+arity) without invoking cvc5. The equivalence checker runs multiple
+cvc5 strategies in parallel (default profile, `--mbqi`,
+`--full-saturate-quant`), and the first decisive answer wins.
 
 ### Repository layout
 
@@ -272,6 +302,8 @@ text_to_sql_planner/
 ├── __init__.py
 ├── main.py                       # run(): full pipeline
 ├── cli.py                        # argparse + Markdown report
+├── drc_simplifier.py             # per-step DRC rewrite passes
+├── operation_tree_simplifier.py  # pre-SQL tree rewrites (anti-join recognition, …)
 ├── types/
 │   ├── drc.py                    # core DRC AST + LIMIT/ORDER_BY wrappers
 │   ├── operators.py              # RA operator parameter types
@@ -287,28 +319,177 @@ text_to_sql_planner/
 │   ├── table_converter.py
 │   └── question_converter.py     # LLM-driven, with retry-on-parse-error
 ├── operators/
+│   ├── _rename.py                # shared capture-avoiding free-variable rename
 │   ├── selection.py
 │   ├── join.py
 │   ├── projection.py
 │   ├── cartesian_product.py
 │   ├── union.py
 │   ├── difference.py
-│   └── division.py
+│   ├── division.py
+│   ├── rename.py
+│   └── exactly_n.py              # canonical "exactly N tuples" pattern emitter
 ├── equivalence/
 │   ├── smt_converter.py          # DRC AST → SMT-LIB text
-│   └── equivalence_checker.py    # async parallel cvc5 driver
+│   ├── smt_preprocessing.py      # equality elimination, unused-slot pruning
+│   └── equivalence_checker.py    # async multi-strategy cvc5 driver
 ├── planner/
 │   ├── llm_client.py             # Bedrock + system prompts
 │   └── planner.py                # iteration loop with temperature escalation
 └── sql/
     ├── sql_converter.py          # tree → flat SELECT
-    └── simplifier.py              # rule-based fixed-point rewriter
+    └── simplifier.py             # rule-based fixed-point rewriter
+
+bird_benchmark/                   # standalone BIRD benchmark harness (see below)
 
 tests/
-├── unit/                         # 275 fast tests, mocks LLM and cvc5
+├── unit/                         # 491 fast tests, mocks LLM and cvc5
 └── ...
 
 examples/                         # end-to-end smoke runs
+```
+
+## BIRD benchmark
+
+The `bird_benchmark/` package is a standalone test harness that
+evaluates the planner against the public BIRD benchmark
+(https://bird-bench.github.io). It lives in a separate top-level
+package with its own CLI and a tightly scoped public API surface from
+`text_to_sql_planner` so the planner package stays free of test-harness
+dependencies.
+
+### What it does
+
+For each `(schema, natural-language question, gold-standard SQL)`
+triple in BIRD:
+
+1. Run the planner on the question and schema → generated SQL +
+   generated DRC.
+2. Convert the gold SQL into DRC via a new SQL→DRC converter (the
+   load-bearing new component, see below).
+3. Use cvc5 to decide whether the generated DRC and the gold DRC are
+   logically equivalent.
+4. Record a `Verdict` per Test_Case: `equivalent`, `not_equivalent`,
+   `unknown`, `timeout`, `planner_failed`, `converter_failed`,
+   `gold_conversion_failure`, `skipped`, or `expected_fail`.
+5. Aggregate into a JSON + markdown report.
+
+### Two execution modes
+
+Single-test mode for fast iteration on a specific Test_Case:
+
+```bash
+uv run python -m bird_benchmark single \
+  --bird-root /path/to/bird/download \
+  --split dev \
+  --id dev_42                      # or --question "exact text"
+```
+
+Suite mode for the entire BIRD split, with append-only manifest and
+crash-resilient resume:
+
+```bash
+uv run python -m bird_benchmark suite \
+  --bird-root /path/to/bird/download \
+  --split dev \
+  --manifest run.jsonl \
+  --report-json report.json \
+  --report-md   report.md
+
+# Resume from where it left off:
+uv run python -m bird_benchmark suite \
+  --bird-root /path/to/bird/download \
+  --split dev \
+  --manifest run.jsonl \
+  --resume
+```
+
+Common options on both subcommands:
+
+| Flag                    | Purpose                                                                 |
+|-------------------------|-------------------------------------------------------------------------|
+| `--cvc5-path PATH`      | cvc5 executable (default `cvc5`)                                        |
+| `--cvc5-timeout SECONDS`| Per-equivalence-check cvc5 timeout, integer seconds in [1, 3600] (default 30) |
+| `--per-test-timeout SECONDS` | Per-Test_Case planner wall-clock budget, integer seconds in [1, 3600] (default 60) |
+| `--expected-fail PATH`  | File with one Test_Case_ID per line; listed Test_Cases whose verdict isn't `equivalent` are reported as `expected_fail` |
+
+### The SQL→DRC converter
+
+`bird_benchmark/sql_to_drc/` holds a hand-rolled recursive-descent
+SQLite parser + schema-aware translator that produces DRC for the
+gold SQL. Out-of-scope SQL features (OUTER JOIN, window functions,
+CTEs, set operations, HAVING, recursive queries, etc.) are reported
+as structured `ConverterError` values with 1-indexed line/column
+positions rather than crashing the run; their Test_Cases get the
+`converter_failed` or `gold_conversion_failure` verdict so the suite
+keeps going.
+
+The supported SQL subset is enumerated in the parser's module
+docstring and includes: `SELECT` with explicit column lists, `FROM`
+with one or more tables, `INNER JOIN ... ON`, `WHERE` with
+conjunctions and disjunctions of comparisons, `GROUP BY`, `ORDER BY`,
+`LIMIT`, scalar aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`),
+comparison operators (`=`, `!=`, `<`, `>`, `<=`, `>=`), `IN` (with
+literal lists or subqueries), `EXISTS`, and simple correlated
+subqueries. SQLite-specific quirks are handled: single-quoted
+strings, double-quoted identifiers (with the SQLite identifier
+fallback), `||` string concatenation, integer-vs-real `/` typing,
+and `strftime` calls.
+
+### Exit codes
+
+| Code | Meaning                                                                                        |
+|------|------------------------------------------------------------------------------------------------|
+| 0    | Success                                                                                         |
+| 1    | Single-mode selector failure (zero/multiple/missing/both) (`SingleSelectorError`)               |
+| 2    | Configuration error: invalid timeout, missing BIRD files, missing/unreadable Expected_Fail_List, malformed manifest under `--resume` |
+| 3    | Report write failure (`SuiteSummary.failed_to_write_report`)                                    |
+
+### Library API
+
+```python
+import asyncio
+from pathlib import Path
+from bird_benchmark import (
+    RunOptions, SingleSelector, run_single, run_suite, Verdict,
+)
+
+async def main():
+    options = RunOptions(
+        bird_root=Path("./bird"),
+        split="dev",
+        manifest_path=Path("./run.jsonl"),
+        report_json_path=Path("./report.json"),
+        report_md_path=Path("./report.md"),
+    )
+    summary = await run_suite(options)
+    print(f"equivalent: {summary.counts[Verdict.equivalent]}")
+
+asyncio.run(main())
+```
+
+### Layout
+
+```
+bird_benchmark/
+├── __init__.py                   # public surface: run_single, run_suite, types
+├── __main__.py                   # python -m bird_benchmark entry point
+├── cli.py                        # argparse + dispatch
+├── types.py                      # Verdict, TestCase, RunResult, RunOptions, SuiteSummary
+├── loader.py                     # BIRD JSON + per-database SQLite reader
+├── manifest.py                   # append-only JSONL Run_Manifest
+├── runner.py                     # run_one / run_single / run_suite
+├── report.py                     # JSON and markdown reporters
+├── evidence.py                   # planner evidence-keyword forwarding
+├── expected_fail.py              # Expected_Fail_List loader + stale-entry detection
+└── sql_to_drc/
+    ├── __init__.py               # public convert_sql() entrypoint
+    ├── ast.py                    # parser AST
+    ├── lexer.py                  # SQLite-flavoured lexer
+    ├── parser.py                 # recursive-descent SELECT parser
+    ├── schema.py                 # CREATE TABLE → column-type lookup
+    ├── translator.py             # AST → DRC
+    └── pretty_printer.py         # DRC → SQL shim (for the round-trip property)
 ```
 
 ## Limitations
@@ -324,6 +505,10 @@ examples/                         # end-to-end smoke runs
   joins.
 - Supported aggregates are `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`. There's no
   `HAVING`, `WINDOW`, or `WITH` (CTE) yet.
+- The BIRD harness's SQL→DRC converter implements a documented subset
+  of SQLite. Out-of-scope gold queries are surfaced as structured
+  errors rather than crashing the suite, but they don't contribute to
+  the equivalent/not-equivalent tally.
 
 ## License
 

@@ -104,7 +104,13 @@ class RunResult:
 
 @dataclass
 class RunOptions:
-    """User-supplied configuration for a single- or suite-mode run."""
+    """User-supplied configuration for a single- or suite-mode run.
+
+    ``manifest_path`` / ``report_json_path`` / ``report_md_path`` are
+    suite-mode fields (``run_suite`` requires the manifest path; report
+    paths default to ``./bird-report.json`` and ``./bird-report.md`` in
+    the CLI per the design). Single-mode ignores them.
+    """
 
     bird_root: Path
     split: str
@@ -114,6 +120,8 @@ class RunOptions:
     manifest_path: Path | None = None
     resume: bool = False
     cvc5_path: str = "cvc5"
+    report_json_path: Path | None = None
+    report_md_path: Path | None = None
 
 
 @dataclass

@@ -420,15 +420,21 @@ class _Parser:
         if self.at_op("."):
             self.advance()
             second = self.expect_ident()
+            # Propagate the trailing identifier's ``quoted`` flag so the
+            # translator can apply the schema-fallback rule for the bare
+            # column-name token. The qualifier is not affected: a qualified
+            # reference is unambiguously an identifier in SQLite.
             return ColumnRef(
                 qualifier=first.text,
                 name=second.text,
                 pos=Position(first.line, first.column),
+                quoted=second.quoted,
             )
         return ColumnRef(
             qualifier=None,
             name=first.text,
             pos=Position(first.line, first.column),
+            quoted=first.quoted,
         )
 
     def _parse_order_keys(self) -> list[OrderKey]:
