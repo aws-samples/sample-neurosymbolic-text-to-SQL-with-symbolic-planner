@@ -69,6 +69,11 @@ from pathlib import Path
 from typing import Sequence, TextIO
 
 from bird_benchmark.expected_fail import ExpectedFailLoadError
+from bird_benchmark.installer import (
+    InstallError,
+    InstallReport,
+    install_split,
+)
 from bird_benchmark.loader import BirdLoadError
 from bird_benchmark.manifest import ManifestParseError
 from bird_benchmark.runner import (
@@ -303,6 +308,74 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    # --- install subcommand ------------------------------------------
+    # The install subcommand intentionally does NOT inherit ``common``:
+    # it doesn't run cvc5, doesn't load the planner, and has no use for
+    # ``--cvc5-path`` / ``--cvc5-timeout`` / ``--per-test-timeout`` /
+    # ``--expected-fail``. Reusing ``common`` would also force operators
+    # to pass ``--split`` twice (once via common, once on a child).
+    install = subparsers.add_parser(
+        "install",
+        help="Download and install a BIRD split into a local directory.",
+        description=(
+            "Download the official BIRD ZIP for the requested split, "
+            "extract it, normalise the on-disk layout to what the "
+            "loader expects, and verify the result by streaming every "
+            "record once. After this completes, the same --bird-root "
+            "and --split can be passed to ``single`` / ``suite``."
+        ),
+    )
+    install.add_argument(
+        "--bird-root",
+        required=True,
+        type=Path,
+        metavar="PATH",
+        help=(
+            "Directory that will hold the installed split. Created if "
+            "missing. After this call, {bird-root}/{split}/{split}.json "
+            "exists."
+        ),
+    )
+    install.add_argument(
+        "--split",
+        required=True,
+        metavar="SPLIT",
+        help=(
+            "BIRD split to install (e.g. dev, train). The split name "
+            "becomes the directory name under --bird-root."
+        ),
+    )
+    install.add_argument(
+        "--url",
+        default=None,
+        metavar="URL",
+        help=(
+            "Override the download URL. Defaults to the official BIRD "
+            "endpoint for the chosen split. Only https:// and file:// "
+            "schemes are accepted."
+        ),
+    )
+    install.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "Re-download and re-install even when {bird-root}/{split} "
+            "already contains a valid layout. Without --force the "
+            "command short-circuits to verification when the install "
+            "is already in place."
+        ),
+    )
+    install.add_argument(
+        "--keep-archive",
+        action="store_true",
+        help=(
+            "Keep the downloaded ZIP at {bird-root}/_downloads/{split}.zip "
+            "after extraction so a future --force can re-extract without "
+            "re-downloading. Default: archive is removed once the "
+            "layout is in place."
+        ),
+    )
+
     return parser
 
 
@@ -401,10 +474,109 @@ def _run_suite(args: argparse.Namespace, stderr: TextIO) -> int:
     return EXIT_OK
 
 
+def _format_bytes(num_bytes: int) -> str:
+    """Render a byte count as a short human-friendly string.
+
+    Used by the ``install`` progress callback so a multi-GB download
+    doesn't scroll the terminal with raw byte counts. Stays in binary
+    units (MiB, GiB) because that's what most ZIP-distribution servers
+    report and what an operator comparing against a Content-Length
+    header would expect.
+    """
+
+    if num_bytes < 1024:
+        return f"{num_bytes} B"
+    units = ("KiB", "MiB", "GiB", "TiB")
+    value = float(num_bytes)
+    for unit in units:
+        value /= 1024.0
+        if value < 1024.0:
+            return f"{value:.1f} {unit}"
+    return f"{value:.1f} PiB"
+
+
+def _make_install_progress(stdout: TextIO):
+    """Build a progress callback that reports download progress to ``stdout``.
+
+    Throttling is handled inside the installer (it only invokes the
+    callback every ~0.5 s or 16 MiB, whichever happens first) so we
+    don't add another layer here. Each tick rewrites the same line via
+    ``\\r`` so a long download stays on one row of the terminal; we
+    drop a final newline at 100 percent so the next install-stage
+    message starts on a fresh line.
+    """
+
+    def progress(done: int, total: int) -> None:
+        if total > 0:
+            percent = (done * 100) // total if total else 0
+            line = (
+                f"\rdownloading: {_format_bytes(done)} / "
+                f"{_format_bytes(total)} ({percent:>3d}%)"
+            )
+        else:
+            line = f"\rdownloading: {_format_bytes(done)}"
+        stdout.write(line)
+        stdout.flush()
+        if total > 0 and done >= total:
+            stdout.write("\n")
+            stdout.flush()
+
+    return progress
+
+
+def _run_install(
+    args: argparse.Namespace, stdout: TextIO, stderr: TextIO
+) -> int:
+    """Dispatch the ``install`` subcommand. Returns the integer exit code.
+
+    All :class:`InstallError` failures map to :data:`EXIT_CONFIG_ERROR`
+    so the CLI's error contract stays consistent with the rest of the
+    framework: any "the install couldn't be set up" condition lands in
+    code 2 alongside missing JSON, missing SQLite, and unreadable
+    expected-fail files. The exception's ``stage`` is included in the
+    error message so an operator can tell whether to retry the
+    download, fix permissions, or report a BIRD-side schema change.
+    """
+
+    progress = _make_install_progress(stdout)
+    try:
+        report = install_split(
+            bird_root=args.bird_root,
+            split=args.split,
+            url=args.url,
+            force=args.force,
+            keep_archive=args.keep_archive,
+            progress=progress,
+        )
+    except InstallError as exc:
+        # Make sure we land on a fresh line if the progress callback
+        # left the terminal mid-row.
+        stdout.write("\n")
+        stdout.flush()
+        _print_error(f"[install:{exc.stage}] {exc.message}", stderr)
+        return EXIT_CONFIG_ERROR
+
+    # Success summary. One line so wrapper scripts can grep for
+    # ``installed split=…``; notes are appended afterwards on their own
+    # lines so multi-line idiosyncrasies don't break the grep.
+    stdout.write(
+        f"installed split={report.split} at {report.split_root} "
+        f"(databases={report.database_count}, "
+        f"test_cases={report.test_case_count}, "
+        f"skipped={report.skipped_records}, "
+        f"downloaded={_format_bytes(report.download_bytes)})\n"
+    )
+    for note in report.notes:
+        stdout.write(f"note: {note}\n")
+    stdout.flush()
+    return EXIT_OK
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
     stderr: TextIO | None = None,
+    stdout: TextIO | None = None,
 ) -> int:
     """Run the ``bird-benchmark`` CLI and return the integer exit code.
 
@@ -418,6 +590,11 @@ def main(
         Optional stream for error output. Defaults to :data:`sys.stderr`;
         tests can pass an :class:`io.StringIO` to capture without
         monkeypatching.
+    stdout:
+        Optional stream for normal output. Defaults to
+        :data:`sys.stdout`. Today this only matters for the
+        ``install`` subcommand, which writes its progress + summary
+        here.
 
     Returns
     -------
@@ -427,6 +604,7 @@ def main(
     """
 
     err = stderr if stderr is not None else sys.stderr
+    out = stdout if stdout is not None else sys.stdout
     parser = _build_parser()
     # ``parse_args`` raises ``SystemExit(2)`` on argparse usage errors
     # (invalid timeout, unknown mode, missing required argument); we let
@@ -439,6 +617,8 @@ def main(
         return _run_single(args, err)
     if args.mode == "suite":
         return _run_suite(args, err)
+    if args.mode == "install":
+        return _run_install(args, out, err)
 
     # ``required=True`` on the subparser group makes this branch
     # unreachable, but defensively returning a non-zero exit keeps the

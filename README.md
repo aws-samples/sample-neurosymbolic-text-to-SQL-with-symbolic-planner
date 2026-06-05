@@ -144,7 +144,7 @@ uv run python examples/example3.py
 ### Tests
 
 ```bash
-uv run pytest tests/ -q          # 491 tests, no external services needed
+uv run pytest tests/ -q          # 507 tests, no external services needed
 uv run pytest tests/unit -v      # unit suite only
 ```
 
@@ -343,7 +343,7 @@ text_to_sql_planner/
 bird_benchmark/                   # standalone BIRD benchmark harness (see below)
 
 tests/
-├── unit/                         # 491 fast tests, mocks LLM and cvc5
+├── unit/                         # 507 fast tests, mocks LLM and cvc5
 └── ...
 
 examples/                         # end-to-end smoke runs
@@ -373,6 +373,120 @@ triple in BIRD:
    `unknown`, `timeout`, `planner_failed`, `converter_failed`,
    `gold_conversion_failure`, `skipped`, or `expected_fail`.
 5. Aggregate into a JSON + markdown report.
+
+### Downloading BIRD
+
+The BIRD dataset is distributed by the BIRD authors at
+https://bird-bench.github.io. The two ZIPs you'll most often want:
+
+| Split    | Size   | URL                                                                     |
+|----------|--------|-------------------------------------------------------------------------|
+| Dev      | ~2 GB  | https://bird-bench.oss-cn-beijing.aliyuncs.com/dev.zip                  |
+| Train    | ~24 GB | https://bird-bench.oss-cn-beijing.aliyuncs.com/train.zip                |
+
+The dev set is the right starting point — it has 1,534 question-SQL
+pairs across 11 databases and is what most published numbers report
+on.
+
+The framework ships an `install` subcommand that downloads, extracts,
+and normalises a split into the layout the loader expects. One liner:
+
+```bash
+uv run python -m bird_benchmark install \
+  --bird-root "$HOME/bird" \
+  --split dev
+```
+
+That call:
+
+1. Downloads `dev.zip` from the official BIRD endpoint into
+   `$HOME/bird/_downloads/dev.zip` (atomic via a `.part` rename).
+2. Extracts it into a sibling staging directory.
+3. Normalises the layout: BIRD wraps the contents in a release-dated
+   inner directory (e.g. `dev_20240627/`) whose name rotates between
+   cleanup releases, and sometimes ships the per-database SQLite files
+   as a nested `dev_databases.zip`. The installer flattens both shapes
+   into the canonical layout.
+4. Moves the result atomically into `$HOME/bird/dev`.
+5. Verifies the install by streaming every record through
+   `BirdLoader`. Records the database / Test_Case / skip counts.
+
+Useful flags:
+
+| Flag             | Purpose                                                                    |
+|------------------|----------------------------------------------------------------------------|
+| `--url URL`      | Override the download URL (mirror or local file). Only `https://` and `file://` schemes are accepted. |
+| `--force`        | Re-download and re-install even when `{bird-root}/{split}` already exists. |
+| `--keep-archive` | Keep the downloaded ZIP under `{bird-root}/_downloads/` after extraction so a future `--force` can re-extract without re-downloading. |
+
+Exit codes match the rest of the CLI: `0` on success, `2`
+(`EXIT_CONFIG_ERROR`) on any `InstallError` (validate / download /
+extract / normalize / verify). The error message includes the failing
+stage in `[install:STAGE]` brackets so a wrapper script can grep for
+the specific failure mode.
+
+After it returns, the on-disk layout the loader expects is in place:
+
+```
+$HOME/bird/
+└── dev/
+    ├── dev.json
+    └── dev_databases/
+        └── {db_id}/
+            └── {db_id}.sqlite
+```
+
+Then point the framework at `$HOME/bird`:
+
+```bash
+uv run python -m bird_benchmark single \
+  --bird-root "$HOME/bird" \
+  --split dev \
+  --id dev_42
+```
+
+#### Manual install (fallback)
+
+If you'd rather run the steps by hand — for example, to install from a
+mirror the `install` subcommand doesn't know about, or because you
+already have the ZIP downloaded — the same layout can be produced
+manually:
+
+```bash
+export BIRD_ROOT="$HOME/bird"
+mkdir -p "$BIRD_ROOT"
+
+curl -L -o /tmp/bird-dev.zip \
+  https://bird-bench.oss-cn-beijing.aliyuncs.com/dev.zip
+unzip -o /tmp/bird-dev.zip -d "$BIRD_ROOT"
+
+# BIRD wraps the contents in a dated directory whose name rotates
+# between cleanup releases; rename it to plain ``dev``.
+ls "$BIRD_ROOT"
+mv "$BIRD_ROOT/dev_20240627" "$BIRD_ROOT/dev"
+
+# Some releases ship the per-database SQLite files as a separate
+# nested archive — extract it in place if present.
+if [ -f "$BIRD_ROOT/dev/dev_databases.zip" ]; then
+  unzip -o "$BIRD_ROOT/dev/dev_databases.zip" -d "$BIRD_ROOT/dev"
+fi
+
+ls "$BIRD_ROOT/dev/dev.json"
+ls "$BIRD_ROOT/dev/dev_databases" | head
+```
+
+If the loader can't find a file it expects, it raises a
+`BirdLoadError` whose message names the missing path — the CLI exits
+non-zero with that message on stderr, so a misconfigured layout is
+diagnosable from the error alone.
+
+A smaller alternative, useful for local iteration, is the [BIRD
+Mini-Dev](https://github.com/bird-bench/mini_dev) set: 500 curated
+questions also distributed in SQLite. Its layout differs (questions
+are in a HuggingFace-style file rather than a single `dev.json`), so
+using it with this framework requires either flattening it into the
+expected layout or extending the loader; not currently supported
+out of the box.
 
 ### Two execution modes
 
@@ -474,9 +588,10 @@ asyncio.run(main())
 bird_benchmark/
 ├── __init__.py                   # public surface: run_single, run_suite, types
 ├── __main__.py                   # python -m bird_benchmark entry point
-├── cli.py                        # argparse + dispatch
+├── cli.py                        # argparse + dispatch (single / suite / install)
 ├── types.py                      # Verdict, TestCase, RunResult, RunOptions, SuiteSummary
 ├── loader.py                     # BIRD JSON + per-database SQLite reader
+├── installer.py                  # download + extract + normalize for ``install`` subcommand
 ├── manifest.py                   # append-only JSONL Run_Manifest
 ├── runner.py                     # run_one / run_single / run_suite
 ├── report.py                     # JSON and markdown reporters
