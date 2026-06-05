@@ -393,8 +393,30 @@ Answer: (limit 10 (order-by ((hire_date asc)) (drc (emp_id name hire_date) (in (
 
 Question: "Which 3 departments have the most employees?"
 Schema: CREATE TABLE Employees (emp_id INT, name VARCHAR, dept_id INT); CREATE TABLE Departments (dept_id INT, dept_name VARCHAR)
-Answer: (limit 3 (order-by (((COUNT emp_id) desc)) (drc (dept_name (COUNT emp_id)) (exists (dept_id) (and (in (dept_id dept_name) Departments) (exists (emp_id name) (and (in (emp_id name dept_id) Employees))))))))
-Note: The order-by key matches the aggregate result variable. The aggregate appears in BOTH the result variables of the inner DRC AND as the order-by key.
+Answer: (limit 3 (order-by (((COUNT emp_id) desc)) (drc (dept_name) (exists (dept_id) (and (in (dept_id dept_name) Departments) (exists (emp_id name) (and (in (emp_id name dept_id) Employees))))))))
+Note: This is a ranking question ("which … most …"), so the result variables contain ONLY ``dept_name`` — the entity being ranked. ``(COUNT emp_id)`` appears in the order-by key but NOT in the result variables. See the "Ranking questions" section below.
+
+Ranking questions ("which X has the highest/lowest Y", "what is the X with the most Z", "find the top X by Y"):
+- These questions name TWO things: the entity to identify (X) and the criterion to rank by (Y / Z).
+- The result variables MUST contain ONLY X — the identifying columns. The ranking criterion goes in the ``order-by`` key, NOT in the result variables.
+- This convention matches how the question is phrased in English: "which gas station has the highest revenue" asks for *the gas station*, not *(gas station, revenue)*. Adding the ranking column to the SELECT list answers a different question ("show me each gas station with its revenue, then pick the top one").
+- The ranking criterion can still be an aggregate in the ``order-by`` key — that's fine, aggregate keys don't have to mirror result variables.
+- This rule applies whenever the question uses superlative or ranking phrasing: "highest", "lowest", "most", "least", "top", "bottom", "biggest", "smallest", "first", "last by …".
+
+Question: "Which gas station has the highest amount of revenue?"
+Schema: CREATE TABLE Transactions (TransactionID INT, GasStationID INT, Price REAL)
+Answer: (limit 1 (order-by (((SUM Price) desc)) (drc (GasStationID) (exists (TransactionID Price) (in (TransactionID GasStationID Price) Transactions)))))
+Note: Result variables are JUST ``GasStationID`` — the ranking column ``(SUM Price)`` appears only in the order-by key. Putting ``(SUM Price)`` in the result variables would project two columns where the question asks for one.
+
+Question: "What is the name of the employee with the highest salary?"
+Schema: CREATE TABLE Employees (emp_id INT, name VARCHAR, salary DECIMAL)
+Answer: (limit 1 (order-by ((salary desc)) (drc (name) (exists (emp_id salary) (in (emp_id name salary) Employees)))))
+Note: Only ``name`` is requested. ``salary`` is the ranking criterion and stays in order-by; ``emp_id`` and ``salary`` are existentially quantified.
+
+Question: "Show the top 5 employees and their salaries"
+Schema: CREATE TABLE Employees (emp_id INT, name VARCHAR, salary DECIMAL)
+Answer: (limit 5 (order-by ((salary desc)) (drc (name salary) (exists (emp_id) (in (emp_id name salary) Employees)))))
+Note: Contrast with the previous example. Here the question explicitly asks for BOTH name AND salary ("employees AND their salaries"), so both appear in the result variables. The trigger words for the multi-column projection are conjunctions ("and", "with their", "along with") between the entity and the metric.
 
 Return ONLY the DRC expression in Lisp syntax, nothing else."""
 

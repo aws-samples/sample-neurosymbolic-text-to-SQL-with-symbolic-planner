@@ -144,7 +144,7 @@ uv run python examples/example3.py
 ### Tests
 
 ```bash
-uv run pytest tests/ -q          # 507 tests, no external services needed
+uv run pytest tests/ -q          # 521 tests, no external services needed
 uv run pytest tests/unit -v      # unit suite only
 ```
 
@@ -343,7 +343,7 @@ text_to_sql_planner/
 bird_benchmark/                   # standalone BIRD benchmark harness (see below)
 
 tests/
-├── unit/                         # 507 fast tests, mocks LLM and cvc5
+├── unit/                         # 521 fast tests, mocks LLM and cvc5
 └── ...
 
 examples/                         # end-to-end smoke runs
@@ -396,6 +396,32 @@ uv run python -m bird_benchmark install \
   --bird-root "$HOME/bird" \
   --split dev
 ```
+
+#### What `--split` means
+
+`--split` names the BIRD partition you want to install. The same value
+you install with is the value you later pass to `single` / `suite`.
+The installer recognises:
+
+| `--split` | Size   | Contents                                                   |
+|-----------|--------|------------------------------------------------------------|
+| `dev`     | ~2 GB  | 1,534 question–SQL pairs across 11 databases. The right starting point and what most published numbers report on. |
+| `train`   | ~24 GB | The training split. Much larger; takes a long time to run end-to-end. |
+
+The `test` split is held back by the BIRD authors and is not publicly
+downloadable — the installer rejects it with a `[install:validate]`
+error that points at the two known splits.
+
+Mechanically, the value you pass becomes:
+
+- the directory name created under `--bird-root`
+  (`--bird-root ~/bird --split dev` produces `~/bird/dev/`),
+- the prefix on the JSON file (`~/bird/dev/dev.json`) and the databases
+  directory (`~/bird/dev/dev_databases/`),
+- the key the installer uses to look up the official download URL when
+  `--url` isn't given.
+
+Most people only ever want `dev`.
 
 That call:
 
@@ -499,6 +525,50 @@ uv run python -m bird_benchmark single \
   --id dev_42                      # or --question "exact text"
 ```
 
+#### Finding Test_Case IDs
+
+Each BIRD record carries a `question_id`; the framework prefixes it
+with the split to form the Test_Case_ID, so dev's IDs look like
+`dev_0`, `dev_1`, …, `dev_1533`. To browse them, use the `list`
+subcommand:
+
+```bash
+# Every Test_Case in the dev split (id, db, question), one per line:
+uv run python -m bird_benchmark list \
+  --bird-root "$HOME/bird" \
+  --split dev
+
+# Filter to a single database and grab the first 5 IDs:
+uv run python -m bird_benchmark list \
+  --bird-root "$HOME/bird" \
+  --split dev \
+  --db california_schools \
+  --ids-only \
+  --limit 5
+
+# Find the Test_Cases whose question mentions ``salary``:
+uv run python -m bird_benchmark list \
+  --bird-root "$HOME/bird" \
+  --split dev \
+  --contains salary \
+  --ids-only
+```
+
+Useful combinations:
+
+| Goal                                         | Pipe                                                       |
+|----------------------------------------------|------------------------------------------------------------|
+| Pick an ID interactively with `fzf`          | `bird-benchmark list ... | fzf | cut -f1`                  |
+| Run the first 10 Test_Cases in `single` mode | `bird-benchmark list ... --ids-only --limit 10 | xargs -I{} bird-benchmark single ... --id {}` |
+| Seed an Expected_Fail_List                   | `bird-benchmark list ... --ids-only > expected-fail.txt`   |
+
+The default output format is `{test_case_id}\t{db_id}\t{question}` so
+it pipes cleanly through `grep`/`awk`/`fzf`. Use `--ids-only` when you
+want just the IDs (one per line, no header). Records the loader had
+to skip (missing field, missing SQLite) appear on stderr as
+`warning: skipping ...` lines and don't pollute the listing on
+stdout.
+
 Suite mode for the entire BIRD split, with append-only manifest and
 crash-resilient resume:
 
@@ -588,7 +658,7 @@ asyncio.run(main())
 bird_benchmark/
 ├── __init__.py                   # public surface: run_single, run_suite, types
 ├── __main__.py                   # python -m bird_benchmark entry point
-├── cli.py                        # argparse + dispatch (single / suite / install)
+├── cli.py                        # argparse + dispatch (single / suite / install / list)
 ├── types.py                      # Verdict, TestCase, RunResult, RunOptions, SuiteSummary
 ├── loader.py                     # BIRD JSON + per-database SQLite reader
 ├── installer.py                  # download + extract + normalize for ``install`` subcommand

@@ -74,14 +74,14 @@ from bird_benchmark.installer import (
     InstallReport,
     install_split,
 )
-from bird_benchmark.loader import BirdLoadError
+from bird_benchmark.loader import BirdLoader, BirdLoaderConfig, BirdLoadError
 from bird_benchmark.manifest import ManifestParseError
 from bird_benchmark.runner import (
     SingleSelectorError,
     run_single,
     run_suite,
 )
-from bird_benchmark.types import RunOptions, SingleSelector
+from bird_benchmark.types import RunOptions, SingleSelector, SkippedTestCase
 
 
 # Inclusive bounds for the two operator-supplied timeouts (Req 6.1 / 6.2 /
@@ -376,6 +376,78 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    # --- list subcommand ---------------------------------------------
+    # ``list`` doesn't run the planner or cvc5 either, so it shares
+    # the install subcommand's pattern of declaring its own
+    # ``--bird-root`` / ``--split`` rather than inheriting ``common``.
+    # The job is purely "what IDs can I pass to ``single --id``?", so
+    # the only real flags are presentational filters.
+    list_cmd = subparsers.add_parser(
+        "list",
+        help="List the Test_Case IDs available in an installed BIRD split.",
+        description=(
+            "Print one line per Test_Case in the requested split. The "
+            "default format is ``{test_case_id}\\t{db_id}\\t{question}`` "
+            "so the output can be piped through grep/awk/fzf to pick an "
+            "--id for ``bird-benchmark single``. Records the loader had "
+            "to skip (missing field, missing SQLite) are reported on "
+            "stderr but don't show up in the listing."
+        ),
+    )
+    list_cmd.add_argument(
+        "--bird-root",
+        required=True,
+        type=Path,
+        metavar="PATH",
+        help=(
+            "Directory containing the installed BIRD split (the same "
+            "value passed to ``install --bird-root``)."
+        ),
+    )
+    list_cmd.add_argument(
+        "--split",
+        required=True,
+        metavar="SPLIT",
+        help="BIRD split name to list (e.g. dev, train).",
+    )
+    list_cmd.add_argument(
+        "--db",
+        default=None,
+        metavar="DB_ID",
+        help=(
+            "Optional filter: only list Test_Cases whose ``db_id`` "
+            "exactly matches this value."
+        ),
+    )
+    list_cmd.add_argument(
+        "--contains",
+        default=None,
+        metavar="SUBSTRING",
+        help=(
+            "Optional filter: only list Test_Cases whose question "
+            "contains this substring (case-insensitive)."
+        ),
+    )
+    list_cmd.add_argument(
+        "--ids-only",
+        action="store_true",
+        help=(
+            "Print only the Test_Case_ID per line, with no db_id or "
+            "question. Useful for piping into ``xargs`` or seeding an "
+            "Expected_Fail_List."
+        ),
+    )
+    list_cmd.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Stop after listing N Test_Cases. Pairs well with "
+            "``--contains`` for quick previews."
+        ),
+    )
+
     return parser
 
 
@@ -572,6 +644,73 @@ def _run_install(
     return EXIT_OK
 
 
+def _run_list(
+    args: argparse.Namespace, stdout: TextIO, stderr: TextIO
+) -> int:
+    """Dispatch the ``list`` subcommand. Returns the integer exit code.
+
+    Streams the BIRD split through :class:`BirdLoader` and prints one
+    line per Test_Case to stdout. Loader-level failures (missing JSON,
+    unparseable JSON) map to :data:`EXIT_CONFIG_ERROR` for parity with
+    ``single`` / ``suite``; per-record skips (missing field, missing
+    SQLite) are surfaced on stderr as ``warning:`` lines rather than
+    fatal errors so a partially-broken install can still be browsed.
+    """
+
+    db_filter: str | None = args.db
+    contains_filter: str | None = (
+        args.contains.lower() if args.contains else None
+    )
+    limit: int | None = args.limit
+    ids_only: bool = args.ids_only
+
+    if limit is not None and limit < 0:
+        _print_error(f"--limit must be non-negative, got {limit}", stderr)
+        return EXIT_CONFIG_ERROR
+
+    config = BirdLoaderConfig(bird_root=args.bird_root, split=args.split)
+    loader = BirdLoader(config)
+    try:
+        items = loader.load()
+        printed = 0
+        skipped = 0
+        for item in items:
+            if isinstance(item, SkippedTestCase):
+                # Skip records get a warning so the operator knows the
+                # split has malformed entries, but they don't pollute
+                # the ID listing on stdout.
+                stderr.write(
+                    f"warning: skipping {item.test_case_id}: {item.reason}\n"
+                )
+                skipped += 1
+                continue
+            if db_filter is not None and item.db_id != db_filter:
+                continue
+            if contains_filter is not None and contains_filter not in item.question.lower():
+                continue
+            if ids_only:
+                stdout.write(f"{item.test_case_id}\n")
+            else:
+                stdout.write(
+                    f"{item.test_case_id}\t{item.db_id}\t{item.question}\n"
+                )
+            printed += 1
+            if limit is not None and printed >= limit:
+                break
+    except BirdLoadError as exc:
+        _print_error(str(exc), stderr)
+        return EXIT_CONFIG_ERROR
+
+    if skipped:
+        stderr.write(
+            f"warning: {skipped} record(s) were skipped; "
+            f"see ``warning: skipping ...`` lines above\n"
+        )
+        stderr.flush()
+    stdout.flush()
+    return EXIT_OK
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -619,6 +758,8 @@ def main(
         return _run_suite(args, err)
     if args.mode == "install":
         return _run_install(args, out, err)
+    if args.mode == "list":
+        return _run_list(args, out, err)
 
     # ``required=True`` on the subparser group makes this branch
     # unreachable, but defensively returning a non-zero exit keeps the

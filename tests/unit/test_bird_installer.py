@@ -527,3 +527,166 @@ def test_cli_install_subparser_requires_bird_root_and_split():
     """Argparse refuses an install invocation missing required flags."""
     with pytest.raises(SystemExit):
         cli.main(["install"], stderr=io.StringIO(), stdout=io.StringIO())
+
+
+
+# ---------------------------------------------------------------------------
+# CLI ``list`` subcommand
+# ---------------------------------------------------------------------------
+
+
+def _install_synthetic_split(tmp_path: Path, split: str = "dev"):
+    """Install a synthetic BIRD split and return the bird_root path.
+
+    Reused across the ``list`` tests so each one starts from a real
+    on-disk install (going through the installer end-to-end rather
+    than hand-crafting the layout, so the tests exercise the same
+    code path operators use in production).
+    """
+
+    archive = tmp_path / "src" / f"{split}.zip"
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    _build_canonical_archive(archive, split)
+    bird_root = tmp_path / "bird"
+    install_split(
+        bird_root=bird_root,
+        split=split,
+        url=archive.as_uri(),
+        url_opener=_file_url_opener(archive),
+    )
+    return bird_root
+
+
+def test_cli_list_default_format(tmp_path):
+    """``list`` prints one ``id\\tdb_id\\tquestion`` line per Test_Case."""
+    bird_root = _install_synthetic_split(tmp_path)
+
+    out = io.StringIO()
+    err = io.StringIO()
+    code = cli.main(
+        [
+            "list",
+            "--bird-root",
+            str(bird_root),
+            "--split",
+            "dev",
+        ],
+        stdout=out,
+        stderr=err,
+    )
+    assert code == EXIT_OK
+    lines = out.getvalue().splitlines()
+    assert len(lines) == 1
+    fields = lines[0].split("\t")
+    assert fields[0] == "dev_0"
+    assert fields[1] == "synth_db"
+    assert "Synthetic question 0" in fields[2]
+
+
+def test_cli_list_ids_only(tmp_path):
+    """``--ids-only`` strips everything except the Test_Case_ID."""
+    bird_root = _install_synthetic_split(tmp_path)
+
+    out = io.StringIO()
+    err = io.StringIO()
+    code = cli.main(
+        [
+            "list",
+            "--bird-root",
+            str(bird_root),
+            "--split",
+            "dev",
+            "--ids-only",
+        ],
+        stdout=out,
+        stderr=err,
+    )
+    assert code == EXIT_OK
+    assert out.getvalue().strip() == "dev_0"
+
+
+def test_cli_list_db_filter(tmp_path):
+    """``--db`` filters to records whose ``db_id`` matches exactly."""
+    bird_root = _install_synthetic_split(tmp_path)
+
+    out = io.StringIO()
+    err = io.StringIO()
+    # The synthetic fixture has a single record under db_id ``synth_db``;
+    # filtering by an unrelated db_id should produce no output.
+    code = cli.main(
+        [
+            "list",
+            "--bird-root",
+            str(bird_root),
+            "--split",
+            "dev",
+            "--db",
+            "no_such_db",
+        ],
+        stdout=out,
+        stderr=err,
+    )
+    assert code == EXIT_OK
+    assert out.getvalue() == ""
+
+    # Filtering by the real db_id yields the one record.
+    out = io.StringIO()
+    code = cli.main(
+        [
+            "list",
+            "--bird-root",
+            str(bird_root),
+            "--split",
+            "dev",
+            "--db",
+            "synth_db",
+            "--ids-only",
+        ],
+        stdout=out,
+        stderr=err,
+    )
+    assert code == EXIT_OK
+    assert out.getvalue().strip() == "dev_0"
+
+
+def test_cli_list_contains_filter_is_case_insensitive(tmp_path):
+    """``--contains`` matches case-insensitively against the question."""
+    bird_root = _install_synthetic_split(tmp_path)
+
+    out = io.StringIO()
+    err = io.StringIO()
+    code = cli.main(
+        [
+            "list",
+            "--bird-root",
+            str(bird_root),
+            "--split",
+            "dev",
+            "--contains",
+            "SYNTHETIC",
+            "--ids-only",
+        ],
+        stdout=out,
+        stderr=err,
+    )
+    assert code == EXIT_OK
+    assert out.getvalue().strip() == "dev_0"
+
+
+def test_cli_list_missing_install_returns_config_error(tmp_path):
+    """Pointing ``list`` at a missing split surfaces ``EXIT_CONFIG_ERROR``."""
+    out = io.StringIO()
+    err = io.StringIO()
+    code = cli.main(
+        [
+            "list",
+            "--bird-root",
+            str(tmp_path / "no_such_root"),
+            "--split",
+            "dev",
+        ],
+        stdout=out,
+        stderr=err,
+    )
+    assert code == EXIT_CONFIG_ERROR
+    assert "BIRD JSON file not found" in err.getvalue()
