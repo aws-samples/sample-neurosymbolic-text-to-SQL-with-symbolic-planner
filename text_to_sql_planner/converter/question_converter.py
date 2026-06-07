@@ -265,6 +265,11 @@ def _retry_hint_for(last_raw_output: str, last_error: str) -> str:
       produce; the variables are already extracted by
       :func:`_validate_free_variables` and live verbatim in the
       ``last_error`` message.
+    * **Literal in membership tuple** — the parser emits "Expected
+      SYMBOL in membership variable list, got NUMBER" (or STRING)
+      when the LLM puts a constant directly inside ``(in (...)
+      Table)``. Tell it explicitly to bind the column to a variable
+      and use a separate ``(= variable literal)`` conjunct.
     * Unary ``(and X)`` / ``(or X)`` — the most common LLM mistake
       when joining tables with a single existential body. We accept
       this in the parser now, but for older error traces we still
@@ -295,6 +300,30 @@ def _retry_hint_for(last_raw_output: str, last_error: str) -> str:
             f"check that EVERY variable in every (in (...) Table) "
             f"tuple is either a result variable or bound by some "
             f"enclosing (exists ...)."
+        )
+
+    # Membership-tuple literal — the parser emits
+    # "Expected SYMBOL in membership variable list, got NUMBER"
+    # (or STRING) when the LLM put a constant directly into the
+    # ``(in (...) Table)`` tuple instead of binding the column to a
+    # variable and adding a separate equality. The prompt teaches
+    # this convention but the LLM occasionally writes SQL-style
+    # ``(in (col1 col2 169) T)`` anyway. Naming the rule explicitly
+    # in the retry tends to fix it on the next attempt.
+    if (
+        "Expected SYMBOL in membership variable list" in err
+        or ("got NUMBER" in err and "(in " in text)
+        or ("got STRING" in err and "(in " in text)
+    ):
+        return (
+            "The (in (...) Table) tuple may contain ONLY variable "
+            "names — never literal constants. To filter a column on a "
+            "literal value, bind the column to a fresh variable inside "
+            "the tuple and add a separate (= variable literal) "
+            "conjunct. Example: instead of "
+            "(in (id name 169) employees), write "
+            "(and (in (id name age) employees) (= age 169)). The same "
+            "rule applies to string literals (e.g. (= name \"Alice\"))."
         )
 
     # Look for unary ``(and X)`` or ``(or X)``: a single sub-expression

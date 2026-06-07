@@ -838,3 +838,220 @@ class TestRenameDispatcher:
             ),
         )
         assert isinstance(result, OperatorFailure)
+
+
+# ---------------------------------------------------------------------------
+# Aggregate tests (Option 1 fix for dev_585)
+# ---------------------------------------------------------------------------
+
+from text_to_sql_planner.operators.aggregate import apply_aggregate
+from text_to_sql_planner.types.operators import AggregateParams
+
+
+class TestAggregate:
+    """Tests for the aggregate operator that promotes a column-typed
+    result variable to an :class:`AggregateVariable`.
+
+    Without this operator the planner can build the right underlying
+    relation (``{x | …}``) but has no way to express the transition
+    to the target's aggregate result variable (``{(F x) | …}``).
+    These tests pin the structural promotion and the validation
+    rules.
+    """
+
+    def _single_col_relation(self, name: str = "BountyAmount") -> DRCExpression:
+        """Build ``{name | (∃…) name ∈ T}`` — the shape the planner
+        produces just before it needs to aggregate."""
+        return DRCExpression(
+            result_variables=[ColumnVariable(name=name)],
+            condition=MembershipNode(
+                variables=[name], relation="votes_filtered"
+            ),
+        )
+
+    def test_promotes_column_to_aggregate(self):
+        """Happy path: ``{x | φ}`` becomes ``{(SUM x) | φ}``."""
+        from text_to_sql_planner.types.drc import AggregateVariable
+
+        rel = self._single_col_relation("BountyAmount")
+        result = apply_aggregate(
+            AggregateParams(function="SUM", column="BountyAmount"),
+            [rel],
+        )
+        assert isinstance(result, OperatorSuccess)
+        rvs = result.output.result_variables
+        assert len(rvs) == 1
+        assert isinstance(rvs[0], AggregateVariable)
+        assert rvs[0].function == "SUM"
+        assert rvs[0].column == "BountyAmount"
+        # The condition is preserved verbatim — only the result
+        # variable's *kind* changed.
+        assert result.output.condition is rel.condition
+
+    @pytest.mark.parametrize(
+        "function", ["COUNT", "SUM", "AVG", "MIN", "MAX"]
+    )
+    def test_accepts_every_supported_aggregate(self, function):
+        """All five SQL aggregates round-trip through the operator."""
+        from text_to_sql_planner.types.drc import AggregateVariable
+
+        rel = self._single_col_relation("x")
+        result = apply_aggregate(
+            AggregateParams(function=function, column="x"),
+            [rel],
+        )
+        assert isinstance(result, OperatorSuccess)
+        rv = result.output.result_variables[0]
+        assert isinstance(rv, AggregateVariable)
+        assert rv.function == function
+
+    def test_rejects_unknown_function(self):
+        """Functions outside the canonical five are rejected."""
+        rel = self._single_col_relation("x")
+        # Bypass the type-system by constructing the params manually
+        # (the dataclass annotates the field with a Literal but the
+        # runtime check still has to fire).
+        params = AggregateParams(function="MEDIAN", column="x")  # type: ignore[arg-type]
+        result = apply_aggregate(params, [rel])
+        assert isinstance(result, OperatorFailure)
+        assert "MEDIAN" in result.error
+
+    def test_rejects_zero_inputs(self):
+        result = apply_aggregate(
+            AggregateParams(function="SUM", column="x"), []
+        )
+        assert isinstance(result, OperatorFailure)
+        assert "1 input" in result.error
+
+    def test_rejects_two_inputs(self):
+        rel = self._single_col_relation("x")
+        result = apply_aggregate(
+            AggregateParams(function="SUM", column="x"), [rel, rel]
+        )
+        assert isinstance(result, OperatorFailure)
+        assert "1 input" in result.error
+
+    def test_rejects_empty_column(self):
+        rel = self._single_col_relation("x")
+        result = apply_aggregate(
+            AggregateParams(function="SUM", column=""), [rel]
+        )
+        assert isinstance(result, OperatorFailure)
+
+    def test_rejects_input_with_more_than_one_result_variable(self):
+        """Aggregate is single-column only — project first if needed."""
+        rel = DRCExpression(
+            result_variables=[
+                ColumnVariable(name="emp_id"),
+                ColumnVariable(name="salary"),
+            ],
+            condition=MembershipNode(
+                variables=["emp_id", "salary"], relation="employees"
+            ),
+        )
+        result = apply_aggregate(
+            AggregateParams(function="SUM", column="salary"), [rel]
+        )
+        assert isinstance(result, OperatorFailure)
+        assert "exactly one" in result.error.lower()
+
+    def test_rejects_already_aggregate_input(self):
+        """Cannot stack aggregate over aggregate."""
+        from text_to_sql_planner.types.drc import AggregateVariable
+
+        rel = DRCExpression(
+            result_variables=[
+                AggregateVariable(function="COUNT", column="x")
+            ],
+            condition=MembershipNode(variables=["x"], relation="t"),
+        )
+        result = apply_aggregate(
+            AggregateParams(function="SUM", column="x"), [rel]
+        )
+        assert isinstance(result, OperatorFailure)
+        assert "not already an aggregate" in result.error.lower()
+
+    def test_rejects_column_mismatch(self):
+        """The ``column`` parameter must match the input's single column."""
+        rel = self._single_col_relation("BountyAmount")
+        result = apply_aggregate(
+            AggregateParams(function="SUM", column="Score"),
+            [rel],
+        )
+        assert isinstance(result, OperatorFailure)
+        assert "BountyAmount" in result.error
+        assert "Score" in result.error
+
+    def test_dispatcher_routes_to_aggregate(self):
+        """``apply_operator`` dispatches the ``"aggregate"`` operator type."""
+        from text_to_sql_planner.types.drc import AggregateVariable
+
+        rel = self._single_col_relation("BountyAmount")
+        result = apply_operator(
+            OperatorApplication(
+                operator="aggregate",
+                inputs=[rel],
+                params=AggregateParams(function="SUM", column="BountyAmount"),
+            )
+        )
+        assert isinstance(result, OperatorSuccess)
+        assert isinstance(
+            result.output.result_variables[0], AggregateVariable
+        )
+
+    def test_dispatcher_validates_unary_arity(self):
+        """The dispatcher's unary-input check applies to aggregate too."""
+        rel = self._single_col_relation()
+        result = apply_operator(
+            OperatorApplication(
+                operator="aggregate",
+                inputs=[rel, rel],
+                params=AggregateParams(function="SUM", column="BountyAmount"),
+            )
+        )
+        assert isinstance(result, OperatorFailure)
+
+
+class TestAggregateUnblocksDev585Pattern:
+    """End-to-end pin for the bug behind dev_585.
+
+    Before the fix: the planner builds ``{BountyAmount | …}`` and
+    then has no operator that can transition to the target
+    ``{(SUM BountyAmount) | …}``. ``rename`` can only relabel the
+    column name; ``projection`` can introduce an aggregate via its
+    column-spec parser but only over an existing column with that
+    underlying name (which is the same one already in the relation,
+    so it produces a structurally-identical DRC and gets
+    de-duplicated).
+
+    After the fix: the planner can apply ``aggregate`` as a single
+    operator step.
+    """
+
+    def test_reproduces_the_required_structural_promotion(self):
+        from text_to_sql_planner.types.drc import AggregateVariable
+
+        # The "votes joined with posts-about-data, projected to
+        # BountyAmount" relation, simplified for the test.
+        underlying = DRCExpression(
+            result_variables=[ColumnVariable(name="BountyAmount")],
+            condition=MembershipNode(
+                variables=["BountyAmount"], relation="votes_filtered"
+            ),
+        )
+
+        # The target shape the question converter produced.
+        target_rv = AggregateVariable(function="SUM", column="BountyAmount")
+
+        promoted = apply_aggregate(
+            AggregateParams(function="SUM", column="BountyAmount"),
+            [underlying],
+        )
+
+        assert isinstance(promoted, OperatorSuccess)
+        out_rv = promoted.output.result_variables[0]
+        assert isinstance(out_rv, AggregateVariable)
+        assert out_rv.function == target_rv.function
+        assert out_rv.column == target_rv.column
+        # And the underlying tuple-binding is unchanged.
+        assert promoted.output.condition is underlying.condition

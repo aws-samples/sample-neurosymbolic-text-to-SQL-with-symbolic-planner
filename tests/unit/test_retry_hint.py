@@ -99,3 +99,71 @@ def test_hint_handles_empty_input():
     hint = _retry_hint_for("", "no output")
     assert isinstance(hint, str)
     assert hint  # non-empty
+
+
+
+# ---------------------------------------------------------------------------
+# Membership-tuple literal hint (dev_757)
+# ---------------------------------------------------------------------------
+
+
+def test_hint_membership_literal_number():
+    """The dev_757 case: the LLM put ``169`` directly inside an ``(in …)`` tuple.
+
+    The parser flags this as ``Expected SYMBOL in membership variable
+    list, got NUMBER``. The retry hint must spell out the
+    bind-then-constrain pattern so the next attempt actually follows
+    the rule the prompt teaches.
+    """
+
+    text = (
+        "(drc (race) (exists (rid) (and (in (rid race) race) "
+        "(in (hid sname rid weight_kg 169) superhero))))"
+    )
+    err = "ParseError at offset 163: Expected SYMBOL in membership variable list, got NUMBER"
+    hint = _retry_hint_for(text, err)
+
+    # Hint names the rule and gives a concrete example.
+    assert "literal" in hint.lower()
+    assert "bind" in hint.lower()
+    # Concrete fix appears.
+    assert "(= " in hint
+    # And the unary-and/or hint is NOT what fired (the prior bug).
+    assert "unary" not in hint.lower()
+
+
+def test_hint_membership_literal_string():
+    """String literals inside (in …) get the same hint."""
+
+    text = (
+        "(drc (id) (exists (name) (and (in (id name \"Alice\") employees))))"
+    )
+    err = "ParseError at offset 50: Expected SYMBOL in membership variable list, got STRING"
+    hint = _retry_hint_for(text, err)
+    assert "literal" in hint.lower()
+    assert "bind" in hint.lower()
+
+
+def test_hint_membership_literal_takes_precedence_over_unary_and():
+    """When BOTH a literal-in-tuple and a unary ``(and X)`` are present,
+    the literal hint wins because it's the actionable parser error."""
+
+    # Build a string that has both: a unary (and X) AND a number in
+    # an (in ...) tuple. The parser will reject the literal first, so
+    # the literal hint should fire.
+    text = "(drc (x) (and (in (x 5) R)))"
+    err = "ParseError at offset 22: Expected SYMBOL in membership variable list, got NUMBER"
+    hint = _retry_hint_for(text, err)
+    assert "literal" in hint.lower()
+    # And the (mis-)hint about unary forms doesn't appear.
+    assert "unary" not in hint.lower()
+
+
+def test_hint_unrelated_parser_error_does_not_match_literal_branch():
+    """A parser error that doesn't mention NUMBER/STRING/membership-list
+    must NOT trigger the literal hint."""
+
+    text = "(drc (x) (in (x) R))"
+    err = "ParseError at offset 5: Unexpected EOF"
+    hint = _retry_hint_for(text, err)
+    assert "literal" not in hint.lower()

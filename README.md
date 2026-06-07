@@ -144,7 +144,7 @@ uv run python examples/example3.py
 ### Tests
 
 ```bash
-uv run pytest tests/ -q          # 603 tests, no external services needed
+uv run pytest tests/ -q          # 649 tests, no external services needed
 uv run pytest tests/unit -v      # unit suite only
 ```
 
@@ -164,7 +164,7 @@ flowchart TD
 
     P[Planner loop]
     LLM[LLM operator chooser<br/>temperature escalation]
-    OPS[RA operators<br/>σ, ⋈, π, ×, ∪, −, ÷, ρ, ▷]
+    OPS[RA operators<br/>σ, ⋈, π, ×, ∪, −, ÷, ρ, Σ, ▷]
     EQ[Equivalence checker<br/>cvc5 SMT-LIB]
 
     TREE[Tree simplifier<br/>tree-level rewrites]
@@ -196,7 +196,7 @@ flowchart TD
 | Print              | `printer/lisp_printer.py`, `printer/pretty_printer.py`       | DRC AST → Lisp form (machine-friendly) and Unicode form (`{x \| ∃y …}`).  |
 | Schema → relations | `converter/table_converter.py`                               | Each table becomes a predicate `T(a, b, c)`.                              |
 | Question → DRC     | `converter/question_converter.py`, `planner/llm_client.py`   | Bedrock Claude emits Lisp DRC; we re-prompt on parse error.               |
-| RA operators       | `operators/{selection,join,projection,cartesian_product,union,difference,division,rename}.py` (plus internal anti-join) | Each operator is a pure function `(params, inputs) → DRC`. |
+| RA operators       | `operators/{selection,join,projection,cartesian_product,union,difference,division,rename,aggregate}.py` (plus internal anti-join) | Each operator is a pure function `(params, inputs) → DRC`. |
 | Planner loop       | `planner/planner.py`                                         | LLM picks next op + inputs; we apply, check equivalence, escalate temp on retries. |
 | DRC simplifier     | `drc_simplifier.py`                                          | Per-step DRC rewrites: merge nested quantifiers, eliminate trivial equalities, drop unused binders, etc. |
 | Equivalence        | `equivalence/{smt_converter,equivalence_checker}.py`         | DRC → SMT-LIB; parallel cvc5 strategies; first decisive answer wins.       |
@@ -206,14 +206,14 @@ flowchart TD
 
 ### Relational algebra operators
 
-The planner builds the answer by composing eight relational-algebra
+The planner builds the answer by composing nine relational-algebra
 operators that the LLM can select directly, plus an internal anti-join
 introduced by the operation-tree simplifier. Each operator is a pure
 function `(params, inputs) → DRC` defined in its own module under
 `operators/`, with parameter types in `types/operators.py`
 (`RAOperatorType` literal: `"selection"`, `"join"`, `"projection"`,
 `"cartesian_product"`, `"union"`, `"difference"`, `"division"`,
-`"rename"`, `"anti_join"`).
+`"rename"`, `"aggregate"`, `"anti_join"`).
 
 | Symbol | Operator          | Module                            | Inputs | Parameters                       | Output relation                                                                     |
 |--------|-------------------|-----------------------------------|--------|----------------------------------|-------------------------------------------------------------------------------------|
@@ -225,6 +225,7 @@ function `(params, inputs) → DRC` defined in its own module under
 | −      | Set difference    | `operators/difference.py`         | 2      | (none)                           | Tuples in the left input that are not in the right input. Right-side variables are positionally alpha-renamed to the left's column names so the negated subformula speaks about R's tuples. |
 | ÷      | Division          | `operators/division.py`           | 2      | (none)                           | Tuples in the left input that are paired with *every* tuple in the right.           |
 | ρ      | Rename            | `operators/rename.py`             | 1      | `mapping: dict[str, str]`        | Same rows; renames one or more columns. Used before self-joins so the natural join doesn't collapse on shared names. Capture-avoiding free-variable rename via `operators/_rename.py`. |
+| Σ      | Aggregate         | `operators/aggregate.py`          | 1      | `function: COUNT/SUM/AVG/MIN/MAX, column: str` | Promotes the input's single `ColumnVariable` result variable to an `AggregateVariable`. Condition unchanged. Use this when the target's result variable is `(F col)` and you've already built the underlying `{col \| …}` relation — `rename` cannot perform this kind change. |
 | ▷      | Anti-join         | (synthesised in `operation_tree_simplifier.py`) | 2 | `join_columns: list[str]`     | Tuples in the left input whose key has no match in the right. Not directly LLM-selectable; introduced by the tree simplifier when it recognises `Join(L, Difference(L, R))` or `Difference(L, Join(L, R))` shapes. Emitted as `NOT EXISTS` in SQL. |
 
 Operators are validated up front: arity checks, column-existence checks,
@@ -328,6 +329,7 @@ text_to_sql_planner/
 │   ├── difference.py
 │   ├── division.py
 │   ├── rename.py
+│   ├── aggregate.py              # promote a column result variable to an aggregate (COUNT/SUM/AVG/MIN/MAX)
 │   └── exactly_n.py              # canonical "exactly N tuples" pattern emitter
 ├── equivalence/
 │   ├── smt_converter.py          # DRC AST → SMT-LIB text
@@ -343,7 +345,7 @@ text_to_sql_planner/
 bird_benchmark/                   # standalone BIRD benchmark harness (see below)
 
 tests/
-├── unit/                         # 603 fast tests, mocks LLM and cvc5
+├── unit/                         # 649 fast tests, mocks LLM and cvc5
 └── ...
 
 examples/                         # end-to-end smoke runs
@@ -602,10 +604,32 @@ uv run python -m bird_benchmark sample \
 
 The seed is required so two runs with the same split + count + seed
 produce the same selection — without that you can't tell apart "my
-code got better" from "I sampled different cases this time". The
-output is one full per-Test_Case block (BIRD context + planner
-transcript + Run_Result JSON) per case, followed by a `# Sample
-Summary` section with:
+code got better" from "I sampled different cases this time".
+
+Output is written to a directory rather than streamed to a single
+file:
+
+- `{output-dir}/{test_case_id}.md` — one transcript per Test_Case
+  (BIRD context + planner / cvc5 log + final `Run_Result` JSON).
+- `{output-dir}/summary.md` — human-readable aggregate. Lists the
+  actual Test_Case_IDs in each bucket, with each ID linked to its
+  transcript file (`[dev_42](./dev_42.md)`) so the operator can
+  click straight from "12 cases were logically equivalent" to any
+  one of them.
+- `{output-dir}/summary.json` — machine-readable mirror with the
+  same per-bucket ID lists.
+
+Stdout gets only one progress line per case (`[3/50] dev_42
+verdict=equivalent exec=match → ./run-07/dev_42.md`) plus a
+final headline summarising the rates.
+
+Pass `--output-dir DIR` to choose the location; when omitted, the
+sampler auto-allocates `~/runs/run-NN` where `NN` is one greater
+than the highest `run-NN` already present in `~/runs`. Two
+back-to-back invocations land in distinct directories, so a
+``rerun`` doesn't clobber the prior result.
+
+The summary content:
 
 - Logically equivalent (cvc5) rate
 - Execution-equivalent (set match) rate — BIRD's official metric
@@ -615,12 +639,8 @@ Summary` section with:
   diagnostic — it surfaces over-specified BIRD gold queries (extra
   joins on declared-but-not-enforced FKs, redundant filters) where
   both queries return the same rows on BIRD's snapshot
-- Per-verdict and per-execution-status breakdowns
-
-Optional `--report-json PATH` / `--report-md PATH` flags write the
-same reports `suite` produces. By default no report files are written
-— the aggregate summary on stdout is usually enough for an ad-hoc
-diagnostic run.
+- Per-verdict and per-execution-status breakdowns, each listing the
+  actual Test_Case_IDs that fell into the bucket
 
 Common options on both subcommands:
 

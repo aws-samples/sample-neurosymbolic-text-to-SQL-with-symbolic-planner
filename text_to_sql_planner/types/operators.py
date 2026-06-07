@@ -12,6 +12,7 @@ RAOperatorType = Literal[
     "selection", "join", "projection",
     "cartesian_product", "union", "difference", "division",
     "rename",
+    "aggregate",
     "anti_join",
 ]
 
@@ -79,6 +80,40 @@ class RenameParams:
 
 
 @dataclass
+class AggregateParams:
+    """Aggregate a single-column relation into one aggregate result variable.
+
+    Promotes a :class:`ColumnVariable` result variable to an
+    :class:`AggregateVariable` by wrapping it in one of the SQL
+    aggregate functions (``COUNT`` / ``SUM`` / ``AVG`` / ``MIN`` /
+    ``MAX``). The input must already have *exactly one* result
+    variable, of column type, and that variable must be the one
+    being aggregated — the operator's job is the structural
+    promotion of ``{c | φ}`` into ``{(F c) | φ}``, not a grouped
+    aggregation. Group-by aggregation is expressed as
+    ``projection [keys, (F col)]`` on the join, exactly as it is
+    today; this operator handles the simpler "aggregate the whole
+    relation to a single value" case the planner currently has no
+    way to express.
+
+    Why this is its own operator: ``rename`` can only relabel a
+    column-typed result variable as another column name; it cannot
+    change the result variable's *kind*. The planner builds the
+    correct underlying relation (e.g. "BountyAmount projected from
+    the right join") but then has nowhere to go because every
+    further ``rename`` attempt produces a structurally-identical
+    DRC and gets de-duplicated. Adding this operator gives the
+    planner an explicit way to perform the
+    ``ColumnVariable → AggregateVariable`` transition that the
+    target DRC requires.
+    """
+
+    type: Literal["aggregate"] = "aggregate"
+    function: Literal["COUNT", "SUM", "AVG", "MIN", "MAX"] = "COUNT"
+    column: str = ""
+
+
+@dataclass
 class AntiJoinParams:
     """Anti-join: rows of the left input whose key is NOT present in the right.
 
@@ -101,6 +136,7 @@ OperatorParams = Union[
     SelectionParams, JoinParams, ProjectionParams,
     CartesianProductParams, UnionParams, DifferenceParams, DivisionParams,
     RenameParams,
+    AggregateParams,
     AntiJoinParams,
 ]
 

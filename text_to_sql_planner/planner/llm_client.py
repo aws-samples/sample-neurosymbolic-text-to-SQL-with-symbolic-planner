@@ -78,6 +78,7 @@ Available operators:
 - selection: Filter rows using a condition. Requires 1 input.
 - projection: Select specific columns. Requires 1 input.
 - rename: Rename one or more columns of a relation. Requires 1 input. Use this BEFORE a self-join to disambiguate columns that would otherwise collide.
+- aggregate: Promote the input's single result variable from a column to an aggregate (COUNT/SUM/AVG/MIN/MAX). Requires 1 input. The input MUST already have exactly one column-typed result variable, and that column's name MUST match the ``column`` parameter. Use this when the target DRC's result variable is an aggregate like ``(SUM x)`` and you've already built the underlying ``{x | …}`` relation — ``rename`` cannot perform this transition because it can't change a result variable's *kind*.
 - join: Natural join on shared columns. Requires 2 inputs.
 - cartesian_product: Cross product of two relations. Requires 2 inputs.
 - union: Set union of two compatible relations. Requires 2 inputs.
@@ -142,6 +143,7 @@ _OPERATOR_TOOL = {
                     "join",
                     "projection",
                     "rename",
+                    "aggregate",
                     "cartesian_product",
                     "union",
                     "difference",
@@ -156,7 +158,7 @@ _OPERATOR_TOOL = {
             },
             "params": {
                 "type": "object",
-                "description": "Operator-specific parameters. For selection: {condition: <lisp-string>}. For projection: {columns: [col1, col2]}. For join: {join_columns: [col]}. For rename: {mapping: {old_name: new_name, ...}}. For cartesian_product/union/difference/division: {}.",
+                "description": "Operator-specific parameters. For selection: {condition: <lisp-string>}. For projection: {columns: [col1, col2]}. For join: {join_columns: [col]}. For rename: {mapping: {old_name: new_name, ...}}. For aggregate: {function: 'COUNT'|'SUM'|'AVG'|'MIN'|'MAX', column: <name-of-input's-single-column>}. For cartesian_product/union/difference/division: {}.",
             },
         },
         "required": ["reasoning", "operator", "input_indices", "params"],
@@ -314,6 +316,12 @@ Examples:
 Question: "Find all employees in department 5"
 Schema: CREATE TABLE employees (id INT, name VARCHAR, dept_id INT)
 Answer: (drc (id name dept_id) (and (in (id name dept_id) employees) (= dept_id 5)))
+Note: To filter a column on a literal value, ALWAYS bind the column to a variable inside the (in (...) Table) tuple, then constrain it with (= variable literal) as a separate conjunct. Literals (numbers, strings) MUST NEVER appear directly in the (in (...) Table) tuple itself — that position takes only variable names. The same rule applies whether the literal is a number (= weight_kg 169) or a string (= name "Alice").
+
+Question: "Find the race of the superhero who weighed 169 kg"
+Schema: CREATE TABLE superhero (id INT, name VARCHAR, race_id INT, weight_kg INT); CREATE TABLE race (id INT, race VARCHAR)
+Answer: (drc (race) (exists (rid) (and (in (rid race) race) (exists (hid sname weight_kg) (and (in (hid sname rid weight_kg) superhero) (= weight_kg 169))))))
+Note: ``weight_kg`` is bound to a variable in the membership, not written as ``169`` directly. The constant goes in a separate ``(= weight_kg 169)`` conjunct.
 
 Question: "Find employee names in department 5"
 Schema: CREATE TABLE employees (id INT, name VARCHAR, dept_id INT)

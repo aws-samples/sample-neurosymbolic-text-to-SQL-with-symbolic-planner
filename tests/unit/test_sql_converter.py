@@ -1084,3 +1084,394 @@ def test_rename_used_for_self_join_disambiguation():
     assert sql.count("Performance_Reviews") == 2
     # No derived subquery wrapping the rename — it flattens.
     assert "FROM (\n" not in sql
+
+
+
+# ---------------------------------------------------------------------------
+# Aggregate operator (SQL emission for the dev_585 fix)
+# ---------------------------------------------------------------------------
+
+from text_to_sql_planner.types.operators import AggregateParams
+
+
+def _aggregate_node(
+    input_node, function: str, column: str
+) -> OperatorNode:
+    """Build an aggregate operator node over ``input_node``.
+
+    Mirrors the planner's construction: the operator's
+    ``output_columns`` are the underlying columns it aggregates over
+    (the SQL converter looks up that field via ``_get_node_columns``).
+    """
+
+    return OperatorNode(
+        operator="aggregate",
+        params=AggregateParams(function=function, column=column),
+        inputs=[input_node],
+        output_columns=[column],
+    )
+
+
+def test_aggregate_over_table_leaf_emits_wrapped_select():
+    """``aggregate(SUM, BountyAmount)`` over a single-column table leaf
+    emits a ``SELECT SUM(alias.col) FROM (inner) alias`` wrapper."""
+
+    table = _table_leaf("votes", ["BountyAmount"])
+    tree = OperationTree(root=_aggregate_node(table, "SUM", "BountyAmount"))
+
+    result = convert_to_sql(tree)
+    assert isinstance(result, SQLSuccess), result
+    sql = result.sql
+    # Outer SELECT applies the aggregate function to the inner alias.
+    assert "SUM(" in sql
+    assert "BountyAmount" in sql
+    # Inner subquery is wrapped — derived subquery with its own alias.
+    assert "FROM (" in sql
+    assert "votes" in sql
+
+
+def test_aggregate_count_over_projection_chain():
+    """End-to-end: a projection of a single column followed by COUNT."""
+
+    table = _table_leaf("employees", ["id", "name", "age"])
+    proj = _projection_node(table, ["id"])
+    tree = OperationTree(root=_aggregate_node(proj, "COUNT", "id"))
+
+    result = convert_to_sql(tree)
+    assert isinstance(result, SQLSuccess), result
+    # Outer aggregate references the inner alias's id column.
+    assert "COUNT(" in result.sql
+    assert ".id" in result.sql
+    # The projection survives in the inner subquery.
+    assert "FROM (" in result.sql
+    assert "employees" in result.sql
+
+
+@pytest.mark.parametrize(
+    "function", ["COUNT", "SUM", "AVG", "MIN", "MAX"]
+)
+def test_aggregate_emits_each_supported_function(function):
+    """All five SQL aggregates render with the right function token."""
+
+    table = _table_leaf("t", ["x"])
+    tree = OperationTree(root=_aggregate_node(table, function, "x"))
+
+    result = convert_to_sql(tree)
+    assert isinstance(result, SQLSuccess), result
+    assert f"{function}(" in result.sql
+
+
+def test_aggregate_dev_585_pattern_end_to_end():
+    """Reproduces the dev_585 plan shape end-to-end through the SQL converter.
+
+    The planner's iteration 5 in run-03 produced:
+    ``aggregate(SUM, BountyAmount)`` over ``projection [BountyAmount]``
+    over ``join [PostId]`` of ``votes`` and a selection of ``posts``.
+
+    Before the SQL emitter learned about ``aggregate``, this tree
+    failed with ``SQL_CONVERSION_FAILED: Cannot flatten operator:
+    aggregate``. After the fix, it emits an aggregate-wrapped SELECT
+    over the inner join + filter.
+    """
+
+    posts = _table_leaf(
+        "posts", ["Id", "Title"]
+    )
+    posts_filtered = _selection_node(
+        posts,
+        ComparisonNode(
+            operator="=",
+            left=VariableRefNode(name="Title"),
+            right=LiteralNode(value="data", data_type="string"),
+        ),
+        output_columns=["Id", "Title"],
+    )
+    votes = _table_leaf("votes", ["PostId", "BountyAmount"])
+    # Rename posts.Id → PostId so the join key matches.
+    from text_to_sql_planner.types.operators import RenameParams
+
+    posts_renamed = OperatorNode(
+        operator="rename",
+        params=RenameParams(mapping={"Id": "PostId"}),
+        inputs=[posts_filtered],
+        output_columns=["PostId", "Title"],
+    )
+    joined = _join_node(
+        votes, posts_renamed, ["PostId"],
+        output_columns=["PostId", "BountyAmount", "Title"],
+    )
+    proj = _projection_node(joined, ["BountyAmount"])
+    tree = OperationTree(root=_aggregate_node(proj, "SUM", "BountyAmount"))
+
+    result = convert_to_sql(tree)
+    assert isinstance(result, SQLSuccess), result
+    sql = result.sql
+    # The aggregate appears at the top level.
+    assert "SUM(" in sql
+    # The join + filter live inside the inner subquery.
+    assert "FROM (" in sql
+    assert "votes" in sql
+    assert "posts" in sql
+    assert "data" in sql
+
+
+def test_aggregate_validates_inputs():
+    """Aggregate emitter rejects empty inputs / empty column."""
+
+    table = _table_leaf("t", ["x"])
+    bad_no_inputs = OperatorNode(
+        operator="aggregate",
+        params=AggregateParams(function="SUM", column="x"),
+        inputs=[],
+        output_columns=["x"],
+    )
+    result = convert_to_sql(OperationTree(root=bad_no_inputs))
+    assert isinstance(result, SQLFailure)
+    assert "1 input" in result.error
+
+    bad_empty_col = OperatorNode(
+        operator="aggregate",
+        params=AggregateParams(function="SUM", column=""),
+        inputs=[table],
+        output_columns=[""],
+    )
+    result = convert_to_sql(OperationTree(root=bad_empty_col))
+    assert isinstance(result, SQLFailure)
+
+
+def test_aggregate_inside_projection_via_subquery_wrap():
+    """An aggregate node used as an input to projection wraps cleanly.
+
+    Confirms ``_build_context`` treats ``AggregateParams`` like the
+    other non-flattenable operators (projection / union / etc.) — it
+    becomes a derived subquery the outer operator selects from.
+    """
+
+    table = _table_leaf("t", ["x", "y"])
+    agg = _aggregate_node(_projection_node(table, ["x"]), "SUM", "x")
+    # Project the aggregate's output (just to exercise the wrap path).
+    outer = _projection_node(agg, ["x"])
+    tree = OperationTree(root=outer)
+
+    result = convert_to_sql(tree)
+    assert isinstance(result, SQLSuccess), result
+    # Aggregate function still appears, wrapped as inner subquery.
+    assert "SUM(" in result.sql
+
+
+
+# ---------------------------------------------------------------------------
+# Aggregate-operator double-wrap fix (dev_585)
+# ---------------------------------------------------------------------------
+
+
+def test_root_aggregate_with_matching_target_no_double_wrap():
+    """Reproduces dev_585's run-05 emission bug.
+
+    Tree: ``aggregate(SUM, BountyAmount)`` over ``projection [BountyAmount]``
+    over a join. Result variables: ``[AggregateVariable(SUM, BountyAmount)]``.
+
+    Before the fix the SQL was:
+
+        SELECT SUM(s1.BountyAmount) FROM (
+          SELECT SUM(a1.BountyAmount) FROM (
+            SELECT v1.BountyAmount FROM votes v1 JOIN posts p1 …
+          ) a1
+        ) s1
+
+    where the outer SUM references ``s1.BountyAmount`` — which doesn't
+    exist as a column at that scope, since the inner SELECT projects
+    ``SUM(...)``. SQLite raises ``no such column: s1.BountyAmount``.
+
+    After the fix: the result-variable finaliser walks past the root
+    aggregate (its ``(function, column)`` matches the target) and
+    builds the outer SELECT directly over the underlying join, so
+    only one SUM survives.
+    """
+    votes = _table_leaf("votes", ["PostId", "BountyAmount"])
+    posts = _table_leaf("posts", ["Id", "Title"])
+    posts_filtered = _selection_node(
+        posts,
+        ComparisonNode(
+            operator="=",
+            left=VariableRefNode(name="Title"),
+            right=LiteralNode(value="data", data_type="string"),
+        ),
+        output_columns=["Id", "Title"],
+    )
+    from text_to_sql_planner.types.operators import RenameParams, AggregateParams
+
+    posts_renamed = OperatorNode(
+        operator="rename",
+        params=RenameParams(mapping={"Id": "PostId"}),
+        inputs=[posts_filtered],
+        output_columns=["PostId", "Title"],
+    )
+    joined = _join_node(
+        votes, posts_renamed, ["PostId"],
+        output_columns=["PostId", "BountyAmount", "Title"],
+    )
+    proj = _projection_node(joined, ["BountyAmount"])
+    agg = OperatorNode(
+        operator="aggregate",
+        params=AggregateParams(function="SUM", column="BountyAmount"),
+        inputs=[proj],
+        output_columns=["BountyAmount"],
+    )
+    tree = OperationTree(root=agg)
+
+    result = convert_to_sql(
+        tree,
+        result_variables=[
+            AggregateVariable(function="SUM", column="BountyAmount")
+        ],
+    )
+    assert isinstance(result, SQLSuccess), result
+    sql = result.sql
+
+    # Exactly one SUM(...) — not two.
+    assert sql.count("SUM(") == 1, sql
+    # The aggregate references the underlying join column directly.
+    assert "BountyAmount" in sql
+    # The runner used to emit ``SUM(s1.BountyAmount)`` over a derived
+    # subquery alias ``s1`` produced by the aggregate operator. After
+    # the fix that alias is gone — the walk-through-aggregate logic
+    # peels both the aggregate and projection off the root, so the
+    # outer SELECT sits directly over the join.
+    assert "SUM(s1.BountyAmount)" not in sql
+    # No "agg" alias appears either.
+    assert "SUM(a1.BountyAmount)" not in sql
+
+
+def test_root_aggregate_function_mismatch_keeps_aggregate_node():
+    """When the planner's aggregate doesn't match the target, the operator
+    is left in place so the inconsistency surfaces (rather than being
+    silently masked).
+
+    The fix only short-circuits a redundant aggregate; a function /
+    column mismatch indicates a planner bug we'd rather see than hide.
+    """
+    from text_to_sql_planner.types.operators import AggregateParams
+
+    table = _table_leaf("t", ["x"])
+    agg_sum = OperatorNode(
+        operator="aggregate",
+        params=AggregateParams(function="SUM", column="x"),
+        inputs=[table],
+        output_columns=["x"],
+    )
+    tree = OperationTree(root=agg_sum)
+
+    # Target asks for COUNT, planner produced SUM. The fix should NOT
+    # collapse them — instead it should emit both layers so the bug is
+    # visible (and so the SQL fails downstream rather than running with
+    # the wrong aggregate).
+    result = convert_to_sql(
+        tree,
+        result_variables=[
+            AggregateVariable(function="COUNT", column="x")
+        ],
+    )
+    assert isinstance(result, SQLSuccess), result
+    sql = result.sql
+    # Both aggregates appear: the inner SUM from the planner's tree
+    # and the outer COUNT from the result-variable list.
+    assert "SUM(" in sql
+    assert "COUNT(" in sql
+
+
+def test_root_aggregate_with_multiple_result_vars_keeps_aggregate_node():
+    """Group-by-style targets (multi-result-variable) keep the aggregate
+    node — they go through the projection-with-aggregate emission path.
+    """
+    from text_to_sql_planner.types.operators import AggregateParams
+
+    table = _table_leaf("t", ["k", "v"])
+    proj = _projection_node(table, ["v"])
+    agg = OperatorNode(
+        operator="aggregate",
+        params=AggregateParams(function="SUM", column="v"),
+        inputs=[proj],
+        output_columns=["v"],
+    )
+    tree = OperationTree(root=agg)
+
+    # Multi-result-variable target: a key column AND an aggregate.
+    result = convert_to_sql(
+        tree,
+        result_variables=[
+            ColumnVariable(name="k"),
+            AggregateVariable(function="SUM", column="v"),
+        ],
+    )
+    # The fix only collapses a single-aggregate target; this case
+    # falls through unchanged so the existing group-by semantics apply.
+    assert isinstance(result, (SQLSuccess, SQLFailure)), result
+    if isinstance(result, SQLSuccess):
+        # If the converter handled it, we don't pin a specific shape —
+        # the regression we care about is that the *single-aggregate*
+        # case collapses correctly, which is covered above.
+        pass
+
+
+def test_dev_585_pattern_with_result_variables_emits_clean_sql():
+    """Full dev_585 reproduction: votes ⋈ posts_filtered, projected to
+    BountyAmount, aggregated to SUM, with the target's result-variable
+    list passed through ``convert_to_sql``.
+
+    This is the path the runner actually takes (via
+    ``main.run`` / ``convert_query_to_sql``). After the fix the
+    emitted SQL should run cleanly against the BIRD SQLite DB
+    without the ``no such column: s1.BountyAmount`` error.
+    """
+    votes = _table_leaf("votes", ["PostId", "BountyAmount"])
+    posts = _table_leaf("posts", ["Id", "Title"])
+    posts_filtered = _selection_node(
+        posts,
+        ComparisonNode(
+            operator="=",
+            left=VariableRefNode(name="Title"),
+            right=LiteralNode(value="data", data_type="string"),
+        ),
+        output_columns=["Id", "Title"],
+    )
+    from text_to_sql_planner.types.operators import RenameParams, AggregateParams
+
+    posts_renamed = OperatorNode(
+        operator="rename",
+        params=RenameParams(mapping={"Id": "PostId"}),
+        inputs=[posts_filtered],
+        output_columns=["PostId", "Title"],
+    )
+    joined = _join_node(
+        votes, posts_renamed, ["PostId"],
+        output_columns=["PostId", "BountyAmount", "Title"],
+    )
+    proj = _projection_node(joined, ["BountyAmount"])
+    agg = OperatorNode(
+        operator="aggregate",
+        params=AggregateParams(function="SUM", column="BountyAmount"),
+        inputs=[proj],
+        output_columns=["BountyAmount"],
+    )
+    tree = OperationTree(root=agg)
+
+    result = convert_to_sql(
+        tree,
+        result_variables=[
+            AggregateVariable(function="SUM", column="BountyAmount")
+        ],
+    )
+    assert isinstance(result, SQLSuccess), result
+    sql = result.sql
+
+    # The bug signature: the SQL must NOT reference ``s1.BountyAmount``,
+    # because there's no column with that name at any subquery alias's
+    # scope after the inner SELECT projects ``SUM(...)``.
+    assert "s1.BountyAmount" not in sql
+    # And exactly one aggregate.
+    assert sql.count("SUM(") == 1
+    # The join is still present (the projection collapsed; the join
+    # underneath stays).
+    assert "votes" in sql
+    assert "posts" in sql

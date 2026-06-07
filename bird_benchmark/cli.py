@@ -374,25 +374,21 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     sample.add_argument(
-        "--report-json",
+        "--output-dir",
         type=Path,
         default=None,
-        metavar="PATH",
+        metavar="DIR",
         help=(
-            "Optional path to write a JSON report of the sample. "
-            "Defaults to no report — sampling is meant for ad-hoc "
-            "diagnostic runs and the aggregate summary printed to "
-            "stdout is usually enough."
-        ),
-    )
-    sample.add_argument(
-        "--report-md",
-        type=Path,
-        default=None,
-        metavar="PATH",
-        help=(
-            "Optional path to write a markdown report of the sample. "
-            "Defaults to no report."
+            "Directory to write per-Test_Case transcripts and the "
+            "sample summary into. Created if missing. Each Test_Case "
+            "writes to ``DIR/{test_case_id}.md``; the aggregate "
+            "summary lands in ``DIR/summary.md`` (human-readable, "
+            "with linked Test_Case_ID lists per bucket) plus "
+            "``DIR/summary.json`` (machine-readable). Stdout gets "
+            "only the per-case progress lines and the headline rates. "
+            "When omitted, defaults to ``~/runs/run-NN`` where ``NN`` "
+            "is one greater than the highest ``NN`` already present "
+            "in ``~/runs``, so back-to-back invocations don't collide."
         ),
     )
 
@@ -564,11 +560,9 @@ def _options_from_args(args: argparse.Namespace) -> RunOptions:
         options.resume = args.resume
         options.report_json_path = args.report_json
         options.report_md_path = args.report_md
-    elif args.mode == "sample":
-        # Sample mode reuses the same RunOptions report fields but
-        # defaults to ``None`` (no report) — the operator opts in.
-        options.report_json_path = args.report_json
-        options.report_md_path = args.report_md
+    # Note: ``sample`` does not set ``RunOptions.report_*`` — its
+    # outputs go into ``--output-dir`` instead, owned by
+    # :func:`run_sample` rather than the generic report writers.
     return options
 
 
@@ -656,12 +650,23 @@ def _run_sample(
     """
 
     options = _options_from_args(args)
+    output_dir = args.output_dir
+    if output_dir is None:
+        try:
+            output_dir = _allocate_default_runs_dir()
+        except OSError as exc:
+            _print_error(
+                f"could not allocate default ~/runs directory: {exc}",
+                stderr,
+            )
+            return EXIT_CONFIG_ERROR
     try:
         summary = asyncio.run(
             run_sample(
                 options,
                 count=args.count,
                 seed=args.seed,
+                output_dir=output_dir,
                 stdout=stdout,
                 stderr=stderr,
             )
@@ -678,6 +683,88 @@ def _run_sample(
     if summary.failed_to_write_report:
         return EXIT_REPORT_WRITE_ERROR
     return EXIT_OK
+
+
+# Format of the auto-allocated subdirectory under ``~/runs``. The
+# integer is right-padded to two digits so a sorted ``ls`` looks
+# right for the first ~99 runs and never produces a confusing
+# ``run-100`` ahead of ``run-9`` lexicographically. We accept
+# arbitrary ``run-NN+`` suffixes when scanning so an existing
+# ``run-150`` doesn't reset the counter.
+_DEFAULT_RUNS_PARENT = Path("~/runs").expanduser()
+_DEFAULT_RUN_PREFIX = "run-"
+
+
+def _allocate_default_runs_dir(
+    *,
+    parent: Path | None = None,
+) -> Path:
+    """Pick the next ``run-NN`` directory under ``~/runs/`` and create it.
+
+    Scans ``parent`` (default ``~/runs``) for directories named
+    ``run-<int>`` and returns ``parent / "run-<max+1>"`` (right-padded
+    to at least two digits for cosmetics). The directory is created
+    here so two near-simultaneous CLI invocations can't both pick the
+    same number — the second to call ``mkdir(exist_ok=False)`` will
+    raise :class:`FileExistsError` and the helper retries with a
+    higher index.
+
+    Parameters
+    ----------
+    parent:
+        Override for the parent directory. Production callers leave
+        this ``None`` and get ``~/runs``; tests pass a ``tmp_path``
+        so they don't touch the real home directory.
+
+    Returns
+    -------
+    Path
+        The freshly-created directory.
+
+    Raises
+    ------
+    OSError
+        If the parent directory cannot be created, or if every retry
+        within the bounded loop also collides (extremely unlikely;
+        the loop bound is just a safety net for a misbehaving FS).
+    """
+
+    parent = parent if parent is not None else _DEFAULT_RUNS_PARENT
+    parent.mkdir(parents=True, exist_ok=True)
+
+    # Scan existing entries for ``run-<int>`` and find the max index.
+    highest = 0
+    for child in parent.iterdir():
+        if not child.is_dir():
+            continue
+        name = child.name
+        if not name.startswith(_DEFAULT_RUN_PREFIX):
+            continue
+        suffix = name[len(_DEFAULT_RUN_PREFIX):]
+        # Accept only pure-integer suffixes; ignore things like
+        # ``run-foo`` so an operator's manually-named directory doesn't
+        # confuse the counter.
+        if not suffix.isdigit():
+            continue
+        idx = int(suffix)
+        if idx > highest:
+            highest = idx
+
+    # Try the next-higher index, retry on collision so two concurrent
+    # invocations cannot both pick the same number. Bound the retries
+    # so a stuck FS can't loop forever.
+    for offset in range(1, 1000):
+        candidate = parent / f"{_DEFAULT_RUN_PREFIX}{(highest + offset):02d}"
+        try:
+            candidate.mkdir(exist_ok=False)
+            return candidate
+        except FileExistsError:
+            # Another process beat us to this index; bump and retry.
+            continue
+    raise OSError(
+        f"could not allocate a unique run directory under {parent} "
+        f"after 1000 attempts"
+    )
 
 
 def _format_bytes(num_bytes: int) -> str:

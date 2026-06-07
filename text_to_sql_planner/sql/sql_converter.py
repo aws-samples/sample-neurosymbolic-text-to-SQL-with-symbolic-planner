@@ -25,6 +25,7 @@ from text_to_sql_planner.types.operators import (
     DifferenceParams,
     DivisionParams,
     RenameParams,
+    AggregateParams,
     AntiJoinParams,
 )
 from text_to_sql_planner.types.drc import (
@@ -226,6 +227,8 @@ class _SqlGenerator:
             return self._convert_anti_join(node, params)
         elif isinstance(params, ProjectionParams):
             return self._convert_projection(node, params)
+        elif isinstance(params, AggregateParams):
+            return self._convert_aggregate(node, params)
         else:
             # Selection, Join, CartesianProduct, Rename -> flatten
             ctx = self._build_context(node)
@@ -251,7 +254,7 @@ class _SqlGenerator:
             return self._ctx_cartesian(node, params, inputs)
         elif isinstance(params, RenameParams):
             return self._ctx_rename(node, params, inputs)
-        elif isinstance(params, (ProjectionParams, UnionParams, DifferenceParams, DivisionParams, AntiJoinParams)):
+        elif isinstance(params, (ProjectionParams, UnionParams, DifferenceParams, DivisionParams, AntiJoinParams, AggregateParams)):
             # Non-flattenable operators get wrapped as a derived subquery
             return self._ctx_from_subquery(node)
         else:
@@ -511,6 +514,50 @@ class _SqlGenerator:
         if ctx.where_conditions:
             parts.append(f"  WHERE {' AND '.join(ctx.where_conditions)}")
         return "\n".join(parts)
+
+    # --- Aggregate ---
+
+    def _convert_aggregate(
+        self, node: OperatorNode, params: AggregateParams
+    ) -> str:
+        """Aggregate -> ``SELECT F(col) FROM (inner) alias``.
+
+        The aggregate operator promotes the input's single column-typed
+        result variable to an :class:`AggregateVariable`. In SQL this
+        is the standard "wrap a derived subquery in a single aggregate
+        SELECT" pattern. The inner relation is materialised as a
+        derived subquery so any joins / filters / projections in it are
+        rendered first; the outer SELECT then applies the function.
+
+        Why not flatten into the inner SELECT: the planner has already
+        proved that the inner relation produces exactly the rows we
+        want to aggregate. Mixing the aggregate into the inner SELECT
+        list would force us to also lift any joins / WHERE clauses out
+        and would risk getting the GROUP BY semantics wrong. Wrapping
+        is simpler and obviously correct — SQLite collapses the
+        no-grouping form to a single-row aggregate result, which is
+        exactly the semantics our :class:`AggregateVariable` represents.
+        """
+
+        inputs = node.inputs
+        if len(inputs) != 1:
+            raise _ConversionError(
+                "Aggregate requires exactly 1 input"
+            )
+        if not params.column:
+            raise _ConversionError(
+                "Aggregate requires a non-empty 'column' parameter"
+            )
+
+        # Render the inner relation as a derived subquery.
+        inner_sql = self._convert_node(inputs[0])
+        inner_alias = self._aliases.next_alias("agg")
+        # Indent the inner SQL for readability inside the wrapper.
+        indented = "\n  ".join(inner_sql.splitlines())
+        return (
+            f"SELECT {params.function}({inner_alias}.{params.column})\n"
+            f"  FROM (\n  {indented}\n  ) {inner_alias}"
+        )
 
     def _project_col_to_sql(self, col: str, var_map: dict[str, str]) -> str:
         """Render a projection column, resolving plain names via the var map.
@@ -893,6 +940,19 @@ class _SqlGenerator:
         # outer SELECT we emit below applies the aggregates / column
         # list once.
         #
+        # The same logic applies to a root-level Aggregate operator:
+        # the operator's whole purpose is to make the relation's
+        # result variable an :class:`AggregateVariable` matching the
+        # target. When the target's result-variable list at the
+        # corresponding position is exactly that aggregate, the outer
+        # SELECT below would emit ``SUM(s1.col)`` over a subquery that
+        # already projects ``SUM(col)`` — the dev_585 double-wrap bug.
+        # We only skip an aggregate node when its
+        # ``(function, column)`` matches the target at the same
+        # position; mismatches (a planner bug) are left in place so
+        # they surface as a SQL error rather than getting silently
+        # masked.
+        #
         # Soundness: a projection ``π_cols(R)`` followed by a
         # projection that matches the target's result variables produces
         # the same final tuples as the target projection applied
@@ -905,12 +965,20 @@ class _SqlGenerator:
         # use must therefore expose every name a result variable
         # references — verified positionally by ``root_columns`` below.
         effective_root = tree.root
-        while (
-            isinstance(effective_root, OperatorNode)
-            and isinstance(effective_root.params, ProjectionParams)
-            and effective_root.inputs
-        ):
-            effective_root = effective_root.inputs[0]
+        while True:
+            if not isinstance(effective_root, OperatorNode) or not effective_root.inputs:
+                break
+            params = effective_root.params
+            if isinstance(params, ProjectionParams):
+                effective_root = effective_root.inputs[0]
+                continue
+            if (
+                isinstance(params, AggregateParams)
+                and _aggregate_matches_target(params, result_variables)
+            ):
+                effective_root = effective_root.inputs[0]
+                continue
+            break
 
         # Special case: when the effective root is an anti-join, render
         # it directly as the outer SELECT instead of wrapping it as a
@@ -1323,6 +1391,38 @@ class _SqlGenerator:
         """Indent each line of a SQL string."""
         pad = " " * indent
         return "\n".join(f"{pad}{line}" for line in sql.split("\n"))
+
+
+# --- Helpers (module-level) ---
+
+
+def _aggregate_matches_target(
+    params: AggregateParams, result_variables: list
+) -> bool:
+    """Decide whether a root-level :class:`AggregateParams` is redundant
+    with the target's result-variable list.
+
+    Returns ``True`` when the result-variable list contains exactly one
+    :class:`AggregateVariable` whose ``(function, column)`` matches
+    ``params``. In that case the outer SELECT emitted by
+    :meth:`SQLConverter._generate_with_result_vars` will produce
+    exactly the same aggregate the operator already produces, so the
+    operator can be skipped to avoid the dev_585 double-wrap bug.
+
+    A mismatch (different function or different column) is treated as
+    a planner inconsistency: we leave the operator in place so the
+    next layer's emission surfaces the error rather than silently
+    masking it. A multi-result-variable target is similarly left in
+    place — that's a group-by case that the projection-with-aggregate
+    path already handles, and we don't want to disturb it.
+    """
+
+    if len(result_variables) != 1:
+        return False
+    rv = result_variables[0]
+    if not isinstance(rv, AggregateVariable):
+        return False
+    return rv.function == params.function and rv.column == params.column
 
 
 # --- Public API ---

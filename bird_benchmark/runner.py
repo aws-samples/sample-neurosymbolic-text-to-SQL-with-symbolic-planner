@@ -93,6 +93,7 @@ emit constants whose sorts match the merged predicate signature.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import sys
 from dataclasses import asdict
@@ -1591,6 +1592,7 @@ async def run_sample(
     *,
     count: int,
     seed: int,
+    output_dir: Path | None = None,
     expected_fail: set[str] | None = None,
     stdout: TextIO | None = None,
     stderr: TextIO | None = None,
@@ -1599,8 +1601,6 @@ async def run_sample(
     check_equivalence_callable: Callable[..., Awaitable[Any]] = _default_check_equivalence,
     exec_callable: Callable[..., ExecutionResult] | None = None,
     loader_factory: Callable[[BirdLoaderConfig], BirdLoader] = BirdLoader,
-    write_json_report: Callable[[list[RunResult], Path], None] = _default_write_json_report,
-    write_markdown_report: Callable[[list[RunResult], Path], None] = _default_write_markdown_report,
 ) -> SampleSummary:
     """Run ``count`` randomly-selected Test_Cases from the split.
 
@@ -1612,6 +1612,30 @@ async def run_sample(
     split + count + seed produce the same selection — without that
     you can't tell apart "my code got better" from "I sampled
     different cases this time".
+
+    Output layout
+    -------------
+
+    When ``output_dir`` is ``None`` (the library default), the entire
+    run — per-case banners, planner transcript, Run_Result JSON,
+    aggregate summary — streams to ``stdout``. Useful for tests and
+    notebook callers that want everything in one buffer.
+
+    When ``output_dir`` is set (the CLI default), the layout is:
+
+    * ``{output_dir}/{test_case_id}.md`` — full transcript per case
+      (BIRD context block + planner / cvc5 transcript + Run_Result
+      JSON). The transcript is captured by redirecting
+      :data:`sys.stdout` for the duration of each ``run_one`` call,
+      since the planner and equivalence checker print via the global
+      ``print``.
+    * ``{output_dir}/summary.md`` — aggregate summary with linked
+      Test_Case_ID lists per verdict and per execution-status bucket.
+      Each ID is a relative-link to its transcript file so the
+      operator can click straight from the summary into the case.
+    * ``{output_dir}/summary.json`` — machine-readable mirror.
+    * ``stdout`` only gets per-case progress lines (``[i/n] ID →
+      file``) and the headline rates at the end.
 
     Parameters
     ----------
@@ -1627,8 +1651,10 @@ async def run_sample(
         count in :attr:`SampleSummary.sampled_count`.
     seed:
         PRNG seed for reproducibility. Required.
-    expected_fail / stdout / stderr / *_callable / loader_factory /
-    write_*_report:
+    output_dir:
+        See "Output layout" above. ``None`` keeps the legacy
+        single-stream behaviour.
+    expected_fail / stdout / stderr / *_callable / loader_factory:
         Mirror :func:`run_suite` exactly. Tests inject the callables
         to drive the sampler without Bedrock or cvc5.
 
@@ -1654,6 +1680,14 @@ async def run_sample(
 
     out = stdout if stdout is not None else sys.stdout
     err = stderr if stderr is not None else sys.stderr
+
+    if output_dir is not None:
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise ValueError(
+                f"--output-dir {output_dir} is not writable: {exc}"
+            ) from exc
 
     if expected_fail is None:
         expected_fail = _load_expected_fail(options.expected_fail_path)
@@ -1694,23 +1728,31 @@ async def run_sample(
     selected: list[TestCase] = rng.sample(test_cases, k=actual_count)
 
     # --- Header banner -------------------------------------------------
-    out.write("\n# BIRD Sample_Run\n\n")
-    out.write(
-        f"- **Split:** `{options.split}`\n"
-        f"- **Requested:** {count}\n"
-        f"- **Sampled:** {actual_count}"
-    )
-    if actual_count < count:
+    if output_dir is None:
+        out.write("\n# BIRD Sample_Run\n\n")
         out.write(
-            f"  _(only {len(test_cases)} eligible Test_Cases in split)_"
+            f"- **Split:** `{options.split}`\n"
+            f"- **Requested:** {count}\n"
+            f"- **Sampled:** {actual_count}"
         )
-    out.write("\n")
-    out.write(f"- **Seed:** {seed}\n")
-    out.write(
-        f"- **Selected IDs:** "
-        f"{', '.join('`' + c.test_case_id + '`' for c in selected)}\n\n"
-    )
-    out.flush()
+        if actual_count < count:
+            out.write(
+                f"  _(only {len(test_cases)} eligible Test_Cases in split)_"
+            )
+        out.write("\n")
+        out.write(f"- **Seed:** {seed}\n")
+        out.write(
+            f"- **Selected IDs:** "
+            f"{', '.join('`' + c.test_case_id + '`' for c in selected)}\n\n"
+        )
+        out.flush()
+    else:
+        out.write(
+            f"\nBIRD sample_run (split={options.split}, "
+            f"count={actual_count}/{count}, seed={seed})\n"
+            f"Output dir: {output_dir}\n\n"
+        )
+        out.flush()
 
     summary = SampleSummary(
         seed=seed,
@@ -1720,50 +1762,115 @@ async def run_sample(
 
     # --- Per-Test_Case loop -------------------------------------------
     for index, test_case in enumerate(selected, start=1):
-        out.write(f"\n---\n## Sample {index}/{actual_count}\n")
-        out.flush()
-
-        _write_bird_test_case_banner(out, test_case)
-        try:
-            result = await run_one(
-                test_case,
-                options,
-                expected_fail,
-                planner_callable=planner_callable,
-                convert_sql_callable=convert_sql_callable,
-                check_equivalence_callable=check_equivalence_callable,
-                exec_callable=exec_callable,
+        if output_dir is None:
+            # Legacy single-stream output: stream the transcript
+            # straight to ``out``.
+            out.write(f"\n---\n## Sample {index}/{actual_count}\n")
+            out.flush()
+            _write_bird_test_case_banner(out, test_case)
+            try:
+                result = await run_one(
+                    test_case,
+                    options,
+                    expected_fail,
+                    planner_callable=planner_callable,
+                    convert_sql_callable=convert_sql_callable,
+                    check_equivalence_callable=check_equivalence_callable,
+                    exec_callable=exec_callable,
+                )
+            except Exception as exc:  # noqa: BLE001 - per-Test_Case isolation
+                result = _make_unhandled_exception_run_result(test_case, exc)
+            _write_run_result_block(out, result)
+        else:
+            # Per-case file mode: capture the entire transcript into
+            # ``{output_dir}/{test_case_id}.md`` by redirecting
+            # ``sys.stdout`` for the duration of ``run_one``. The
+            # planner / cvc5 / question-converter all print via the
+            # module-level ``print``, so this is the principled way to
+            # peel them off the global stream without rewiring every
+            # caller.
+            case_path = output_dir / f"{test_case.test_case_id}.md"
+            try:
+                with case_path.open("w", encoding="utf-8") as case_file:
+                    with contextlib.redirect_stdout(case_file):
+                        _write_bird_test_case_banner(case_file, test_case)
+                        try:
+                            result = await run_one(
+                                test_case,
+                                options,
+                                expected_fail,
+                                planner_callable=planner_callable,
+                                convert_sql_callable=convert_sql_callable,
+                                check_equivalence_callable=check_equivalence_callable,
+                                exec_callable=exec_callable,
+                            )
+                        except Exception as exc:  # noqa: BLE001 - per-Test_Case isolation
+                            result = _make_unhandled_exception_run_result(test_case, exc)
+                        _write_run_result_block(case_file, result)
+            except OSError as exc:
+                # Per-case file write failures shouldn't abort the
+                # whole sample. Record a synthetic planner-failed
+                # result so the summary still tallies the case, and
+                # surface the path on stderr.
+                err.write(
+                    f"error: failed to write per-case transcript "
+                    f"{case_path}: {exc}\n"
+                )
+                err.flush()
+                result = _make_unhandled_exception_run_result(test_case, exc)
+            # Per-case progress line on stdout — short, greppable.
+            verdict_str = result.reported_verdict.value
+            exec_str = (
+                result.execution.status.value
+                if result.execution is not None
+                else "n/a"
             )
-        except Exception as exc:  # noqa: BLE001 - per-Test_Case isolation
-            # Mirror the suite driver: an unhandled exception becomes
-            # a planner_failed result so the sample run can keep going.
-            result = _make_unhandled_exception_run_result(test_case, exc)
+            out.write(
+                f"[{index}/{actual_count}] {test_case.test_case_id} "
+                f"verdict={verdict_str} exec={exec_str} → {case_path}\n"
+            )
+            out.flush()
 
-        _write_run_result_block(out, result)
         _accumulate_sample_summary(summary, result)
 
     # --- Aggregate summary --------------------------------------------
-    _write_sample_summary(out, summary)
+    if output_dir is None:
+        _write_sample_summary(out, summary)
+    else:
+        # Human-readable summary file with linked ID lists per bucket.
+        summary_md_path = output_dir / "summary.md"
+        try:
+            with summary_md_path.open("w", encoding="utf-8") as f:
+                _write_sample_summary_markdown(
+                    f, summary, options=options,
+                    output_dir=output_dir,
+                )
+        except OSError as exc:
+            summary.failed_to_write_report = True
+            err.write(
+                f"error: failed to write summary markdown "
+                f"{summary_md_path}: {exc}\n"
+            )
 
-    # --- Optional reports ---------------------------------------------
-    if options.report_json_path is not None:
+        # Machine-readable mirror.
+        summary_json_path = output_dir / "summary.json"
         try:
-            write_json_report(summary.results, options.report_json_path)
-        except (OSError, IOError) as exc:
+            with summary_json_path.open("w", encoding="utf-8") as f:
+                json.dump(
+                    _serialize_sample_summary(summary, options=options),
+                    f, indent=2, default=_default_json_serializer,
+                )
+                f.write("\n")
+        except OSError as exc:
             summary.failed_to_write_report = True
             err.write(
-                f"error: failed to write JSON report to "
-                f"{options.report_json_path}: {exc}\n"
+                f"error: failed to write summary JSON "
+                f"{summary_json_path}: {exc}\n"
             )
-    if options.report_md_path is not None:
-        try:
-            write_markdown_report(summary.results, options.report_md_path)
-        except (OSError, IOError) as exc:
-            summary.failed_to_write_report = True
-            err.write(
-                f"error: failed to write markdown report to "
-                f"{options.report_md_path}: {exc}\n"
-            )
+
+        # Headline rates on stdout so an operator running the CLI
+        # without redirecting still sees the bottom line.
+        _write_sample_headline(out, summary, output_dir=output_dir)
 
     return summary
 
@@ -1877,3 +1984,269 @@ def _pct(numerator: int, denominator: int) -> str:
     if denominator <= 0:
         return "0.0%"
     return f"{(100.0 * numerator / denominator):.1f}%"
+
+
+def _write_sample_headline(
+    out: TextIO, summary: SampleSummary, *, output_dir: Path
+) -> None:
+    """Print a short rate summary on stdout when running in directory mode.
+
+    The full summary lives in ``{output_dir}/summary.md``; this is the
+    "if you only see one line, see this" version that appears at the
+    end of the per-case progress stream so an operator can grok the
+    bottom line without opening another file.
+    """
+
+    n = max(1, summary.sampled_count)
+    eq = summary.verdict_counts.get(Verdict.equivalent, 0)
+    em = summary.execution_counts.get(ExecutionStatus.match, 0)
+    out.write(
+        f"\nsample summary: "
+        f"{summary.sampled_count} sampled, "
+        f"logical-equivalent={eq} ({_pct(eq, n)}), "
+        f"exec-match={em} ({_pct(em, n)}), "
+        f"logical-yes/exec-no={summary.logical_yes_exec_no}, "
+        f"logical-no/exec-yes={summary.logical_no_exec_yes}\n"
+    )
+    out.write(f"summary written to {output_dir / 'summary.md'}\n")
+    out.flush()
+
+
+def _write_sample_summary_markdown(
+    out: TextIO,
+    summary: SampleSummary,
+    *,
+    options: RunOptions,
+    output_dir: Path,
+) -> None:
+    """Write the human-readable summary file.
+
+    The summary lists, for every non-empty bucket, the actual
+    Test_Case_IDs that fell into it, with each ID linked to its
+    transcript file (``./{id}.md``, relative-link inside
+    ``output_dir``). This is the "list the IDs" requirement: when
+    skimming "12 cases were logically equivalent", the operator can
+    click straight through to any one of them.
+
+    The summary structure:
+
+    1. Run metadata (seed, sampled / requested counts, split).
+    2. Headline rates (logical-equivalent, exec-match, multiset).
+    3. Disagreement cells with linked ID lists.
+    4. Per-verdict breakdown with linked ID lists.
+    5. Per-execution-status breakdown with linked ID lists.
+    """
+
+    n = max(1, summary.sampled_count)
+
+    out.write("# BIRD Sample Summary\n\n")
+    out.write(f"- **Split:** `{options.split}`\n")
+    out.write(
+        f"- **Sampled:** {summary.sampled_count} "
+        f"(requested {summary.requested_count}, seed={summary.seed})\n"
+    )
+    out.write(f"- **Output directory:** `{output_dir}`\n\n")
+
+    eq_count = summary.verdict_counts.get(Verdict.equivalent, 0)
+    exec_match = summary.execution_counts.get(ExecutionStatus.match, 0)
+    out.write("## Headline rates\n\n")
+    out.write(
+        f"- **Logically equivalent (cvc5):** "
+        f"{eq_count} / {summary.sampled_count} "
+        f"({_pct(eq_count, n)})\n"
+    )
+    out.write(
+        f"- **Execution-equivalent (set match):** "
+        f"{exec_match} / {summary.sampled_count} "
+        f"({_pct(exec_match, n)})\n"
+    )
+    out.write(
+        f"- **Multiset match (strict superset of set match):** "
+        f"{summary.multiset_match_count} / {summary.sampled_count} "
+        f"({_pct(summary.multiset_match_count, n)})\n\n"
+    )
+
+    # --- Disagreement cells: linked ID lists ---------------------------
+    out.write("## Disagreement cells\n\n")
+    yes_no = _ids_in_disagreement(
+        summary, logical=Verdict.equivalent,
+        exec_status=ExecutionStatus.mismatch,
+    )
+    no_yes = _ids_in_disagreement(
+        summary, logical=Verdict.not_equivalent,
+        exec_status=ExecutionStatus.match,
+    )
+    out.write(
+        f"- **logical=yes, exec=no:** {len(yes_no)}"
+    )
+    if yes_no:
+        out.write(": " + _format_id_links(yes_no))
+    out.write("\n")
+    out.write(
+        f"- **logical=no, exec=yes:** {len(no_yes)}"
+    )
+    if no_yes:
+        out.write(": " + _format_id_links(no_yes))
+    out.write("\n\n")
+
+    # --- Verdict breakdown ---------------------------------------------
+    out.write("## Verdict breakdown\n\n")
+    for verdict in Verdict:
+        ids = _ids_for_verdict(summary, verdict)
+        c = len(ids)
+        if c:
+            out.write(
+                f"### `{verdict.value}` — {c} ({_pct(c, n)})\n\n"
+            )
+            out.write(_format_id_links(ids) + "\n\n")
+
+    # --- Execution-status breakdown ------------------------------------
+    out.write("## Execution-status breakdown\n\n")
+    for status in ExecutionStatus:
+        ids = _ids_for_exec_status(summary, status)
+        c = len(ids)
+        if c:
+            out.write(
+                f"### `{status.value}` — {c} ({_pct(c, n)})\n\n"
+            )
+            out.write(_format_id_links(ids) + "\n\n")
+
+    out.flush()
+
+
+def _ids_for_verdict(summary: SampleSummary, verdict: Verdict) -> list[str]:
+    """Return the Test_Case_IDs whose ``reported_verdict`` is ``verdict``,
+    in sample order.
+    """
+
+    return [
+        r.test_case_id
+        for r in summary.results
+        if r.reported_verdict == verdict
+    ]
+
+
+def _ids_for_exec_status(
+    summary: SampleSummary, status: ExecutionStatus
+) -> list[str]:
+    """Return the Test_Case_IDs whose execution status matches, in sample order.
+
+    Cases without an ``execution`` block (the framework was run with
+    ``execution_check=False``) all fall under ``ExecutionStatus.skipped``
+    so the totals still equal ``sampled_count``.
+    """
+
+    out: list[str] = []
+    for r in summary.results:
+        if r.execution is None:
+            if status == ExecutionStatus.skipped:
+                out.append(r.test_case_id)
+            continue
+        if r.execution.status == status:
+            out.append(r.test_case_id)
+    return out
+
+
+def _ids_in_disagreement(
+    summary: SampleSummary,
+    *,
+    logical: Verdict,
+    exec_status: ExecutionStatus,
+) -> list[str]:
+    """Return the Test_Case_IDs in a specific (logical, exec) cell."""
+
+    out: list[str] = []
+    for r in summary.results:
+        if r.execution is None:
+            continue
+        if r.underlying_verdict == logical and r.execution.status == exec_status:
+            out.append(r.test_case_id)
+    return out
+
+
+def _format_id_links(ids: list[str]) -> str:
+    """Render ``ids`` as a comma-separated list of ``[id](./id.md)`` links.
+
+    The operator opens the summary in a markdown viewer (or just a
+    text editor) and can click straight through to a case file.
+    """
+
+    return ", ".join(f"[{tid}](./{tid}.md)" for tid in ids)
+
+
+def _serialize_sample_summary(
+    summary: SampleSummary, *, options: RunOptions
+) -> dict[str, Any]:
+    """Convert ``summary`` into the JSON shape written to ``summary.json``.
+
+    Contains the headline numbers, the disagreement cells with ID
+    lists, and a per-bucket ID list under each verdict and execution
+    status. Unlike the markdown summary, this is meant for scripts /
+    dashboards — the IDs are bare strings, not linked.
+    """
+
+    n = max(1, summary.sampled_count)
+    eq = summary.verdict_counts.get(Verdict.equivalent, 0)
+    em = summary.execution_counts.get(ExecutionStatus.match, 0)
+
+    verdict_breakdown: dict[str, dict[str, Any]] = {}
+    for verdict in Verdict:
+        ids = _ids_for_verdict(summary, verdict)
+        verdict_breakdown[verdict.value] = {
+            "count": len(ids),
+            "ids": ids,
+        }
+
+    exec_breakdown: dict[str, dict[str, Any]] = {}
+    for status in ExecutionStatus:
+        ids = _ids_for_exec_status(summary, status)
+        exec_breakdown[status.value] = {
+            "count": len(ids),
+            "ids": ids,
+        }
+
+    yes_no = _ids_in_disagreement(
+        summary, logical=Verdict.equivalent,
+        exec_status=ExecutionStatus.mismatch,
+    )
+    no_yes = _ids_in_disagreement(
+        summary, logical=Verdict.not_equivalent,
+        exec_status=ExecutionStatus.match,
+    )
+
+    return {
+        "split": options.split,
+        "seed": summary.seed,
+        "requested_count": summary.requested_count,
+        "sampled_count": summary.sampled_count,
+        "rates": {
+            "logical_equivalent": {
+                "count": eq,
+                "pct": _pct(eq, n),
+            },
+            "execution_match": {
+                "count": em,
+                "pct": _pct(em, n),
+            },
+            "multiset_match": {
+                "count": summary.multiset_match_count,
+                "pct": _pct(summary.multiset_match_count, n),
+            },
+        },
+        "disagreements": {
+            "logical_yes_exec_no": {
+                "count": len(yes_no),
+                "ids": yes_no,
+            },
+            "logical_no_exec_yes": {
+                "count": len(no_yes),
+                "ids": no_yes,
+            },
+        },
+        "verdict_breakdown": verdict_breakdown,
+        "execution_breakdown": exec_breakdown,
+        # Always include the ordered list of sampled IDs so a re-run
+        # with the same seed can be cross-checked even if the loader's
+        # ordering ever changes.
+        "sampled_ids": [r.test_case_id for r in summary.results],
+    }

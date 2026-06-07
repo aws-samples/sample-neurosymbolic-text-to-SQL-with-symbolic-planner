@@ -31,6 +31,7 @@ from text_to_sql_planner.types.operation_tree import (
     TableLeafNode,
 )
 from text_to_sql_planner.types.operators import (
+    AggregateParams,
     CartesianProductParams,
     DifferenceParams,
     DivisionParams,
@@ -122,6 +123,16 @@ def _build_operator_params(operator: str, params: dict) -> object:
         if not isinstance(raw_mapping, dict):
             return None
         return RenameParams(mapping=dict(raw_mapping))
+    elif operator == "aggregate":
+        # Aggregate params carry just the function name and the
+        # underlying column. Validation lives in ``apply_aggregate``;
+        # we only build the dataclass here. Return ``None`` for
+        # malformed input so the planner can retry with the LLM.
+        function = params.get("function")
+        column = params.get("column")
+        if not isinstance(function, str) or not isinstance(column, str):
+            return None
+        return AggregateParams(function=function, column=column)
     return None
 
 
