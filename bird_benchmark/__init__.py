@@ -20,11 +20,20 @@ from bird_benchmark.installer import (
     install_split,
 )
 from bird_benchmark.loader import BirdLoader, BirdLoadError
-from bird_benchmark.runner import SingleSelectorError, run_single, run_suite
+from bird_benchmark.runner import (
+    SingleSelectorError,
+    run_sample,
+    run_single,
+    run_suite,
+)
 from bird_benchmark.types import (
     ConverterError,
+    ExecutionResult,
+    ExecutionStatus,
+    ForeignKey,
     RunOptions,
     RunResult,
+    SampleSummary,
     SingleSelector,
     TestCase,
     Verdict,
@@ -34,16 +43,21 @@ __all__ = [
     "BirdLoader",
     "BirdLoadError",
     "ConverterError",
+    "ExecutionResult",
+    "ExecutionStatus",
     "ExpectedFailLoadError",
+    "ForeignKey",
     "InstallError",
     "InstallReport",
     "RunOptions",
     "RunResult",
+    "SampleSummary",
     "SingleSelector",
     "SingleSelectorError",
     "TestCase",
     "Verdict",
     "install_split",
+    "run_sample",
     "run_single",
     "run_suite",
 ]

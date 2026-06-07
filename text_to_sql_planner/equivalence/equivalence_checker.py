@@ -219,6 +219,10 @@ async def check_equivalence(
     expr2: DRCExpression,
     config: EquivalenceCheckerConfig | None = None,
     schema_types: dict[str, str] | None = None,
+    axioms: list[str] | None = None,
+    label: str | None = None,
+    lhs_label: str | None = None,
+    rhs_label: str | None = None,
 ) -> EquivalenceResult:
     """Check if two DRC expressions are logically equivalent using cvc5.
 
@@ -228,31 +232,83 @@ async def check_equivalence(
 
     Args:
         schema_types: Optional dict mapping column_name -> "Int"|"String" from the DB schema.
+        axioms: Optional list of SMT-LIB assertion strings (each one a complete
+            ``(assert ...)`` form) to prepend to the equivalence script. The
+            equivalence proof then proceeds *under* these axioms — useful for
+            referential-integrity facts that the schema declares but the DRC
+            condition doesn't restate (e.g. every row in a child table has a
+            matching row in the parent). Each axiom must use the same predicate
+            symbols as the DRC sides, with the same per-position sort signature.
+        label: Optional human-readable description of *what* is being
+            compared, appended to the ``### cvc5 equivalence check`` banner
+            in the run log. The same function is called from two distinct
+            contexts ("planner relation vs target DRC" during planning and
+            "generated DRC vs gold DRC" during BIRD evaluation) and they
+            looked identical in the markdown trace; the label
+            disambiguates them. Defaults to no label (the bare banner) so
+            existing call sites are unaffected.
+        lhs_label / rhs_label: Optional short tags for the two DRC sides.
+            When supplied, ``Result:`` lines append a hint of the form
+            ``(LHS = generated, RHS = gold)`` and the SMT-LIB script gets
+            comment headers identifying each side. Useful when reading a
+            ``not_equivalent`` script after the fact: knowing which side
+            is which makes the difference immediately legible.
     """
     if config is None:
         config = EquivalenceCheckerConfig()
 
     from text_to_sql_planner.types.drc import ColumnVariable, AggregateVariable
 
+    # Helper: render the optional ``(LHS = generated, RHS = gold)``
+    # disambiguator. Empty string when neither side label was supplied
+    # so the existing log format stays clean.
+    sides_hint = ""
+    if lhs_label and rhs_label:
+        sides_hint = f" (LHS = {lhs_label}, RHS = {rhs_label})"
+
     # Early exit: if result variable counts differ, expressions can't be equivalent
     if len(expr1.result_variables) != len(expr2.result_variables):
-        print(f"\n> ⚡ **cvc5:** Arity mismatch ({len(expr1.result_variables)} vs {len(expr2.result_variables)}) → `not_equivalent` (skipped cvc5)\n")
+        print(
+            f"\n> ⚡ **cvc5:** Arity mismatch "
+            f"({len(expr1.result_variables)} vs {len(expr2.result_variables)})"
+            f"{sides_hint} → `not_equivalent` (skipped cvc5)\n"
+        )
         return NotEquivalentResult()
 
     # Early exit: result variable structure must match (column vs aggregate, function names)
     for rv1, rv2 in zip(expr1.result_variables, expr2.result_variables):
         if type(rv1) != type(rv2):
-            print(f"\n> ⚡ **cvc5:** Result variable type mismatch ({type(rv1).__name__} vs {type(rv2).__name__}) → `not_equivalent` (skipped cvc5)\n")
+            print(
+                f"\n> ⚡ **cvc5:** Result variable type mismatch "
+                f"({type(rv1).__name__} vs {type(rv2).__name__})"
+                f"{sides_hint} → `not_equivalent` (skipped cvc5)\n"
+            )
             return NotEquivalentResult()
         if isinstance(rv1, AggregateVariable) and isinstance(rv2, AggregateVariable):
             if rv1.function != rv2.function:
-                print(f"\n> ⚡ **cvc5:** Aggregate function mismatch ({rv1.function} vs {rv2.function}) → `not_equivalent` (skipped cvc5)\n")
+                print(
+                    f"\n> ⚡ **cvc5:** Aggregate function mismatch "
+                    f"({rv1.function} vs {rv2.function})"
+                    f"{sides_hint} → `not_equivalent` (skipped cvc5)\n"
+                )
                 return NotEquivalentResult()
 
-    print(f"\n### cvc5 equivalence check\n", flush=True)
+    banner = "### cvc5 equivalence check"
+    if label:
+        banner = f"{banner}: {label}"
+    print(f"\n{banner}\n", flush=True)
 
-    # Build the proper equivalence check script
-    script = _build_equivalence_script(expr1, expr2, schema_types=schema_types)
+    # Build the proper equivalence check script. When side labels were
+    # supplied, prepend each side's assertion in the script with a
+    # comment line so the reader can tell at a glance which formula is
+    # which when investigating ``not_equivalent`` results.
+    script = _build_equivalence_script(
+        expr1, expr2,
+        schema_types=schema_types,
+        axioms=axioms,
+        lhs_label=lhs_label,
+        rhs_label=rhs_label,
+    )
 
     print(f"#### SMT-LIB script ({len(script)} chars)\n")
     print(f"```smt2\n{_indent_smt(script)}\n```\n")
@@ -263,12 +319,19 @@ async def check_equivalence(
 
     status_icon = "✅" if result.status == "equivalent" else "❌" if result.status == "not_equivalent" else "⚠️"
     reason_str = f" — {result.reason}" if hasattr(result, 'reason') and result.reason else ""
-    print(f"**Result:** {status_icon} `{result.status}`{reason_str}\n")
+    print(f"**Result:** {status_icon} `{result.status}`{sides_hint}{reason_str}\n")
 
     return result
 
 
-def _build_equivalence_script(expr1: DRCExpression, expr2: DRCExpression, schema_types: dict[str, str] | None = None) -> str:
+def _build_equivalence_script(
+    expr1: DRCExpression,
+    expr2: DRCExpression,
+    schema_types: dict[str, str] | None = None,
+    axioms: list[str] | None = None,
+    lhs_label: str | None = None,
+    rhs_label: str | None = None,
+) -> str:
     """Build SMT-LIB script to check equivalence of two DRC expressions.
 
     For ``{x1,...,xn | C1}`` and ``{y1,...,yn | C2}`` we check::
@@ -412,9 +475,31 @@ def _build_equivalence_script(expr1: DRCExpression, expr2: DRCExpression, schema
         bindings = " ".join(
             f"({name} {_shared_sort(i)})" for i, name in enumerate(shared_names)
         )
-        lines.append(f"(assert (not (forall ({bindings}) (= {formula1} {formula2}))))")
+        equivalence_assert = (
+            f"(assert (not (forall ({bindings}) (= {formula1} {formula2}))))"
+        )
     else:
-        lines.append(f"(assert (not (= {formula1} {formula2})))")
+        equivalence_assert = f"(assert (not (= {formula1} {formula2})))"
+
+    # Inject any caller-supplied axioms BEFORE the negated equivalence
+    # assertion. Standard SMT-LIB semantics: the solver looks for a
+    # model that satisfies every assertion, so axioms here become
+    # facts the equivalence proof gets to assume. The runner uses
+    # this for foreign-key referential-integrity axioms.
+    if axioms:
+        for axiom in axioms:
+            lines.append(axiom)
+
+    # When the caller named the two sides, drop a comment above the
+    # equivalence assertion that maps "first formula" -> LHS and
+    # "second formula" -> RHS. SMT-LIB semicolon comments are
+    # stripped by cvc5; humans investigating a ``not_equivalent``
+    # script see them.
+    if lhs_label and rhs_label:
+        lines.append(
+            f";; (= LHS RHS)  --  LHS = {lhs_label}, RHS = {rhs_label}"
+        )
+    lines.append(equivalence_assert)
 
     lines.append("(check-sat)")
     return "\n".join(lines)

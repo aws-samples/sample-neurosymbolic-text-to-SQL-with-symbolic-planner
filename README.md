@@ -144,7 +144,7 @@ uv run python examples/example3.py
 ### Tests
 
 ```bash
-uv run pytest tests/ -q          # 521 tests, no external services needed
+uv run pytest tests/ -q          # 603 tests, no external services needed
 uv run pytest tests/unit -v      # unit suite only
 ```
 
@@ -343,7 +343,7 @@ text_to_sql_planner/
 bird_benchmark/                   # standalone BIRD benchmark harness (see below)
 
 tests/
-├── unit/                         # 521 fast tests, mocks LLM and cvc5
+├── unit/                         # 603 fast tests, mocks LLM and cvc5
 └── ...
 
 examples/                         # end-to-end smoke runs
@@ -514,7 +514,7 @@ using it with this framework requires either flattening it into the
 expected layout or extending the loader; not currently supported
 out of the box.
 
-### Two execution modes
+### Three execution modes
 
 Single-test mode for fast iteration on a specific Test_Case:
 
@@ -588,6 +588,40 @@ uv run python -m bird_benchmark suite \
   --resume
 ```
 
+Sample mode for a deterministic random-N diagnostic run, with both
+the cvc5 logical-equivalence rate and the SQLite execution-
+equivalence rate reported in the aggregate summary:
+
+```bash
+uv run python -m bird_benchmark sample \
+  --bird-root /path/to/bird/download \
+  --split dev \
+  --count 50 \
+  --seed 42
+```
+
+The seed is required so two runs with the same split + count + seed
+produce the same selection — without that you can't tell apart "my
+code got better" from "I sampled different cases this time". The
+output is one full per-Test_Case block (BIRD context + planner
+transcript + Run_Result JSON) per case, followed by a `# Sample
+Summary` section with:
+
+- Logically equivalent (cvc5) rate
+- Execution-equivalent (set match) rate — BIRD's official metric
+- Multiset match rate — strictly stricter; catches duplicate-count bugs
+- The two **disagreement cells**: how many cases had `logical=yes,
+  exec=no` and `logical=no, exec=yes`. The latter is the most useful
+  diagnostic — it surfaces over-specified BIRD gold queries (extra
+  joins on declared-but-not-enforced FKs, redundant filters) where
+  both queries return the same rows on BIRD's snapshot
+- Per-verdict and per-execution-status breakdowns
+
+Optional `--report-json PATH` / `--report-md PATH` flags write the
+same reports `suite` produces. By default no report files are written
+— the aggregate summary on stdout is usually enough for an ad-hoc
+diagnostic run.
+
 Common options on both subcommands:
 
 | Flag                    | Purpose                                                                 |
@@ -596,6 +630,39 @@ Common options on both subcommands:
 | `--cvc5-timeout SECONDS`| Per-equivalence-check cvc5 timeout, integer seconds in [1, 3600] (default 30) |
 | `--per-test-timeout SECONDS` | Per-Test_Case planner wall-clock budget, integer seconds in [1, 3600] (default 60) |
 | `--expected-fail PATH`  | File with one Test_Case_ID per line; listed Test_Cases whose verdict isn't `equivalent` are reported as `expected_fail` |
+| `--no-execution-check`  | Skip running the generated and gold SQL against the BIRD SQLite DB. By default both checks run; the report shows `match` / `mismatch` next to the cvc5 verdict so an over-specified gold (logical: not_equivalent, exec: match) is easy to spot |
+| `--exec-timeout SECONDS`| Per-query wall-clock budget for the execution check (default 30) |
+
+### Dual equivalence check
+
+Each Test_Case is evaluated two ways and both signals are reported:
+
+1. **Logical equivalence** via cvc5 over the generated and gold DRC.
+   This is a proof over *every* possible database state — `unsat` ⇒
+   the queries cannot disagree on any input. Strong but strict:
+   declared-but-not-enforced foreign-key joins, redundant filters,
+   and other "vacuous on this database" patterns get flagged as
+   not-equivalent.
+2. **Execution equivalence** by running both queries against the
+   per-Test_Case SQLite database and comparing result sets. This is
+   what BIRD's official leaderboard does. Tracks the same database
+   the public leaderboard does, so framework numbers can be
+   compared head-to-head.
+
+The two signals are complementary, not redundant. When they agree
+you have both a proof and an observation. When they disagree —
+typically logical:`not_equivalent`, execution:`match` — the gold
+query is over-specified relative to the database snapshot, which is
+itself the most useful diagnostic.
+
+The execution result records both **set equality** (BIRD's official
+metric) and **multiset equality** (strictly stricter — catches
+duplicate-count bugs). Per-query timeout, read-only DB access, and
+graceful handling of malformed SQL are built in; the execution
+status is one of `match`, `mismatch`, `generated_error`,
+`gold_error`, `timeout`, `db_unavailable`, or `skipped`. Use
+`--no-execution-check` to skip this entirely (e.g. when the SQLite
+files aren't installed).
 
 ### The SQL→DRC converter
 
@@ -658,7 +725,7 @@ asyncio.run(main())
 bird_benchmark/
 ├── __init__.py                   # public surface: run_single, run_suite, types
 ├── __main__.py                   # python -m bird_benchmark entry point
-├── cli.py                        # argparse + dispatch (single / suite / install / list)
+├── cli.py                        # argparse + dispatch (single / suite / sample / install / list)
 ├── types.py                      # Verdict, TestCase, RunResult, RunOptions, SuiteSummary
 ├── loader.py                     # BIRD JSON + per-database SQLite reader
 ├── installer.py                  # download + extract + normalize for ``install`` subcommand

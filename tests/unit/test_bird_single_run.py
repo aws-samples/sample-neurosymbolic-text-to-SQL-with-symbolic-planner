@@ -140,6 +140,28 @@ def _equivalence_returning(result):
     return _check
 
 
+def _extract_run_result_json(output: str) -> dict:
+    """Parse the JSON object inside the trailing ``# Run_Result`` block.
+
+    Single-mode now wraps its summary in a fenced ``json`` code block
+    under a ``# Run_Result`` heading so operators can read the
+    multi-line payload alongside the gold/generated SQL. The JSON is
+    still standard so machine consumers can extract it; this helper
+    pulls it back out for the assertions.
+    """
+    import json as _json
+
+    marker = "# Run_Result"
+    idx = output.find(marker)
+    assert idx != -1, f"missing '{marker}' header in output"
+    fence_start = output.find("```json", idx)
+    assert fence_start != -1, f"missing '```json' fence after {marker!r}"
+    body_start = output.find("\n", fence_start) + 1
+    fence_end = output.find("```", body_start)
+    assert fence_end != -1, "JSON block was not closed"
+    return _json.loads(output[body_start:fence_end])
+
+
 # --- Selector validation ----------------------------------------------
 
 
@@ -247,11 +269,22 @@ async def test_run_single_unique_match_runs_and_prints_json():
     assert result.test_case_id == "dev_1"
     assert result.reported_verdict == Verdict.equivalent
 
-    # The JSON serialisation must include the Test_Case_ID, generated SQL,
-    # gold SQL, and Verdict per Req 7.3. SMT_Script is None for an
-    # equivalent verdict and is therefore expected as JSON null.
-    line = stdout.getvalue().strip()
-    payload = json.loads(line)
+    output = stdout.getvalue()
+
+    # The single-mode output now starts with a BIRD context banner so
+    # an operator can see the question and gold SQL up front before
+    # the planner transcript scrolls past.
+    assert "# BIRD Test_Case" in output
+    assert "- **Test_Case_ID:** `dev_1`" in output
+    assert "- **Question:** How many people are there?" in output
+    assert "```sql" in output
+    assert "SELECT COUNT(*) FROM people;" in output
+
+    # The final ``# Run_Result`` block is a fenced JSON document.
+    # Per Req 7.3 it must include the Test_Case_ID, generated SQL,
+    # gold SQL, and Verdict. SMT_Script is None for an equivalent
+    # verdict and is therefore expected as JSON null.
+    payload = _extract_run_result_json(output)
     assert payload["test_case_id"] == "dev_1"
     assert payload["reported_verdict"] == "equivalent"
     assert payload["generated_sql"] == "SELECT id FROM people;"

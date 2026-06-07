@@ -151,15 +151,59 @@ def _collect_relation_sorts(
     var_types: dict[str, str],
     rel_sorts: dict[str, list[str]],
 ) -> None:
-    """Collect the sort signature for each relation based on variable types at membership sites."""
+    """Collect the sort signature for each relation based on variable types at membership sites.
+
+    Per-position unification semantics
+    -----------------------------------
+
+    The same predicate can appear with different arities at different
+    membership sites — e.g. a projection-style ``(in (a b) T)`` followed
+    by a full-row ``(in (v1 v2 v3 v4) T)``. Both are valid uses of
+    ``T`` (one consumer ignored some columns), but they let us see the
+    sort of different positions.
+
+    We unify across sites with three rules:
+
+    1. The signature length is the *maximum* arity seen — that way
+       full-row sites get a complete signature and short sites' info
+       still applies to the prefix positions.
+    2. Per position, ``String`` wins over ``Int`` when both are
+       observed: a column whose value gets compared to a string
+       literal anywhere in the query has to be declared ``String`` or
+       cvc5 rejects the predicate call with a sort error.
+    3. Positions only observed at one site (because they're past the
+       end of a shorter site's tuple) take that site's sort.
+
+    The previous "longest list wins" rule lost rule 2: a 9-arg
+    membership of all-``Int`` would silently overwrite a 4-arg
+    membership whose first two slots had been resolved to ``String``
+    by literal-comparison inference. That's the bug behind dev_1519's
+    ``cvc5(...) exited with code 1`` failure.
+    """
     if node is None:
         return
 
     if isinstance(node, MembershipNode):
-        sorts = [var_types.get(v, "Int") for v in node.variables]
-        # Keep the longest (most complete) sort list for each relation
-        if node.relation not in rel_sorts or len(sorts) > len(rel_sorts[node.relation]):
-            rel_sorts[node.relation] = sorts
+        site_sorts = [var_types.get(v, "Int") for v in node.variables]
+        existing = rel_sorts.get(node.relation)
+        if existing is None:
+            rel_sorts[node.relation] = site_sorts
+        else:
+            # Per-position unification with String-wins semantics.
+            unified_len = max(len(existing), len(site_sorts))
+            unified: list[str] = []
+            for i in range(unified_len):
+                left = existing[i] if i < len(existing) else None
+                right = site_sorts[i] if i < len(site_sorts) else None
+                if left is None:
+                    unified.append(right or "Int")
+                elif right is None:
+                    unified.append(left)
+                elif left == "String" or right == "String":
+                    unified.append("String")
+                else:
+                    unified.append(left)
+            rel_sorts[node.relation] = unified
 
     elif isinstance(node, LogicalConnectiveNode):
         _collect_relation_sorts(node.left, var_types, rel_sorts)

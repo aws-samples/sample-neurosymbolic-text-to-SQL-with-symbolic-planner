@@ -78,6 +78,7 @@ from bird_benchmark.loader import BirdLoader, BirdLoaderConfig, BirdLoadError
 from bird_benchmark.manifest import ManifestParseError
 from bird_benchmark.runner import (
     SingleSelectorError,
+    run_sample,
     run_single,
     run_suite,
 )
@@ -219,6 +220,30 @@ def _build_parser() -> argparse.ArgumentParser:
             "no list."
         ),
     )
+    common.add_argument(
+        "--no-execution-check",
+        dest="execution_check",
+        action="store_false",
+        default=True,
+        help=(
+            "Skip running the generated and gold SQL against the BIRD "
+            "SQLite database. By default the framework records both "
+            "the cvc5 verdict and the executed-row-set verdict so the "
+            "report can show their (dis)agreement."
+        ),
+    )
+    common.add_argument(
+        "--exec-timeout",
+        type=_timeout_int,
+        default=30,
+        metavar="SECONDS",
+        help=(
+            "Per-query timeout for the execution check, integer "
+            f"seconds in [{_TIMEOUT_MIN_SECONDS}, {_TIMEOUT_MAX_SECONDS}] "
+            "(default: 30). Independent of --cvc5-timeout — the two "
+            "checks are unrelated work."
+        ),
+    )
 
     # --- single subcommand -------------------------------------------
     single = subparsers.add_parser(
@@ -305,6 +330,69 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Path to the markdown report written at suite end "
             f"(default: {_DEFAULT_REPORT_MD_PATH})."
+        ),
+    )
+
+    # --- sample subcommand -------------------------------------------
+    sample = subparsers.add_parser(
+        "sample",
+        parents=[common],
+        help="Run a deterministic random sample of N Test_Cases from a split.",
+        description=(
+            "Draw N Test_Cases from the requested split using a "
+            "user-supplied seed and run each one through the same "
+            "pipeline ``single`` uses. After every Test_Case has run, "
+            "an aggregate summary reports both the cvc5 logical-"
+            "equivalence rate and the SQLite execution-equivalence "
+            "rate, plus the cells where the two signals disagree. "
+            "Useful for diagnostic runs where the full suite is too "
+            "slow but a hand-picked single case is too narrow."
+        ),
+    )
+    sample.add_argument(
+        "--count",
+        required=True,
+        type=int,
+        metavar="N",
+        help=(
+            "Number of Test_Cases to sample. When the split has "
+            "fewer eligible Test_Cases than N the sampler runs "
+            "every eligible record once."
+        ),
+    )
+    sample.add_argument(
+        "--seed",
+        required=True,
+        type=int,
+        metavar="N",
+        help=(
+            "PRNG seed used to draw the sample. Required so two "
+            "runs with the same split + count + seed produce the "
+            "same selection — without that you cannot tell apart "
+            "\"my code got better\" from \"I sampled different "
+            "cases this time\"."
+        ),
+    )
+    sample.add_argument(
+        "--report-json",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Optional path to write a JSON report of the sample. "
+            "Defaults to no report — sampling is meant for ad-hoc "
+            "diagnostic runs and the aggregate summary printed to "
+            "stdout is usually enough."
+        ),
+    )
+    sample.add_argument(
+        "--report-md",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Optional path to write a markdown report of the sample. "
+            "Defaults to no report."
         ),
     )
 
@@ -468,10 +556,17 @@ def _options_from_args(args: argparse.Namespace) -> RunOptions:
         per_test_timeout_seconds=args.per_test_timeout,
         expected_fail_path=args.expected_fail,
         cvc5_path=args.cvc5_path,
+        execution_check=args.execution_check,
+        execution_timeout_seconds=args.exec_timeout,
     )
     if args.mode == "suite":
         options.manifest_path = args.manifest
         options.resume = args.resume
+        options.report_json_path = args.report_json
+        options.report_md_path = args.report_md
+    elif args.mode == "sample":
+        # Sample mode reuses the same RunOptions report fields but
+        # defaults to ``None`` (no report) — the operator opts in.
         options.report_json_path = args.report_json
         options.report_md_path = args.report_md
     return options
@@ -542,6 +637,45 @@ def _run_suite(args: argparse.Namespace, stderr: TextIO) -> int:
         # only to surface the failure as a non-zero exit so wrapper
         # scripts can distinguish a successful report write from a
         # silently-broken one.
+        return EXIT_REPORT_WRITE_ERROR
+    return EXIT_OK
+
+
+def _run_sample(
+    args: argparse.Namespace, stdout: TextIO, stderr: TextIO
+) -> int:
+    """Dispatch the ``sample`` subcommand. Returns the integer exit code.
+
+    Sample mode shares the same error surface as ``suite`` for
+    config / load failures (``EXIT_CONFIG_ERROR``) and report-write
+    failures (``EXIT_REPORT_WRITE_ERROR``). The
+    :class:`ValueError`-based validation of ``--count`` / ``--seed``
+    inside :func:`run_sample` also lands in ``EXIT_CONFIG_ERROR``;
+    invalid integers caught by argparse already exit ``2`` via
+    argparse's own error path.
+    """
+
+    options = _options_from_args(args)
+    try:
+        summary = asyncio.run(
+            run_sample(
+                options,
+                count=args.count,
+                seed=args.seed,
+                stdout=stdout,
+                stderr=stderr,
+            )
+        )
+    except ValueError as exc:
+        _print_error(str(exc), stderr)
+        return EXIT_CONFIG_ERROR
+    except ExpectedFailLoadError as exc:
+        _print_error(str(exc), stderr)
+        return EXIT_CONFIG_ERROR
+    except BirdLoadError as exc:
+        _print_error(str(exc), stderr)
+        return EXIT_CONFIG_ERROR
+    if summary.failed_to_write_report:
         return EXIT_REPORT_WRITE_ERROR
     return EXIT_OK
 
@@ -760,6 +894,8 @@ def main(
         return _run_install(args, out, err)
     if args.mode == "list":
         return _run_list(args, out, err)
+    if args.mode == "sample":
+        return _run_sample(args, out, err)
 
     # ``required=True`` on the subparser group makes this branch
     # unreachable, but defensively returning a non-zero exit keeps the

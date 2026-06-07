@@ -60,11 +60,34 @@ through public symbols. This module imports ``main.run``,
 ``equivalence.check_equivalence``, ``equivalence.EquivalenceCheckerConfig``
 (all enumerated in the allow-list), ``equivalence.convert_to_smt``
 (needed to render the captured ``smt_script``; see ``_build_smt_script``
-below), the public DRC type ``DRCExpression`` and the public helper
+below), ``converter.table_converter.convert_tables`` (used by
+:func:`_schema_types_from_test_case` to derive a ``{column: "String"}``
+map for SMT type unification — see "Schema-driven SMT typing" below),
+the public DRC type ``DRCExpression`` and the public helper
 ``query_inner_drc`` from ``types.drc``. The :class:`EquivalenceResult`
 union members are *not* imported: the runner dispatches on the public
 ``result.status`` literal field instead, so the result-class identities
 stay an implementation detail of the equivalence checker.
+
+Schema-driven SMT typing
+------------------------
+
+When the equivalence checker compares the generated DRC against the
+gold DRC, both sides reference the same predicate symbols (the
+table names) but each side's column-type inference is local to its
+own DRC. If the same column appears in both DRCs but with different
+inferred sorts — e.g. one side constrains it to a string literal and
+the other doesn't — the merged equivalence script declares
+``transactions_1k`` once and emits ``Int``/``String`` argument
+constants that disagree with that signature, and cvc5 exits with a
+sort error before solving.
+
+To prevent this, the runner derives a ``{column_name: "String"}``
+dictionary from the per-Test_Case ``CREATE TABLE`` schema (the same
+parser the planner uses, so the typing rule can't drift) and threads
+it through to the equivalence checker. The checker uses it to override
+local sort inference with the schema's declared types, so both DRCs
+emit constants whose sorts match the merged predicate signature.
 """
 
 from __future__ import annotations
@@ -82,6 +105,11 @@ from text_to_sql_planner.equivalence import (
     check_equivalence as _default_check_equivalence,
     convert_to_smt,
 )
+from text_to_sql_planner.converter.table_converter import (
+    TableConversionFailure,
+    TableConversionSuccess,
+    convert_tables,
+)
 from text_to_sql_planner.main import (
     TextToSQLFailure,
     TextToSQLSuccess,
@@ -90,6 +118,7 @@ from text_to_sql_planner.main import (
 from text_to_sql_planner.types.drc import DRCExpression, query_inner_drc
 
 from bird_benchmark.evidence import forward_call
+from bird_benchmark.exec_eq import compare_executions
 from bird_benchmark.expected_fail import (
     ExpectedFailLoadError,
     detect_stale,
@@ -104,8 +133,11 @@ from bird_benchmark.report import (
 from bird_benchmark.sql_to_drc import convert_sql as _default_convert_sql
 from bird_benchmark.types import (
     ConverterError,
+    ExecutionResult,
+    ExecutionStatus,
     RunOptions,
     RunResult,
+    SampleSummary,
     SingleSelector,
     SkippedTestCase,
     SuiteSummary,
@@ -319,6 +351,193 @@ def _truncate_to_gold_arity(
     return truncated
 
 
+def _schema_types_from_test_case(test_case: TestCase) -> dict[str, str]:
+    """Return a ``{column_name: "String"}`` dict for ``test_case.schema``.
+
+    The equivalence checker accepts a ``schema_types`` dict that
+    overrides per-DRC sort inference with the schema's declared
+    types (only ``"String"`` overrides matter — anything else
+    defaults to ``Int`` in the SMT layer). Without this, the
+    generated DRC and the gold DRC can locally infer different
+    sorts for the same column position; the merged equivalence
+    script then declares the table predicate once with one
+    signature but the two sides emit constants with mismatched
+    sorts, and cvc5 rejects the script before solving.
+
+    The runner derives the dict from ``test_case.schema`` (the
+    joined ``CREATE TABLE`` statements the loader already
+    produced) using the same parser the planner uses so the
+    typing rule can't drift between the two pipelines. A schema
+    that fails to parse yields an empty dict; the checker then
+    falls back to per-DRC sort inference, which is the
+    pre-existing behaviour and is correct for any Test_Case
+    where both sides happen to agree on column sorts.
+    """
+
+    if not test_case.schema:
+        return {}
+    result = convert_tables(test_case.schema)
+    if isinstance(result, TableConversionFailure):
+        return {}
+    if not isinstance(result, TableConversionSuccess):
+        return {}
+    schema_types: dict[str, str] = {}
+    for relation in result.relations:
+        for column, declared_type in relation.column_types.items():
+            # Only ``"String"`` overrides matter to the equivalence
+            # checker; ``"Int"`` is the default. If the same column
+            # name appears in two tables with different declared
+            # types, the union takes ``"String"`` so the checker
+            # never under-declares a string column.
+            if declared_type == "String":
+                schema_types[column] = "String"
+    return schema_types
+
+
+def _fk_axioms_from_test_case(test_case: TestCase) -> list[str]:
+    """Render BIRD's declared foreign keys as SMT-LIB ``(assert (forall ...))``.
+
+    For each declared FK ``T1.c -> T2.k`` we emit the axiom
+
+    .. code-block:: smt2
+
+        (assert (forall ((x_T1_col_0 SortT1_0) ... (x_T1_col_N SortT1_N))
+          (=> (T1 x_T1_col_0 ... x_T1_col_N)
+              (exists ((y_T2_col_j SortT2_j) ...)
+                (T2 y_T2_col_0 ... y_T2_col_M)))))
+
+    where the existentially-quantified ``y_T2_col_*`` covers every
+    position of ``T2`` *except* the FK position, which is replaced
+    by ``x_T1_col_<from>`` so the FK constraint is what links the
+    two predicate calls.
+
+    The axiom states "every row of ``T1`` has a matching row in
+    ``T2``" — exactly the referential-integrity guarantee that
+    SQL's ``REFERENCES`` clause promises but the DRC condition
+    doesn't otherwise restate. With it in scope, cvc5 can prove
+    that ``SELECT ... FROM T1 INNER JOIN T2 ON T1.c = T2.k`` is
+    equivalent to the same query without the join when the join
+    contributes no extra filter, which is the BIRD gold-query
+    pattern this exists to handle.
+
+    Returns
+    -------
+    list[str]
+        One ``(assert ...)`` line per FK. Empty when the test case
+        has no FKs, or when the schema cannot be parsed (the
+        equivalence proof then runs without referential-integrity
+        assistance — the same fallback the runner already has for
+        missing schema types).
+
+    Per-position sorts come from the schema (parsed via the same
+    ``convert_tables`` helper :func:`_schema_types_from_test_case`
+    uses); columns absent from the schema map default to ``Int``,
+    matching the equivalence checker's own default.
+    """
+
+    if not test_case.foreign_keys or not test_case.schema:
+        return []
+    parsed = convert_tables(test_case.schema)
+    if not isinstance(parsed, TableConversionSuccess):
+        return []
+
+    # Index relations by lowercased table name so the FK metadata's
+    # casing (which BIRD pulls from sqlite_master and may disagree
+    # with the planner's parsed schema) doesn't cost us a match.
+    relations_by_name: dict[str, Any] = {
+        r.table_name.lower(): r for r in parsed.relations
+    }
+
+    axioms: list[str] = []
+    for fk in test_case.foreign_keys:
+        from_rel = relations_by_name.get(fk.from_table.lower())
+        to_rel = relations_by_name.get(fk.to_table.lower())
+        if from_rel is None or to_rel is None:
+            continue
+
+        # Locate the FK column positions, case-insensitively.
+        from_lower = [c.lower() for c in from_rel.columns]
+        to_lower = [c.lower() for c in to_rel.columns]
+        try:
+            from_idx = from_lower.index(fk.from_column.lower())
+            to_idx = to_lower.index(fk.to_column.lower())
+        except ValueError:
+            # Schema lists the table but not the column — skip.
+            continue
+
+        axiom = _build_fk_axiom(
+            from_table=from_rel.table_name,
+            from_columns=from_rel.columns,
+            from_types=from_rel.column_types,
+            from_idx=from_idx,
+            to_table=to_rel.table_name,
+            to_columns=to_rel.columns,
+            to_types=to_rel.column_types,
+            to_idx=to_idx,
+        )
+        axioms.append(axiom)
+    return axioms
+
+
+def _build_fk_axiom(
+    *,
+    from_table: str,
+    from_columns: list[str],
+    from_types: dict[str, str],
+    from_idx: int,
+    to_table: str,
+    to_columns: list[str],
+    to_types: dict[str, str],
+    to_idx: int,
+) -> str:
+    """Render a single FK as an SMT-LIB ``(assert (forall ...))`` axiom.
+
+    Variable names are mangled with the table name and column name so
+    the axiom can never accidentally collide with the equivalence
+    script's own constants. Sorts default to ``Int`` for any column
+    not in the type map, matching the equivalence checker's default.
+    """
+
+    def sort_for(types: dict[str, str], column: str) -> str:
+        return types.get(column, "Int")
+
+    # Variables for the universal: one per from_table column.
+    from_vars = [f"_fk_{from_table}_{col}" for col in from_columns]
+    from_bindings = " ".join(
+        f"({var} {sort_for(from_types, col)})"
+        for var, col in zip(from_vars, from_columns)
+    )
+
+    # Variables for the existential: one per to_table column EXCEPT
+    # the FK position, which is replaced by the from-side variable
+    # at ``from_idx``. This is the linkage that makes the axiom
+    # actually say "matching".
+    fk_var = from_vars[from_idx]
+    to_args: list[str] = []
+    to_existentials: list[tuple[str, str]] = []
+    for j, col in enumerate(to_columns):
+        if j == to_idx:
+            to_args.append(fk_var)
+        else:
+            var = f"_fk_{to_table}_{col}"
+            to_args.append(var)
+            to_existentials.append((var, sort_for(to_types, col)))
+
+    if to_existentials:
+        ex_bindings = " ".join(f"({v} {s})" for v, s in to_existentials)
+        consequent = (
+            f"(exists ({ex_bindings}) ({to_table} {' '.join(to_args)}))"
+        )
+    else:
+        consequent = f"({to_table} {' '.join(to_args)})"
+
+    antecedent = f"({from_table} {' '.join(from_vars)})"
+    return (
+        f"(assert (forall ({from_bindings}) "
+        f"(=> {antecedent} {consequent})))"
+    )
+
+
 def _apply_expected_fail(
     result: RunResult, expected_fail: set[str]
 ) -> RunResult:
@@ -342,6 +561,85 @@ def _apply_expected_fail(
     return result
 
 
+def _sqlite_path_for(test_case: TestCase, options: RunOptions) -> Path:
+    """Build the BIRD per-database SQLite path.
+
+    Mirrors ``BirdLoader._sqlite_path`` but takes the inputs the
+    runner already has (the test case and the options) so we don't
+    pass the loader through every dispatch frame. The convention is
+
+        {bird_root}/{split}/{split}_databases/{db_id}/{db_id}.sqlite
+
+    The runner's exec-eq step is responsible for handling a missing
+    file gracefully — :func:`bird_benchmark.exec_eq.compare_executions`
+    returns ``ExecutionStatus.db_unavailable`` in that case rather
+    than raising.
+    """
+
+    split = options.split
+    return (
+        options.bird_root
+        / split
+        / f"{split}_databases"
+        / test_case.db_id
+        / f"{test_case.db_id}.sqlite"
+    )
+
+
+def _finalize_with_execution(
+    test_case: TestCase,
+    options: RunOptions,
+    result: RunResult,
+    *,
+    exec_callable=None,
+) -> RunResult:
+    """Populate ``result.execution`` and return ``result``.
+
+    Called from every exit path of :func:`run_one` so the executed-
+    row-set verdict is recorded alongside the cvc5 verdict. Skips
+    cleanly when:
+
+    * ``options.execution_check`` is ``False`` (operator opted out).
+    * The result has no ``generated_sql`` (planner / converter
+      failure paths). The exec status is set to ``skipped`` so the
+      report can show "no exec data" instead of leaving the field
+      ``None``.
+
+    The default executor is :func:`compare_executions`; tests can
+    inject a fake via the ``exec_callable`` keyword so neither
+    the real SQLite database nor the real disk is touched.
+    """
+
+    if not options.execution_check:
+        return result
+
+    if not result.generated_sql or not result.gold_sql:
+        result.execution = ExecutionResult(
+            status=ExecutionStatus.skipped,
+            error="empty SQL on one or both sides",
+        )
+        return result
+
+    callable_ = exec_callable if exec_callable is not None else compare_executions
+    sqlite_path = _sqlite_path_for(test_case, options)
+    try:
+        result.execution = callable_(
+            sqlite_path=sqlite_path,
+            generated_sql=result.generated_sql,
+            gold_sql=result.gold_sql,
+            timeout_seconds=float(options.execution_timeout_seconds),
+        )
+    except Exception as exc:  # noqa: BLE001 - exec eq must never crash run_one
+        # ``compare_executions`` is designed to return error statuses
+        # rather than raise, but we belt-and-brace here so a bug in the
+        # exec layer can't bring down the whole suite.
+        result.execution = ExecutionResult(
+            status=ExecutionStatus.db_unavailable,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+    return result
+
+
 async def run_one(
     test_case: TestCase,
     options: RunOptions,
@@ -350,6 +648,7 @@ async def run_one(
     planner_callable: Callable[..., Awaitable[Any]] = _default_planner_run,
     convert_sql_callable: Callable[[str, str], Any] = _default_convert_sql,
     check_equivalence_callable: Callable[..., Awaitable[Any]] = _default_check_equivalence,
+    exec_callable: Callable[..., ExecutionResult] | None = None,
 ) -> RunResult:
     """Run one ``TestCase`` end-to-end and return a ``RunResult``.
 
@@ -422,15 +721,20 @@ async def run_one(
         # planner was running. Record planner_failed with the literal
         # reason ``planner_timeout`` so report consumers can filter
         # timeouts from other planner failures.
-        return _apply_expected_fail(
-            RunResult(
-                **base,
-                underlying_verdict=Verdict.planner_failed,
-                reported_verdict=Verdict.planner_failed,
-                reason=_truncate_reason("planner_timeout"),
-                error_code="planner_timeout",
+        return _finalize_with_execution(
+            test_case,
+            options,
+            _apply_expected_fail(
+                RunResult(
+                    **base,
+                    underlying_verdict=Verdict.planner_failed,
+                    reported_verdict=Verdict.planner_failed,
+                    reason=_truncate_reason("planner_timeout"),
+                    error_code="planner_timeout",
+                ),
+                expected_fail,
             ),
-            expected_fail,
+            exec_callable=exec_callable,
         )
     except Exception as exc:  # noqa: BLE001 - per-Test_Case isolation
         # The planner raised an unexpected exception (network glitch,
@@ -441,15 +745,20 @@ async def run_one(
         # driver's catch-all is only the safety net.
         code = type(exc).__name__
         message = _safe_message(str(exc))
-        return _apply_expected_fail(
-            RunResult(
-                **base,
-                underlying_verdict=Verdict.planner_failed,
-                reported_verdict=Verdict.planner_failed,
-                reason=_truncate_reason(f"{code}: {message}"),
-                error_code=code,
+        return _finalize_with_execution(
+            test_case,
+            options,
+            _apply_expected_fail(
+                RunResult(
+                    **base,
+                    underlying_verdict=Verdict.planner_failed,
+                    reported_verdict=Verdict.planner_failed,
+                    reason=_truncate_reason(f"{code}: {message}"),
+                    error_code=code,
+                ),
+                expected_fail,
             ),
-            expected_fail,
+            exec_callable=exec_callable,
         )
 
     if isinstance(planner_result, TextToSQLFailure):
@@ -459,15 +768,20 @@ async def run_one(
         # ``error_code`` field to make sense of the markdown.
         message = _safe_message(planner_result.error)
         code = _safe_code(planner_result.code)
-        return _apply_expected_fail(
-            RunResult(
-                **base,
-                underlying_verdict=Verdict.planner_failed,
-                reported_verdict=Verdict.planner_failed,
-                reason=_truncate_reason(f"{code}: {message}"),
-                error_code=code,
+        return _finalize_with_execution(
+            test_case,
+            options,
+            _apply_expected_fail(
+                RunResult(
+                    **base,
+                    underlying_verdict=Verdict.planner_failed,
+                    reported_verdict=Verdict.planner_failed,
+                    reason=_truncate_reason(f"{code}: {message}"),
+                    error_code=code,
+                ),
+                expected_fail,
             ),
-            expected_fail,
+            exec_callable=exec_callable,
         )
 
     if not isinstance(planner_result, TextToSQLSuccess):
@@ -479,15 +793,20 @@ async def run_one(
         message = _safe_message(
             f"unexpected planner result type: {type(planner_result).__name__}"
         )
-        return _apply_expected_fail(
-            RunResult(
-                **base,
-                underlying_verdict=Verdict.planner_failed,
-                reported_verdict=Verdict.planner_failed,
-                reason=_truncate_reason(f"{code}: {message}"),
-                error_code=code,
+        return _finalize_with_execution(
+            test_case,
+            options,
+            _apply_expected_fail(
+                RunResult(
+                    **base,
+                    underlying_verdict=Verdict.planner_failed,
+                    reported_verdict=Verdict.planner_failed,
+                    reason=_truncate_reason(f"{code}: {message}"),
+                    error_code=code,
+                ),
+                expected_fail,
             ),
-            expected_fail,
+            exec_callable=exec_callable,
         )
 
     generated_sql = planner_result.sql or ""
@@ -518,14 +837,19 @@ async def run_one(
             reason_text = f"{gold_query.feature}: {message}"
         else:
             reason_text = message
-        return _apply_expected_fail(
-            RunResult(
-                **base,
-                underlying_verdict=verdict,
-                reported_verdict=verdict,
-                reason=_truncate_reason(reason_text),
+        return _finalize_with_execution(
+            test_case,
+            options,
+            _apply_expected_fail(
+                RunResult(
+                    **base,
+                    underlying_verdict=verdict,
+                    reported_verdict=verdict,
+                    reason=_truncate_reason(reason_text),
+                ),
+                expected_fail,
             ),
-            expected_fail,
+            exec_callable=exec_callable,
         )
 
     # ``convert_sql`` may return a ``QueryExpression`` wrapped in
@@ -539,14 +863,19 @@ async def run_one(
         # node is not a ``DRCExpression``. Treat this as a
         # gold-conversion failure so the suite keeps running and the
         # reason names the offending type.
-        return _apply_expected_fail(
-            RunResult(
-                **base,
-                underlying_verdict=Verdict.gold_conversion_failure,
-                reported_verdict=Verdict.gold_conversion_failure,
-                reason=_truncate_reason(_safe_message(str(exc))),
+        return _finalize_with_execution(
+            test_case,
+            options,
+            _apply_expected_fail(
+                RunResult(
+                    **base,
+                    underlying_verdict=Verdict.gold_conversion_failure,
+                    reported_verdict=Verdict.gold_conversion_failure,
+                    reason=_truncate_reason(_safe_message(str(exc))),
+                ),
+                expected_fail,
             ),
-            expected_fail,
+            exec_callable=exec_callable,
         )
 
     # --- Step 4: Equivalence check -----------------------------------
@@ -554,8 +883,35 @@ async def run_one(
         timeout_seconds=options.cvc5_timeout_seconds,
         cvc5_path=options.cvc5_path,
     )
+    # Build the schema-types map from the BIRD ``CREATE TABLE``
+    # statements so cvc5 sees one consistent column sort for each
+    # predicate position across both sides of the equivalence script.
+    # See "Schema-driven SMT typing" in the module docstring.
+    schema_types = _schema_types_from_test_case(test_case)
+    # Render BIRD's declared foreign keys into SMT-LIB axioms so the
+    # equivalence proof can use referential-integrity facts. Empty
+    # when the test case has no FKs or when the schema can't be
+    # parsed; the equivalence call then runs unaffected.
+    fk_axioms = _fk_axioms_from_test_case(test_case)
+    # Surface a clear section header before the final equivalence
+    # check so the run log makes the boundary obvious between
+    # *planner-internal* equivalence checks (built relation vs target
+    # DRC) and the *suite-level* check that decides the verdict
+    # (generated DRC vs gold DRC). Without this, both checks share
+    # the same ``### cvc5 equivalence check`` banner and operators
+    # mis-read a final not_equivalent as a planner failure.
+    print(
+        "\n## BIRD final equivalence check\n\n"
+        "_Comparing the planner's generated DRC against the "
+        "gold DRC translated from BIRD's reference SQL._\n",
+        flush=True,
+    )
     eq_result = await check_equivalence_callable(
-        generated_drc, gold_drc, config
+        generated_drc, gold_drc, config,
+        schema_types=schema_types, axioms=fk_axioms,
+        label=f"BIRD final: generated DRC vs gold DRC ({test_case.test_case_id})",
+        lhs_label="generated",
+        rhs_label="gold",
     )
 
     # ---- BIRD-style projection-tolerance retry ----------------------
@@ -578,7 +934,14 @@ async def run_one(
         truncated = _truncate_to_gold_arity(generated_drc, gold_drc)
         if truncated is not None:
             retry_result = await check_equivalence_callable(
-                truncated, gold_drc, config
+                truncated, gold_drc, config,
+                schema_types=schema_types, axioms=fk_axioms,
+                label=(
+                    f"BIRD final retry: generated DRC truncated to gold's "
+                    f"arity vs gold DRC ({test_case.test_case_id})"
+                ),
+                lhs_label="generated (truncated)",
+                rhs_label="gold",
             )
             if getattr(retry_result, "status", None) == "equivalent":
                 # The retry replaces the original verdict so downstream
@@ -621,19 +984,26 @@ async def run_one(
             )
         )
 
-    return _apply_expected_fail(
-        RunResult(
-            **base,
-            underlying_verdict=verdict,
-            reported_verdict=verdict,
-            smt_script=smt_script,
-            reason=reason_text,
+    return _finalize_with_execution(
+        test_case,
+        options,
+        _apply_expected_fail(
+            RunResult(
+                **base,
+                underlying_verdict=verdict,
+                reported_verdict=verdict,
+                smt_script=smt_script,
+                reason=reason_text,
+            ),
+            expected_fail,
         ),
-        expected_fail,
+        exec_callable=exec_callable,
     )
 
 
-__all__ = ["run_one", "run_single", "run_suite", "SingleSelectorError"]
+__all__ = [
+    "run_one", "run_single", "run_suite", "run_sample", "SingleSelectorError",
+]
 
 
 # =====================================================================
@@ -785,6 +1155,7 @@ async def run_single(
     planner_callable: Callable[..., Awaitable[Any]] = _default_planner_run,
     convert_sql_callable: Callable[[str, str], Any] = _default_convert_sql,
     check_equivalence_callable: Callable[..., Awaitable[Any]] = _default_check_equivalence,
+    exec_callable: Callable[..., ExecutionResult] | None = None,
     loader_factory: Callable[[BirdLoaderConfig], BirdLoader] = BirdLoader,
 ) -> RunResult:
     """Run exactly one :class:`TestCase` selected by ``selector``.
@@ -830,6 +1201,10 @@ async def run_single(
         selector, options, loader_factory=loader_factory
     )
 
+    out = stdout if stdout is not None else sys.stdout
+
+    _write_bird_test_case_banner(out, test_case)
+
     result = await run_one(
         test_case,
         options,
@@ -837,15 +1212,51 @@ async def run_single(
         planner_callable=planner_callable,
         convert_sql_callable=convert_sql_callable,
         check_equivalence_callable=check_equivalence_callable,
+        exec_callable=exec_callable,
     )
 
-    out = stdout if stdout is not None else sys.stdout
-    payload = _serialize_run_result(result)
-    out.write(json.dumps(payload, default=_default_json_serializer))
-    out.write("\n")
-    out.flush()
+    _write_run_result_block(out, result)
 
     return result
+
+
+def _write_bird_test_case_banner(out: TextIO, test_case: TestCase) -> None:
+    """Print the ``# BIRD Test_Case`` header block for ``test_case``.
+
+    Surfaces the test_case_id, db_id, question, and gold SQL above
+    the planner / cvc5 transcripts so an operator scrolling through
+    the run log sees what the suite is comparing against without
+    having to scroll past the question converter's prompt.
+    """
+
+    out.write("\n# BIRD Test_Case\n\n")
+    out.write(f"- **Test_Case_ID:** `{test_case.test_case_id}`\n")
+    out.write(f"- **Database:** `{test_case.db_id}`\n")
+    out.write(f"- **Question:** {test_case.question}\n")
+    if test_case.evidence:
+        out.write(f"- **Evidence:** {test_case.evidence}\n")
+    out.write("\n**Gold SQL (from BIRD):**\n\n")
+    out.write("```sql\n")
+    out.write(test_case.gold_sql.rstrip())
+    out.write("\n```\n\n")
+    out.flush()
+
+
+def _write_run_result_block(out: TextIO, result: RunResult) -> None:
+    """Print the ``# Run_Result`` fenced JSON block for ``result``.
+
+    The JSON is indented for human readability — ``json.loads`` round
+    trips indented JSON fine, so machine consumers (tests, scripts)
+    are unaffected.
+    """
+
+    payload = _serialize_run_result(result)
+    out.write("\n# Run_Result\n\n```json\n")
+    out.write(
+        json.dumps(payload, default=_default_json_serializer, indent=2)
+    )
+    out.write("\n```\n")
+    out.flush()
 
 
 # =====================================================================
@@ -884,6 +1295,10 @@ def _make_skipped_run_result(skipped: SkippedTestCase) -> RunResult:
         smt_script=None,
         reason=_truncate_reason(_safe_message(skipped.reason)),
         error_code="",
+        execution=ExecutionResult(
+            status=ExecutionStatus.skipped,
+            error="loader skipped this record",
+        ),
     )
 
 
@@ -913,6 +1328,10 @@ def _make_unhandled_exception_run_result(
         smt_script=None,
         reason=_truncate_reason(f"{code}: {message}"),
         error_code=code,
+        execution=ExecutionResult(
+            status=ExecutionStatus.skipped,
+            error="run_one raised before producing SQL",
+        ),
     )
 
 
@@ -971,6 +1390,7 @@ async def run_suite(
     planner_callable: Callable[..., Awaitable[Any]] = _default_planner_run,
     convert_sql_callable: Callable[[str, str], Any] = _default_convert_sql,
     check_equivalence_callable: Callable[..., Awaitable[Any]] = _default_check_equivalence,
+    exec_callable: Callable[..., ExecutionResult] | None = None,
     loader_factory: Callable[[BirdLoaderConfig], BirdLoader] = BirdLoader,
     manifest_factory: Callable[[Path], Manifest] = Manifest.open_for_append,
     write_json_report: Callable[[list[RunResult], Path], None] = _default_write_json_report,
@@ -1102,6 +1522,7 @@ async def run_suite(
                         planner_callable=planner_callable,
                         convert_sql_callable=convert_sql_callable,
                         check_equivalence_callable=check_equivalence_callable,
+                        exec_callable=exec_callable,
                     )
                 except Exception as exc:  # noqa: BLE001 - per-Test_Case isolation
                     # Req 8.6: an unhandled exception from ``run_one``
@@ -1158,3 +1579,301 @@ async def run_suite(
         )
 
     return summary
+
+
+# =====================================================================
+# Sample_Run driver
+# =====================================================================
+
+
+async def run_sample(
+    options: RunOptions,
+    *,
+    count: int,
+    seed: int,
+    expected_fail: set[str] | None = None,
+    stdout: TextIO | None = None,
+    stderr: TextIO | None = None,
+    planner_callable: Callable[..., Awaitable[Any]] = _default_planner_run,
+    convert_sql_callable: Callable[[str, str], Any] = _default_convert_sql,
+    check_equivalence_callable: Callable[..., Awaitable[Any]] = _default_check_equivalence,
+    exec_callable: Callable[..., ExecutionResult] | None = None,
+    loader_factory: Callable[[BirdLoaderConfig], BirdLoader] = BirdLoader,
+    write_json_report: Callable[[list[RunResult], Path], None] = _default_write_json_report,
+    write_markdown_report: Callable[[list[RunResult], Path], None] = _default_write_markdown_report,
+) -> SampleSummary:
+    """Run ``count`` randomly-selected Test_Cases from the split.
+
+    Sample mode is the diagnostic verb between :func:`run_single`
+    (one Test_Case) and :func:`run_suite` (the whole split): it
+    exercises a deterministic random sample so an operator can get
+    a quick estimate of the framework's pass rate without committing
+    to the full suite. The seed is required so two runs of the same
+    split + count + seed produce the same selection — without that
+    you can't tell apart "my code got better" from "I sampled
+    different cases this time".
+
+    Parameters
+    ----------
+    options:
+        Same as the other entry points; ``bird_root`` and ``split``
+        drive the loader, the timeouts flow through, and
+        ``execution_check`` controls whether each case also runs
+        through the SQLite execution-equivalence check.
+    count:
+        Number of Test_Cases to draw. Must be ≥ 1. When the split
+        has fewer eligible records than ``count``, the sampler runs
+        every eligible record once and reports the smaller actual
+        count in :attr:`SampleSummary.sampled_count`.
+    seed:
+        PRNG seed for reproducibility. Required.
+    expected_fail / stdout / stderr / *_callable / loader_factory /
+    write_*_report:
+        Mirror :func:`run_suite` exactly. Tests inject the callables
+        to drive the sampler without Bedrock or cvc5.
+
+    Returns
+    -------
+    SampleSummary
+        Tally of every cell needed for a one-screen status report:
+        per-verdict counts, per-execution-status counts, multiset
+        match count, and the two interesting disagreement cells
+        (logical-yes/exec-no and logical-no/exec-yes).
+
+    Raises
+    ------
+    ValueError
+        For ``count < 1`` or ``seed < 0``. The CLI catches these and
+        maps them to ``EXIT_CONFIG_ERROR``.
+    """
+
+    if count < 1:
+        raise ValueError(f"--count must be a positive integer, got {count}")
+    if seed < 0:
+        raise ValueError(f"--seed must be a non-negative integer, got {seed}")
+
+    out = stdout if stdout is not None else sys.stdout
+    err = stderr if stderr is not None else sys.stderr
+
+    if expected_fail is None:
+        expected_fail = _load_expected_fail(options.expected_fail_path)
+
+    # Load the split into memory. BIRD splits are a few thousand
+    # records; holding them all is fine and lets us sample uniformly.
+    loader = loader_factory(
+        BirdLoaderConfig(bird_root=options.bird_root, split=options.split)
+    )
+    test_cases: list[TestCase] = []
+    skipped_records: list[SkippedTestCase] = []
+    for item in loader.load():
+        if isinstance(item, SkippedTestCase):
+            skipped_records.append(item)
+        else:
+            test_cases.append(item)
+
+    if not test_cases:
+        # Nothing to sample. Surface a non-fatal warning so the
+        # operator can tell apart "the split is empty" from "the
+        # planner failed every record".
+        err.write(
+            "warning: no eligible Test_Cases in split "
+            f"{options.split!r}; sample is empty\n"
+        )
+        err.flush()
+        return SampleSummary(
+            seed=seed,
+            requested_count=count,
+            sampled_count=0,
+        )
+
+    # Deterministic sample. ``random.sample`` is "without replacement"
+    # so each Test_Case appears at most once per run.
+    import random as _random
+    rng = _random.Random(seed)
+    actual_count = min(count, len(test_cases))
+    selected: list[TestCase] = rng.sample(test_cases, k=actual_count)
+
+    # --- Header banner -------------------------------------------------
+    out.write("\n# BIRD Sample_Run\n\n")
+    out.write(
+        f"- **Split:** `{options.split}`\n"
+        f"- **Requested:** {count}\n"
+        f"- **Sampled:** {actual_count}"
+    )
+    if actual_count < count:
+        out.write(
+            f"  _(only {len(test_cases)} eligible Test_Cases in split)_"
+        )
+    out.write("\n")
+    out.write(f"- **Seed:** {seed}\n")
+    out.write(
+        f"- **Selected IDs:** "
+        f"{', '.join('`' + c.test_case_id + '`' for c in selected)}\n\n"
+    )
+    out.flush()
+
+    summary = SampleSummary(
+        seed=seed,
+        requested_count=count,
+        sampled_count=actual_count,
+    )
+
+    # --- Per-Test_Case loop -------------------------------------------
+    for index, test_case in enumerate(selected, start=1):
+        out.write(f"\n---\n## Sample {index}/{actual_count}\n")
+        out.flush()
+
+        _write_bird_test_case_banner(out, test_case)
+        try:
+            result = await run_one(
+                test_case,
+                options,
+                expected_fail,
+                planner_callable=planner_callable,
+                convert_sql_callable=convert_sql_callable,
+                check_equivalence_callable=check_equivalence_callable,
+                exec_callable=exec_callable,
+            )
+        except Exception as exc:  # noqa: BLE001 - per-Test_Case isolation
+            # Mirror the suite driver: an unhandled exception becomes
+            # a planner_failed result so the sample run can keep going.
+            result = _make_unhandled_exception_run_result(test_case, exc)
+
+        _write_run_result_block(out, result)
+        _accumulate_sample_summary(summary, result)
+
+    # --- Aggregate summary --------------------------------------------
+    _write_sample_summary(out, summary)
+
+    # --- Optional reports ---------------------------------------------
+    if options.report_json_path is not None:
+        try:
+            write_json_report(summary.results, options.report_json_path)
+        except (OSError, IOError) as exc:
+            summary.failed_to_write_report = True
+            err.write(
+                f"error: failed to write JSON report to "
+                f"{options.report_json_path}: {exc}\n"
+            )
+    if options.report_md_path is not None:
+        try:
+            write_markdown_report(summary.results, options.report_md_path)
+        except (OSError, IOError) as exc:
+            summary.failed_to_write_report = True
+            err.write(
+                f"error: failed to write markdown report to "
+                f"{options.report_md_path}: {exc}\n"
+            )
+
+    return summary
+
+
+def _accumulate_sample_summary(summary: SampleSummary, result: RunResult) -> None:
+    """Update ``summary`` in place with the result's contribution.
+
+    Tracks the per-verdict and per-execution-status counts, the
+    multiset-match count, and the two disagreement cells. The
+    disagreement cells are the most useful diagnostic — see
+    :class:`SampleSummary` for the interpretation.
+    """
+
+    summary.results.append(result)
+    summary.verdict_counts[result.reported_verdict] = (
+        summary.verdict_counts.get(result.reported_verdict, 0) + 1
+    )
+    if result.execution is not None:
+        summary.execution_counts[result.execution.status] = (
+            summary.execution_counts.get(result.execution.status, 0) + 1
+        )
+        if result.execution.multiset_match:
+            summary.multiset_match_count += 1
+        # Disagreement cells: only meaningful when both signals
+        # produced a real verdict. Skip planner_failed / converter_*
+        # rows where the cvc5 verdict didn't run, and skip exec
+        # status ``skipped`` for the same reason.
+        is_logical_yes = (
+            result.underlying_verdict == Verdict.equivalent
+        )
+        is_logical_no = (
+            result.underlying_verdict == Verdict.not_equivalent
+        )
+        is_exec_yes = result.execution.status == ExecutionStatus.match
+        is_exec_no = result.execution.status == ExecutionStatus.mismatch
+        if is_logical_yes and is_exec_no:
+            summary.logical_yes_exec_no += 1
+        elif is_logical_no and is_exec_yes:
+            summary.logical_no_exec_yes += 1
+    else:
+        # Execution check disabled: every row falls into the "skipped"
+        # bucket so the totals still equal sampled_count.
+        summary.execution_counts[ExecutionStatus.skipped] = (
+            summary.execution_counts.get(ExecutionStatus.skipped, 0) + 1
+        )
+
+
+def _write_sample_summary(out: TextIO, summary: SampleSummary) -> None:
+    """Emit the human-readable aggregate summary at the end of a sample run.
+
+    The format intentionally mirrors what an operator scrolling the
+    log wants to see in one screen: the headline rates first
+    (logical-equivalent and exec-match percentages), then the
+    disagreement cells, then the verdict and execution-status
+    breakdowns.
+    """
+
+    out.write("\n---\n# Sample Summary\n\n")
+
+    n = max(1, summary.sampled_count)  # avoid div-by-zero for empty sample
+    eq_count = summary.verdict_counts.get(Verdict.equivalent, 0)
+    exec_match = summary.execution_counts.get(ExecutionStatus.match, 0)
+
+    out.write(
+        f"- **Sampled:** {summary.sampled_count} "
+        f"(seed={summary.seed}, requested={summary.requested_count})\n"
+    )
+    out.write(
+        f"- **Logically equivalent (cvc5):** "
+        f"{eq_count} / {summary.sampled_count} "
+        f"({_pct(eq_count, n)})\n"
+    )
+    out.write(
+        f"- **Execution-equivalent (set match):** "
+        f"{exec_match} / {summary.sampled_count} "
+        f"({_pct(exec_match, n)})\n"
+    )
+    out.write(
+        f"- **Multiset match (strict superset of set match):** "
+        f"{summary.multiset_match_count} / {summary.sampled_count} "
+        f"({_pct(summary.multiset_match_count, n)})\n"
+    )
+    out.write(
+        f"- **Disagreement (logical=yes, exec=no):** "
+        f"{summary.logical_yes_exec_no}\n"
+    )
+    out.write(
+        f"- **Disagreement (logical=no, exec=yes):** "
+        f"{summary.logical_no_exec_yes}\n"
+    )
+
+    out.write("\n## Verdict breakdown\n\n")
+    for verdict in Verdict:
+        c = summary.verdict_counts.get(verdict, 0)
+        if c:
+            out.write(f"- `{verdict.value}`: {c} ({_pct(c, n)})\n")
+
+    out.write("\n## Execution breakdown\n\n")
+    for status in ExecutionStatus:
+        c = summary.execution_counts.get(status, 0)
+        if c:
+            out.write(f"- `{status.value}`: {c} ({_pct(c, n)})\n")
+
+    out.write("\n")
+    out.flush()
+
+
+def _pct(numerator: int, denominator: int) -> str:
+    """Render ``numerator / denominator`` as a one-decimal percentage."""
+
+    if denominator <= 0:
+        return "0.0%"
+    return f"{(100.0 * numerator / denominator):.1f}%"

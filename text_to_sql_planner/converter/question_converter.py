@@ -114,12 +114,28 @@ async def convert_question(
                 # is something else (e.g. a unary ``(and X)`` from a
                 # join expression with one conjunct).
                 hint = _retry_hint_for(last_raw_output, last_error)
+                # The lead-in description should match the failure
+                # mode: a parse error and a free-variable validation
+                # error are different beasts and conflating them
+                # actively misleads the next attempt.
+                if "Unquantified free variables" in last_error:
+                    lead = (
+                        "[The previous attempt parsed but failed "
+                        "validation. Validator: " + last_error + ". "
+                    )
+                else:
+                    lead = (
+                        "[The previous attempt produced syntactically "
+                        "invalid DRC Lisp. Parser error: "
+                        + last_error + ". "
+                    )
                 enhanced_question = (
                     f"{question}\n\n"
-                    f"[The previous attempt produced syntactically invalid "
-                    f"DRC Lisp. Parser error: {last_error}. {hint} "
-                    f"Produce a fresh, well-formed expression, counting "
-                    f"the parentheses carefully.]"
+                    f"{lead}{hint} "
+                    f"Produce a fresh, well-formed expression. Return "
+                    f"ONLY the final S-expression with no surrounding "
+                    f"prose, intermediate drafts, or 'let me redo' "
+                    f"text.]"
                 )
                 user_msg = f"Schema:\n{schema}\n\nQuestion: {enhanced_question}"
                 print(f"#### LLM prompt (with error feedback)\n")
@@ -132,9 +148,26 @@ async def convert_question(
             print(f"#### LLM raw output\n")
             print(f"```lisp\n{raw_lisp}\n```\n")
 
+            # Pull the LAST balanced top-level S-expression out of the
+            # LLM output. The system prompt says "Return ONLY the DRC
+            # expression in Lisp syntax, nothing else", but Claude
+            # occasionally chains-of-thought in the response and emits
+            # multiple candidates separated by prose ("Wait, let me
+            # redo this more carefully."). Parsing the *first*
+            # candidate then chokes on the trailing prose; parsing the
+            # *last* matches the model's apparent final answer and
+            # degrades to a no-op when the output is already a single
+            # expression.
+            parse_input = _extract_last_sexpr(raw_lisp)
+            if parse_input != raw_lisp:
+                print(
+                    "ℹ️ **Multiple S-expressions detected in output;** "
+                    "parsing the last one (the model's final answer).\n"
+                )
+
             # Parse the Lisp syntax (extended DRC: optional limit / order-by
             # wrappers around a core ``(drc ...)`` form).
-            result = parse_query(raw_lisp)
+            result = parse_query(parse_input)
 
             if isinstance(result, QueryParserSuccess):
                 query = result.query
@@ -180,7 +213,7 @@ async def convert_question(
                 return ConversionSuccess(
                     expression=inner_drc,
                     query=query,
-                    lisp_syntax=raw_lisp,
+                    lisp_syntax=parse_input,
                     use_distinct=distinct_decision.use_distinct,
                     distinct_reasoning=distinct_decision.reasoning,
                 )
@@ -225,6 +258,13 @@ def _retry_hint_for(last_raw_output: str, last_error: str) -> str:
 
     Heuristics:
 
+    * **Free-variable validator failure** — the parser succeeded but
+      the framework's free-variable check rejected the result. Name
+      the offending variables and tell the model to wrap them in an
+      enclosing ``exists``. This is the most actionable hint we can
+      produce; the variables are already extracted by
+      :func:`_validate_free_variables` and live verbatim in the
+      ``last_error`` message.
     * Unary ``(and X)`` / ``(or X)`` — the most common LLM mistake
       when joining tables with a single existential body. We accept
       this in the parser now, but for older error traces we still
@@ -235,7 +275,27 @@ def _retry_hint_for(last_raw_output: str, last_error: str) -> str:
       contains ``(not (exists`` do we mention exactly-N nesting.
     * Otherwise — generic balanced-parens hint.
     """
+    err = last_error or ""
     text = last_raw_output or ""
+
+    # The free-variable validator failure is the highest-signal
+    # failure mode: we know exactly which variables the model forgot
+    # to quantify. Pull them out of the error message and tell the
+    # model to add them.
+    free_vars = _free_vars_from_validator_error(err)
+    if free_vars:
+        names = ", ".join(free_vars)
+        return (
+            f"The previous expression parsed but had unquantified "
+            f"variables: {names}. These appear inside a membership or "
+            f"comparison but no enclosing (exists ...) binds them. Add "
+            f"them to the variable list of the existing (exists ...) "
+            f"that wraps their reference site (typically the inner "
+            f"existential around the membership tuple), and double-"
+            f"check that EVERY variable in every (in (...) Table) "
+            f"tuple is either a result variable or bound by some "
+            f"enclosing (exists ...)."
+        )
 
     # Look for unary ``(and X)`` or ``(or X)``: a single sub-expression
     # between the operator and its matching close-paren. We use a
@@ -275,6 +335,131 @@ def _retry_hint_for(last_raw_output: str, last_error: str) -> str:
         )
 
     return "Re-balance the parentheses and re-emit the expression."
+
+
+def _free_vars_from_validator_error(error_message: str) -> list[str]:
+    """Extract the variable names from a free-variable validator error.
+
+    The validator's error format is::
+
+        Unquantified free variables: ['v1', 'v2', ...]. These must be ...
+
+    We parse that bracketed Python-list literal directly with
+    :func:`ast.literal_eval` so the extraction is unambiguous and
+    requires no regex on lisp text. Returns ``[]`` if the message
+    isn't from the free-variable validator or the variables list
+    can't be safely parsed.
+    """
+    import ast
+
+    marker = "Unquantified free variables: "
+    idx = error_message.find(marker)
+    if idx < 0:
+        return []
+    start = idx + len(marker)
+    # The list literal extends from ``[`` to the matching ``]``;
+    # walk the characters tracking bracket depth.
+    if start >= len(error_message) or error_message[start] != "[":
+        return []
+    depth = 0
+    end = start
+    while end < len(error_message):
+        ch = error_message[end]
+        if ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth == 0:
+                end += 1
+                break
+        end += 1
+    if depth != 0:
+        return []
+    snippet = error_message[start:end]
+    try:
+        parsed = ast.literal_eval(snippet)
+    except (ValueError, SyntaxError):
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [str(item) for item in parsed if isinstance(item, str)]
+
+
+def _extract_last_sexpr(text: str) -> str:
+    """Return the last balanced top-level S-expression in ``text``.
+
+    The LLM occasionally chains thought into its response, emitting
+    multiple candidate expressions separated by prose:
+
+        (drc (...) ...)
+
+        Wait, let me redo this more carefully.
+
+        (drc (...) ...)
+
+    The system prompt says to return only the Lisp expression, but
+    when Claude doesn't comply, parsing the first form succeeds and
+    then chokes on the trailing prose. This helper walks the input
+    once, depth-tracking parens with quote awareness, and returns
+    the substring of the final balanced top-level form. When the
+    output is already a single expression (or no balanced form is
+    found at all), the original text is returned verbatim so this
+    helper is a safe no-op on well-formed outputs.
+
+    Quote awareness matters because DRC literals can contain
+    unbalanced parens inside strings (``"foo)bar"``). We track
+    double-quoted regions, with backslash-escape support, and ignore
+    parens inside them.
+    """
+    if not text:
+        return text
+
+    # Walk the text once and record (start, end) of every balanced
+    # top-level form (depth returns to 0 from 1).
+    forms: list[tuple[int, int]] = []
+    in_string = False
+    escape = False
+    depth = 0
+    form_start = -1
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            i += 1
+            continue
+        if ch == '"':
+            in_string = True
+            i += 1
+            continue
+        if ch == "(":
+            if depth == 0:
+                form_start = i
+            depth += 1
+        elif ch == ")":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and form_start >= 0:
+                    forms.append((form_start, i + 1))
+                    form_start = -1
+        i += 1
+
+    if not forms:
+        # No balanced form found — surface the input as-is so the
+        # parser produces its usual error message.
+        return text
+    if len(forms) == 1:
+        # Already a single top-level form; return verbatim to preserve
+        # any leading whitespace / formatting the parser might use.
+        return text
+
+    last_start, last_end = forms[-1]
+    return text[last_start:last_end]
 
 
 def _has_unary_and_or(text: str) -> bool:

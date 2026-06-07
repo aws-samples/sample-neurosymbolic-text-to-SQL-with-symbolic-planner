@@ -209,7 +209,13 @@ async def plan(
     # Also check via cvc5 equivalence for structural matches
     for i, (expr, cols, node) in enumerate(available):
         if len(cols) == len(target_columns):
-            eq_result = await check_equivalence(expr, target_relation, config.equivalence_config, schema_types=schema_types)
+            eq_result = await check_equivalence(
+                expr, target_relation, config.equivalence_config,
+                schema_types=schema_types,
+                label=f"planner: candidate relation [{i}] vs target DRC",
+                lhs_label=f"candidate [{i}]",
+                rhs_label="target",
+            )
             if isinstance(eq_result, EquivalentResult):
                 print(f"### ✅ Degenerate case: target is equivalent to table relation [{i}]\n")
                 tree = OperationTree(root=node)
@@ -396,7 +402,14 @@ async def plan(
             # Check equivalence with target
             print(f"Checking equivalence with target...\n", flush=True)
             eq_result = await check_equivalence(
-                new_expr, target_relation, config.equivalence_config, schema_types=schema_types
+                new_expr, target_relation, config.equivalence_config,
+                schema_types=schema_types,
+                label=(
+                    f"planner: just-built relation [{new_index}] "
+                    f"vs target DRC (iteration {iteration})"
+                ),
+                lhs_label=f"built [{new_index}]",
+                rhs_label="target",
             )
 
             if isinstance(eq_result, EquivalentResult):

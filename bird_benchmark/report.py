@@ -259,6 +259,12 @@ def _render_run_result(result: RunResult, verdict: Verdict) -> list[str]:
             lines.append("```smt2")
             lines.append(result.smt_script)
             lines.append("```")
+        # The execution-equivalence verdict is the most useful single
+        # diagnostic for a not_equivalent verdict — when cvc5 says
+        # the queries differ but execution says they return the same
+        # rows on this database, the gold is over-specified relative
+        # to BIRD's snapshot.
+        lines.extend(_render_execution(result))
     elif verdict in _VERDICTS_WITH_REASON:
         # Failure cases that never reached the equivalence checker
         # (Req 9.4): no SMT script exists, the reason is what matters.
@@ -268,9 +274,54 @@ def _render_run_result(result: RunResult, verdict: Verdict) -> list[str]:
         lines.append(result.gold_sql)
         lines.append("```")
         lines.append(f"**Reason:** {result.reason}")
+        # Execution may still have happened on these paths if the
+        # planner produced SQL but the equivalence step never ran —
+        # surface it when present so an operator can see whether the
+        # generated SQL at least executes.
+        lines.extend(_render_execution(result))
     # Other verdicts (equivalent / skipped / expected_fail /
     # gold_conversion_failure) only get the Test_Case_ID. The summary
     # table carries the count, and the JSON report carries the full
     # detail for any deeper inspection.
 
     return lines
+
+
+def _render_execution(result: RunResult) -> list[str]:
+    """Render the execution-equivalence section of a Run_Result.
+
+    Returns an empty list when ``result.execution`` is ``None`` (exec
+    checks disabled, or a path that pre-dates exec eq). Otherwise
+    emits a single labelled line summarising the status, plus
+    additional rows when there's something interesting to surface
+    (mismatched row counts, error messages, set-vs-multiset
+    disagreement).
+    """
+
+    exe = result.execution
+    if exe is None:
+        return []
+    out: list[str] = []
+    if exe.status.value in ("match", "mismatch"):
+        # Both queries ran. Show the row counts and the multiset/set
+        # disagreement if any.
+        agreement = "match" if exe.set_match else "mismatch"
+        if exe.set_match and not exe.multiset_match:
+            agreement = "match (set), mismatch (multiset)"
+        elif not exe.set_match:
+            agreement = "mismatch"
+        out.append(
+            f"**Execution:** {agreement} "
+            f"(generated={exe.generated_row_count} rows, "
+            f"gold={exe.gold_row_count} rows)"
+        )
+    elif exe.status.value == "skipped":
+        # Don't clutter the report with "execution: skipped" on every
+        # verdict that didn't have SQL to run — this case is the
+        # default for converter / planner failures and the operator
+        # already knows.
+        return []
+    else:
+        # Error-shaped status: surface the status and the error string.
+        out.append(f"**Execution:** {exe.status.value} — {exe.error}")
+    return out
