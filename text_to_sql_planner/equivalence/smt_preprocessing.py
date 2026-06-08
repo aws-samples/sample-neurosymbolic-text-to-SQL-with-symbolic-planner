@@ -677,6 +677,192 @@ def drop_unused_slots(
 
 
 # ---------------------------------------------------------------------------
+# Pass 3: STRFTIME ↔ integer-date comparison rewrite
+#
+# cvc5 has no built-in semantics for ``STRFTIME``. Without help, a
+# comparison like ``STRFTIME('%Y', dob) > '1980'`` becomes an
+# uninterpreted ``(> (STRFTIME "%Y" dob) 1980)`` call that the solver
+# cannot relate to the planner-side ``(> dob 4017)`` form (4017 = days
+# since epoch for 1980-12-31). The verdict comes back
+# ``not_equivalent`` even though the queries describe the same set of
+# rows over actual date data.
+#
+# We exploit the fact that BIRD's gold queries use ``STRFTIME`` with a
+# small finite set of patterns:
+#
+#   STRFTIME('%Y', d) <op> 'YYYY'
+#
+# where ``<op>`` is one of ``< <= > >= = !=`` and ``'YYYY'`` is a
+# four-digit year string. For each such pattern, we substitute an
+# equivalent integer comparison on ``d`` (interpreted as days since
+# 1970-01-01, the same convention used by ``_convert_node_for_comparison``).
+#
+# The rewrite fires for both arg orderings (literal can be on the
+# left). Anything that doesn't match the year-comparison shape passes
+# through unchanged — the SMT converter still declares STRFTIME
+# uninterpreted in that case (e.g. ``%m``, ``%d``, or non-literal
+# right-hand side).
+# ---------------------------------------------------------------------------
+
+
+def rewrite_strftime_year_comparisons(
+    condition: DRCCondition,
+) -> DRCCondition:
+    """Rewrite ``STRFTIME('%Y', d) <op> 'YYYY'`` patterns into integer
+    date comparisons. See pass docstring above."""
+    return _strftime_rewrite(condition)
+
+
+def _strftime_rewrite(node: DRCCondition) -> DRCCondition:
+    if node is None:
+        return node
+    if isinstance(node, ComparisonNode):
+        rewritten = _try_rewrite_strftime_comparison(node)
+        if rewritten is not None:
+            return rewritten
+        return ComparisonNode(
+            operator=node.operator,
+            left=_strftime_rewrite(node.left),
+            right=_strftime_rewrite(node.right),
+        )
+    if isinstance(node, LogicalConnectiveNode):
+        return LogicalConnectiveNode(
+            operator=node.operator,
+            left=_strftime_rewrite(node.left),
+            right=_strftime_rewrite(node.right),
+        )
+    if isinstance(node, NotNode):
+        return NotNode(operand=_strftime_rewrite(node.operand))
+    if isinstance(node, QuantifierNode):
+        return QuantifierNode(
+            kind=node.kind,
+            variables=list(node.variables),
+            body=_strftime_rewrite(node.body),
+        )
+    if isinstance(node, ArithmeticNode):
+        return ArithmeticNode(
+            operator=node.operator,
+            left=_strftime_rewrite(node.left),
+            right=_strftime_rewrite(node.right),
+        )
+    if isinstance(node, FunctionCallNode):
+        return FunctionCallNode(
+            function=node.function,
+            arguments=[_strftime_rewrite(a) for a in node.arguments],
+        )
+    return node
+
+
+def _try_rewrite_strftime_comparison(
+    node: ComparisonNode,
+) -> DRCCondition | None:
+    """If ``node`` is ``STRFTIME('%Y', d) <op> 'YYYY'`` (or its
+    flipped form ``'YYYY' <op> STRFTIME(...)``), return the rewritten
+    integer-comparison form. Otherwise return ``None``."""
+    op = node.operator
+    flip = False
+    fn_node, lit_node = _split_strftime_call_and_literal(node.left, node.right)
+    if fn_node is None:
+        fn_node, lit_node = _split_strftime_call_and_literal(node.right, node.left)
+        flip = True
+    if fn_node is None:
+        return None
+    # Function on the LHS by convention; flip the operator's direction
+    # if we had to swap operands.
+    if flip:
+        op = _flip_comparison_op(op)
+
+    if len(fn_node.arguments) != 2:
+        return None
+    fmt_arg = fn_node.arguments[0]
+    if not (isinstance(fmt_arg, LiteralNode) and fmt_arg.data_type == "string"):
+        return None
+    if str(fmt_arg.value) != "%Y":
+        return None
+
+    date_node = fn_node.arguments[1]
+
+    year = _parse_year_literal(lit_node)
+    if year is None:
+        return None
+
+    boundary_lo = _days_since_epoch(year, 1, 1)        # Jan 1 of year
+    boundary_hi = _days_since_epoch(year + 1, 1, 1)    # Jan 1 of year+1
+
+    def _cmp(op_str: str, boundary: int) -> ComparisonNode:
+        return ComparisonNode(
+            operator=op_str,
+            left=date_node,
+            right=LiteralNode(value=boundary, data_type="number"),
+        )
+
+    if op == ">":
+        return _cmp(">=", boundary_hi)
+    if op == ">=":
+        return _cmp(">=", boundary_lo)
+    if op == "<":
+        return _cmp("<", boundary_lo)
+    if op == "<=":
+        return _cmp("<", boundary_hi)
+    if op == "=":
+        return LogicalConnectiveNode(
+            operator="and",
+            left=_cmp(">=", boundary_lo),
+            right=_cmp("<", boundary_hi),
+        )
+    if op == "!=":
+        return LogicalConnectiveNode(
+            operator="or",
+            left=_cmp("<", boundary_lo),
+            right=_cmp(">=", boundary_hi),
+        )
+    return None
+
+
+def _split_strftime_call_and_literal(
+    a: DRCCondition, b: DRCCondition
+) -> tuple[FunctionCallNode | None, LiteralNode | None]:
+    """If ``a`` is a ``STRFTIME(...)`` call and ``b`` is a string
+    literal, return ``(a, b)``. Otherwise return ``(None, None)``."""
+    if isinstance(a, FunctionCallNode) and a.function == "STRFTIME":
+        if isinstance(b, LiteralNode) and b.data_type == "string":
+            return a, b
+    return None, None
+
+
+def _flip_comparison_op(op: str) -> str:
+    """Return the operator that yields the same truth value when its
+    operands are swapped (``a > b`` ↔ ``b < a``)."""
+    return {
+        "<": ">", "<=": ">=", ">": "<", ">=": "<=",
+        "=": "=", "!=": "!=",
+    }.get(op, op)
+
+
+def _parse_year_literal(node: DRCCondition) -> int | None:
+    """If ``node`` is a string literal whose value is a four-digit
+    year, return the year as an int. Otherwise return ``None``."""
+    if not isinstance(node, LiteralNode):
+        return None
+    if node.data_type != "string":
+        return None
+    val = str(node.value).strip()
+    if len(val) != 4 or not val.isdigit():
+        return None
+    year = int(val)
+    if year < 1 or year > 9999:
+        return None
+    return year
+
+
+def _days_since_epoch(year: int, month: int, day: int) -> int:
+    """Days from 1970-01-01 to (year, month, day). Matches the
+    integer date encoding ``_convert_node_for_comparison`` uses."""
+    from datetime import date
+    return (date(year, month, day) - date(1970, 1, 1)).days
+
+
+# ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
@@ -709,6 +895,15 @@ def preprocess_for_smt_pair(
     condition keeps the slot alive in both, otherwise the predicate
     signatures would diverge.
 
+    Pass 3 (per-condition): rewrite ``STRFTIME`` calls into integer
+    date comparisons. The SMT layer treats ``STRFTIME`` as an
+    uninterpreted function, which means cvc5 cannot prove
+    ``STRFTIME('%Y', dob) > '1980'`` ↔ ``dob > <last day of 1980>``
+    even though the two are semantically equivalent over real dates.
+    The rewrite replaces qualifying STRFTIME comparisons with the
+    arithmetic form *on both sides* before the script is built, so
+    cvc5 sees identical predicates and a clean equivalence proof.
+
     ``keep_names`` is a set of variable names that must NOT be dropped
     from membership terms even if they appear nowhere else in the
     conditions. This protects names that are referenced *outside* the
@@ -719,4 +914,5 @@ def preprocess_for_smt_pair(
     used = eliminate_unused_relation_slots(
         after_pass1, keep_names=set(keep_names or ()),
     )
-    return [drop_unused_slots(c, used) for c in after_pass1]
+    after_pass2 = [drop_unused_slots(c, used) for c in after_pass1]
+    return [rewrite_strftime_year_comparisons(c) for c in after_pass2]
