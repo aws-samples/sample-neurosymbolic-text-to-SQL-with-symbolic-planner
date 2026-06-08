@@ -359,6 +359,49 @@ class _Translator:
         # ---- result_variables -----------------------------------------
         result_variables = self._translate_select_list(stmt, scope)
 
+        # ---- Existential closure --------------------------------------
+        # Every name introduced by FROM-clause memberships that is NOT a
+        # result variable must be existentially quantified. The DRC
+        # contract is "no free variables in the condition other than
+        # the result variables" — the planner-side LLM follows this
+        # rule explicitly, but the SQL→DRC translator used to leave
+        # filter columns as free constants. That broke equivalence
+        # checks against the planner: cvc5 would see one side bind
+        # ``City`` with ``∃City. … ∧ City="Adelanto"`` and the other
+        # side leave ``v_city_10`` as a free String constant. The two
+        # are not logically the same shape — cvc5 picks ``v_city_10
+        # ≠ "Adelanto"`` as a counterexample and reports
+        # ``not_equivalent`` even though the original SQL queries
+        # describe identical relations (dev_78 / dev_1425 / dev_757 /
+        # dev_1375 in run-10).
+        result_var_names: set[str] = set()
+        for rv in result_variables:
+            if isinstance(rv, ColumnVariable):
+                result_var_names.add(rv.name)
+            elif isinstance(rv, AggregateVariable):
+                # The aggregated column is a free variable on the
+                # outside (the aggregate replaces it positionally), so
+                # NOT existentially bound; same for ``COUNT(*)`` whose
+                # column is the literal ``"*"``.
+                result_var_names.add(rv.column)
+        # Names introduced by FROM-clause bindings that are not in the
+        # SELECT list become existentially-quantified bound names.
+        bound_names = list(scope.bound_vars.values())
+        # Preserve introduction order while deduplicating.
+        seen: set[str] = set()
+        free_filter_names: list[str] = []
+        for name in bound_names:
+            if name in result_var_names or name in seen:
+                continue
+            seen.add(name)
+            free_filter_names.append(name)
+        if free_filter_names:
+            body = QuantifierNode(
+                kind="exists",
+                variables=free_filter_names,
+                body=body,
+            )
+
         drc_expr = DRCExpression(
             result_variables=result_variables,
             condition=body,
@@ -392,13 +435,131 @@ class _Translator:
         if isinstance(source, sql_ast.TableRef):
             memberships.append(self._bind_table(source, scope, stmt))
             return memberships
+        if isinstance(source, sql_ast.DerivedTable):
+            memberships.extend(self._bind_derived_table(source, scope))
+            return memberships
 
         # JoinChain: base table plus a list of INNER JOINs.
-        memberships.append(self._bind_table(source.base, scope, stmt))
+        if isinstance(source.base, sql_ast.DerivedTable):
+            memberships.extend(self._bind_derived_table(source.base, scope))
+        else:
+            memberships.append(self._bind_table(source.base, scope, stmt))
         for join in source.joins:
-            memberships.append(self._bind_table(join.right, scope, stmt))
+            if isinstance(join.right, sql_ast.DerivedTable):
+                memberships.extend(self._bind_derived_table(join.right, scope))
+            else:
+                memberships.append(self._bind_table(join.right, scope, stmt))
             memberships.append(self._translate_expr(join.on, scope))
         return memberships
+
+    def _bind_derived_table(
+        self,
+        ref: "sql_ast.DerivedTable",
+        scope: Scope,
+    ) -> list[DRCCondition]:
+        """Bind a parenthesised SELECT subquery as a FROM source.
+
+        The subquery is translated recursively. Its body (conditions
+        and memberships, ∃-bound where appropriate) becomes part of
+        the outer scope. Each of the subquery's projected columns is
+        registered as ``(alias, col_name)`` in the outer
+        ``scope.bound_vars`` so the outer SELECT / WHERE / ORDER BY
+        can reference them as ``alias.col`` or bare ``col``.
+
+        Aliases on the inner ``select_list`` items take precedence
+        over the underlying expression name. For aggregates without
+        an alias we synthesise a name (``func_<n>``) so the column is
+        still addressable. cvc5 sees aggregate-derived columns as
+        unconstrained variables — the right model for an opaque
+        aggregate result that the outer query treats as a value.
+
+        Returns the list of DRC conditions to conjoin into the outer
+        body. The first element is always the inner subquery's body
+        (wrapped in an existential over its non-projected bindings);
+        subsequent elements are empty in the common case.
+        """
+
+        sub_query, sub_scope = self.translate_select(
+            ref.subquery, parent=scope,
+        )
+        sub_drc = _strip_wrappers(sub_query)
+
+        alias_l = ref.alias.lower()
+        scope.tables[alias_l] = ref.alias
+
+        # ``column_names_in_outer`` is the ordered list of column
+        # names the outer query can reference on this alias. For each
+        # inner select-list item we use its alias if present,
+        # otherwise the column name (for ColumnRef) or a synthetic
+        # name (for Aggregate / computed expressions).
+        column_names_in_outer: list[str] = []
+        # ``inner_var_names`` is the parallel list of DRC variable
+        # names the inner DRC uses for those columns.
+        inner_var_names: list[str] = []
+        # Aggregate columns get a fresh outer-scope variable (cvc5 sees
+        # them as unconstrained) plus a structural placeholder in the
+        # inner DRC's body. We track which positions are aggregates so
+        # the outer scope can bind them appropriately.
+        for i, item in enumerate(ref.subquery.select_list):
+            inner_rv = sub_drc.result_variables[i] if i < len(sub_drc.result_variables) else None
+            outer_col_name = self._derived_column_name(item, inner_rv, i)
+            if outer_col_name is None:
+                continue
+            column_names_in_outer.append(outer_col_name)
+            # For ColumnVariable result-vars, the inner DRC's variable
+            # is the bound name we expose. For AggregateVariable
+            # result-vars, we mint a fresh name (the inner aggregate
+            # has no per-row variable name).
+            if isinstance(inner_rv, ColumnVariable):
+                inner_var_names.append(inner_rv.name)
+            elif isinstance(inner_rv, AggregateVariable):
+                fresh = self._fresh(ref.alias, outer_col_name)
+                inner_var_names.append(fresh)
+            else:
+                fresh = self._fresh(ref.alias, outer_col_name)
+                inner_var_names.append(fresh)
+
+        # Register the alias.column lookups in the outer scope.
+        for col_name, var_name in zip(column_names_in_outer, inner_var_names):
+            scope.bound_vars[(alias_l, col_name.lower())] = var_name
+        scope.columns_by_alias[alias_l] = list(column_names_in_outer)
+
+        # Names introduced inside the subquery that are NOT the
+        # exposed columns become existentially bound. The outer
+        # scope shouldn't see them.
+        exposed = set(inner_var_names)
+        sub_inner_vars = list(sub_scope.bound_vars.values())
+        ex_bound: list[str] = []
+        seen: set[str] = set()
+        for v in sub_inner_vars:
+            if v in exposed or v in seen:
+                continue
+            seen.add(v)
+            ex_bound.append(v)
+
+        body = sub_drc.condition
+        if ex_bound:
+            body = QuantifierNode(
+                kind="exists", variables=ex_bound, body=body,
+            )
+        return [body]
+
+    def _derived_column_name(
+        self,
+        item: "sql_ast.SelectItem",
+        rv,
+        position: int,
+    ) -> str | None:
+        """Pick the outer-scope column name for one inner select-list item."""
+        if item.alias:
+            return item.alias
+        if isinstance(item.expr, sql_ast.ColumnRef):
+            return item.expr.name
+        if isinstance(rv, AggregateVariable):
+            return f"{rv.function.lower()}_{position}"
+        if isinstance(rv, ColumnVariable):
+            return rv.name
+        return None
 
     def _bind_table(
         self,
@@ -562,6 +723,22 @@ class _Translator:
             # call so cvc5 sees a single nominal symbol to reason about.
             return FunctionCallNode(
                 function="concat",
+                arguments=[
+                    self._translate_expr(expr.left, scope),
+                    self._translate_expr(expr.right, scope),
+                ],
+            )
+        if op == "LIKE":
+            # ``lhs LIKE pattern`` — there's no built-in LIKE in DRC, so
+            # we model it as an uninterpreted Bool predicate
+            # ``(LIKE lhs pattern)``. The SMT converter declares
+            # ``LIKE`` once (with the inferred operand sorts) and both
+            # sides of an equivalence check share the same predicate
+            # symbol, so a generated ``LIKE Title "%data%"`` and the
+            # gold's identical call are recognised as equivalent
+            # without cvc5 needing to interpret SQL pattern semantics.
+            return FunctionCallNode(
+                function="LIKE",
                 arguments=[
                     self._translate_expr(expr.left, scope),
                     self._translate_expr(expr.right, scope),

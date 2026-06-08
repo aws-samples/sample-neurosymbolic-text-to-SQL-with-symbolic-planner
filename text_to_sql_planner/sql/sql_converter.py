@@ -814,13 +814,9 @@ class _SqlGenerator:
         else:
             parts.append(f"  WHERE {not_exists}")
 
-        if has_aggregates:
-            plain_cols: list[str] = []
-            for i, rv in enumerate(result_variables):
-                if isinstance(rv, ColumnVariable):
-                    plain_cols.append(_lookup_at(i, rv.name))
-            if plain_cols:
-                parts.append(f"  GROUP BY {', '.join(plain_cols)}")
+        _maybe_emit_group_by(
+            parts, has_aggregates, order_by, result_variables, _lookup_at
+        )
 
         if order_by:
             order_parts: list[str] = []
@@ -1047,13 +1043,9 @@ class _SqlGenerator:
         if ctx.where_conditions:
             parts.append(f"  WHERE {' AND '.join(ctx.where_conditions)}")
 
-        if has_aggregates:
-            plain_cols: list[str] = []
-            for i, rv in enumerate(result_variables):
-                if isinstance(rv, ColumnVariable):
-                    plain_cols.append(_lookup_at(i, rv.name))
-            if plain_cols:
-                parts.append(f"  GROUP BY {', '.join(plain_cols)}")
+        _maybe_emit_group_by(
+            parts, has_aggregates, order_by, result_variables, _lookup_at
+        )
 
         # ORDER BY / LIMIT layers are non-relational — they live outside
         # the set comprehension. Each ORDER BY key references the target
@@ -1190,12 +1182,22 @@ class _SqlGenerator:
         return f"({parts[0]} {op} {parts[1]})"
 
     def _literal_to_sql(self, node: LiteralNode) -> str:
-        """Convert a literal to SQL."""
+        """Convert a literal to SQL.
+
+        Date strings are emitted as plain SQL string literals (no
+        ``DATE '…'`` prefix). The ``DATE 'YYYY-MM-DD'`` form is
+        ANSI-SQL / PostgreSQL syntax that SQLite — the engine BIRD
+        runs the queries against — rejects with an
+        ``OperationalError: near "'YYYY-MM-DD'": syntax error``
+        (dev_947 in run-11 was the trigger). SQLite stores dates as
+        TEXT in ISO-8601 format, so a bare quoted string compares
+        lexicographically as the same date and the equivalence
+        check still treats it as a date via the SMT converter's
+        date-string-to-int coercion.
+        """
         if node.data_type == "string":
             val = str(node.value)
             escaped = val.replace("'", "''")
-            if _is_date_string(val):
-                return f"DATE '{escaped}'"
             return f"'{escaped}'"
         return str(node.value)
 
@@ -1217,6 +1219,14 @@ class _SqlGenerator:
             left = self._condition_to_sql(node.arguments[0], var_map)
             right = self._condition_to_sql(node.arguments[1], var_map)
             return f"({left} - {right})"
+        elif node.function == "LIKE" and len(node.arguments) == 2:
+            # ``(LIKE col pattern)`` → ``col LIKE pattern`` (SQL infix
+            # form). Without this the converter would emit ``LIKE(col,
+            # pattern)`` as a function call, which SQLite doesn't
+            # understand.
+            left = self._condition_to_sql(node.arguments[0], var_map)
+            right = self._condition_to_sql(node.arguments[1], var_map)
+            return f"({left} LIKE {right})"
         else:
             if not node.arguments:
                 return node.function
@@ -1394,6 +1404,51 @@ class _SqlGenerator:
 
 
 # --- Helpers (module-level) ---
+
+
+def _maybe_emit_group_by(
+    parts: list[str],
+    has_aggregates: bool,
+    order_by: list | None,
+    result_variables: list,
+    lookup_at,
+) -> None:
+    """Append ``GROUP BY`` to ``parts`` when the query needs one.
+
+    Two paths produce a needed ``GROUP BY``:
+
+    1. **Mixed result variables**: the SELECT list contains both
+       plain columns and aggregate columns. Standard SQL semantics
+       require ``GROUP BY`` over every plain column for the
+       aggregates to have a per-group meaning. ``has_aggregates``
+       drives this case.
+    2. **Aggregate in ORDER BY**: the SELECT list is all plain
+       columns but the ``ORDER BY`` criteria contain an aggregate
+       (e.g. ``ORDER BY (COUNT col) DESC``). SQLite — and standard
+       SQL — rejects ``ORDER BY agg(col)`` over an unaggregated
+       SELECT list with ``misuse of aggregate``. Adding ``GROUP BY``
+       on every plain SELECT column makes the aggregate well-defined
+       per group. This is the dev_78 "most common X" pattern:
+       ``SELECT X … ORDER BY COUNT(X) DESC LIMIT 1`` MUST be
+       ``GROUP BY X`` for the COUNT to be a per-group count rather
+       than an undefined aggregate over the whole row set.
+
+    Both paths emit the GROUP BY over the SELECT list's
+    plain-column entries, in their original order.
+    """
+
+    needs_group_by = has_aggregates
+    if not needs_group_by and order_by:
+        needs_group_by = any(crit.aggregate for crit in order_by)
+    if not needs_group_by:
+        return
+
+    plain_cols: list[str] = []
+    for i, rv in enumerate(result_variables):
+        if isinstance(rv, ColumnVariable):
+            plain_cols.append(lookup_at(i, rv.name))
+    if plain_cols:
+        parts.append(f"  GROUP BY {', '.join(plain_cols)}")
 
 
 def _aggregate_matches_target(

@@ -39,8 +39,23 @@ from text_to_sql_planner.types.drc import (
 # ---------------------------------------------------------------------------
 
 
-def test_eq_elim_substitutes_variable():
-    """``∃v. (in (v) R) ∧ (= v 5)`` → ``(in (v) R)[v := 5]`` (no exist)."""
+def test_eq_elim_does_not_substitute_literal_into_membership_slot():
+    """``∃v. (in (v) R) ∧ (= v 5)`` is NOT eliminated.
+
+    Substituting the literal ``5`` into ``v``'s position in
+    ``(in (v) R)`` has no DRC representation (positional slots take
+    variable names, not literals). If the eliminator dropped the
+    binder and the equality, the leftover ``(in (v) R)`` would mention
+    ``v`` as a *free* constant — the formula would say "is there any
+    row with the same ``v`` as the one bound outside?" instead of
+    "is there a row with v=5". The dev_78 BIRD case is the canonical
+    instance: ``∃City. schools(..., City, ...) ∧ City = "Adelanto"``
+    must NOT collapse to ``schools(..., City, ...)`` with a free
+    String constant.
+
+    The eliminator detects this case and skips the rewrite, leaving
+    the existential and the equality intact.
+    """
     inner = LogicalConnectiveNode(
         operator="and",
         left=MembershipNode(variables=["v"], relation="R"),
@@ -54,15 +69,41 @@ def test_eq_elim_substitutes_variable():
 
     out = eliminate_trivial_equalities(expr)
 
-    # The exists is gone, the equality is gone, and the membership
-    # carries the literal substituted in (as an identifier in the slot
-    # position — see the substitute logic for membership semantics).
-    # In our implementation, substituting a literal into a positional
-    # membership slot is a no-op (we keep the original name) because
-    # there's no DRC representation for "literal at slot k". So in this
-    # case the equality gets rewritten away but the membership stays.
-    assert isinstance(out, MembershipNode)
-    assert out.relation == "R"
+    # Existential survives; equality survives; semantics preserved.
+    assert isinstance(out, QuantifierNode)
+    assert out.kind == "exists"
+    assert out.variables == ["v"]
+
+
+def test_eq_elim_substitutes_literal_into_non_slot_reference():
+    """When ``v`` only appears in a comparison (no membership slot),
+    literal substitution IS safe and the eliminator runs."""
+    # ``∃ v. (and (> v 0) (= v 5))`` — ``v`` is in a comparison, not
+    # a slot — eliminate it.
+    inner = LogicalConnectiveNode(
+        operator="and",
+        left=ComparisonNode(
+            operator=">",
+            left=VariableRefNode(name="v"),
+            right=LiteralNode(value=0, data_type="number"),
+        ),
+        right=ComparisonNode(
+            operator="=",
+            left=VariableRefNode(name="v"),
+            right=LiteralNode(value=5, data_type="number"),
+        ),
+    )
+    expr = QuantifierNode(kind="exists", variables=["v"], body=inner)
+
+    out = eliminate_trivial_equalities(expr)
+
+    # Existential is gone; ``v`` got substituted with 5 in the comparison.
+    assert isinstance(out, ComparisonNode)
+    assert out.operator == ">"
+    assert isinstance(out.right, LiteralNode)
+    assert out.right.value == 0
+    assert isinstance(out.left, LiteralNode)
+    assert out.left.value == 5
 
 
 def test_eq_elim_unifies_two_bound_vars():
@@ -324,14 +365,15 @@ def test_preprocess_for_smt_combines_passes():
 
         ∃ k, name, addr.  R(k, name, addr)  ∧  (= k 7)
 
-    Pass 1 sees ``(= k 7)`` and rewrites the body, leaving the equality
-    consumed. Pass 2 then notices that ``name`` and ``addr`` are bound
-    but never referenced anywhere — it prunes their slots. ``k`` is
-    *also* never referenced after pass 1 consumed the equality, so its
-    slot is pruned too: the relation collapses to a zero-arity
-    proposition ``R()`` (witnessed by the original "is there any row
-    with k=7" question). This is correct: the question reduces to
-    "does R have any row" once we substitute the constant.
+    Pass 1 sees ``(= k 7)`` but cannot eliminate it: ``k`` appears as
+    a membership slot, and there's no DRC representation for "literal
+    at slot k". The existential and equality survive untouched.
+
+    Pass 2 then notices that ``name`` and ``addr`` are bound but never
+    referenced anywhere — those slots are pruned. ``k`` IS referenced
+    by the equality ``(= k 7)`` so its slot is kept. The result is::
+
+        ∃ k. R(k) ∧ (= k 7)
     """
     body = LogicalConnectiveNode(
         operator="and",
@@ -353,9 +395,8 @@ def test_preprocess_for_smt_combines_passes():
     membs = _gather_memberships(out)
     assert len(membs) == 1
     assert membs[0].relation == "R"
-    # All slots get pruned because nothing references the bound names
-    # any more after pass 1 consumed the equality.
-    assert membs[0].variables == []
+    # Only the ``k`` slot survives — it's referenced by the equality.
+    assert membs[0].variables == ["k"]
 
 
 def test_preprocess_for_smt_keeps_referenced_slot():
@@ -419,3 +460,141 @@ def _gather_memberships(node: DRCCondition) -> list[MembershipNode]:
         out.extend(_gather_memberships(node.left))
         out.extend(_gather_memberships(node.right))
     return out
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for the dev_78 false-negative.
+#
+# Background:
+# The runner compares planner-generated DRC vs gold DRC translated from
+# BIRD's reference SQL. The generated side starts as
+#   ``∃ City, ... . schools(..., City, ...) ∧ City = "Adelanto"``
+# while the gold side keeps the equality on a fresh constant
+#   ``schools(..., v_schools_city_10, ...) ∧ v_schools_city_10 = "Adelanto"``.
+# The old equality eliminator rewrote the generated side to drop the
+# binder and the equality, leaving ``schools(..., City, ...)`` with
+# ``City`` now a *free constant* whose value the equivalence check
+# couldn't tie back to "Adelanto". cvc5 reported ``not_equivalent``
+# even though the two formulas describe identical relations.
+#
+# The fix: skip elimination when the bound variable appears as a
+# membership slot AND the would-be replacement is a literal.
+# Variable-to-variable substitution stays available because slots
+# accept variables.
+# ---------------------------------------------------------------------------
+
+
+def test_dev_78_shape_preserves_equality_on_membership_slot():
+    """The exact dev_78 LHS shape: ``∃City. (in (..City..) schools) ∧
+    City = "Adelanto"`` must be preserved."""
+    inner = LogicalConnectiveNode(
+        operator="and",
+        left=MembershipNode(
+            variables=["CDSCode", "City", "GSserved"], relation="schools",
+        ),
+        right=ComparisonNode(
+            operator="=",
+            left=VariableRefNode(name="City"),
+            right=LiteralNode(value="Adelanto", data_type="string"),
+        ),
+    )
+    expr = QuantifierNode(kind="exists", variables=["City"], body=inner)
+
+    out = eliminate_trivial_equalities(expr)
+
+    # The existential survives. We don't pin the exact tree shape
+    # below the existential — only that ``City`` is still a bound name
+    # (not a free constant) and the equality is still around.
+    assert isinstance(out, QuantifierNode)
+    assert out.kind == "exists"
+    assert "City" in out.variables
+
+
+def test_dev_78_pair_preprocessing_keeps_both_sides_aligned():
+    """Through the FULL pipeline, the generated and gold sides reduce
+    to formulas with matching slot signatures.
+
+    This is the regression test for the run-08 dev_78 false negative:
+    feeding both sides through ``preprocess_for_smt_pair`` must produce
+    membership terms that *both* still mention the City slot, otherwise
+    cvc5 sees ill-aligned predicates and reports not-equivalent on
+    formulas that are logically the same."""
+    # Generated side: ``∃ City, GSserved. schools(CDSCode, City, GSserved)
+    #                  ∧ City = "Adelanto"``
+    gen = QuantifierNode(
+        kind="exists",
+        variables=["City", "GSserved"],
+        body=LogicalConnectiveNode(
+            operator="and",
+            left=MembershipNode(
+                variables=["CDSCode", "City", "GSserved"],
+                relation="schools",
+            ),
+            right=ComparisonNode(
+                operator="=",
+                left=VariableRefNode(name="City"),
+                right=LiteralNode(value="Adelanto", data_type="string"),
+            ),
+        ),
+    )
+    # Gold side: same shape but with the converter's fresh-constant
+    # naming convention. The constant ``v_city`` is bound by an
+    # existential just like ``City`` on the generated side.
+    gold = QuantifierNode(
+        kind="exists",
+        variables=["v_city", "v_gss"],
+        body=LogicalConnectiveNode(
+            operator="and",
+            left=MembershipNode(
+                variables=["v_cds", "v_city", "v_gss"], relation="schools",
+            ),
+            right=ComparisonNode(
+                operator="=",
+                left=VariableRefNode(name="v_city"),
+                right=LiteralNode(value="Adelanto", data_type="string"),
+            ),
+        ),
+    )
+
+    pre_gen, pre_gold = preprocess_for_smt_pair(
+        [gen, gold],
+        keep_names={"CDSCode", "v_cds"},
+    )
+
+    gen_membs = _gather_memberships(pre_gen)
+    gold_membs = _gather_memberships(pre_gold)
+    assert len(gen_membs) == 1
+    assert len(gold_membs) == 1
+    # Both sides keep the same number of slots — the City slot must
+    # have survived on the generated side, since it's still constrained
+    # by the equality. (The original bug dropped this slot.)
+    assert len(gen_membs[0].variables) == len(gold_membs[0].variables)
+
+
+def test_eq_elim_with_variable_substitution_into_membership_slot_is_allowed():
+    """Variable-to-variable substitution is still permitted into
+    membership slots — the generated AST is well-formed."""
+    # ``∃ a, b. (in (a) R) ∧ (= a b)`` — eliminate ``a`` (or ``b``),
+    # collapsing to ``∃ x. (in (x) R)``.
+    body = LogicalConnectiveNode(
+        operator="and",
+        left=MembershipNode(variables=["a"], relation="R"),
+        right=ComparisonNode(
+            operator="=",
+            left=VariableRefNode(name="a"),
+            right=VariableRefNode(name="b"),
+        ),
+    )
+    expr = QuantifierNode(kind="exists", variables=["a", "b"], body=body)
+
+    out = eliminate_trivial_equalities(expr)
+
+    # One existential remains, binding either ``a`` or ``b``.
+    assert isinstance(out, QuantifierNode)
+    assert out.kind == "exists"
+    assert len(out.variables) == 1
+    membs = _gather_memberships(out)
+    assert len(membs) == 1
+    assert membs[0].relation == "R"
+    # The membership slot now references the surviving binder.
+    assert membs[0].variables == out.variables

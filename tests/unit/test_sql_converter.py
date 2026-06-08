@@ -1475,3 +1475,151 @@ def test_dev_585_pattern_with_result_variables_emits_clean_sql():
     # underneath stays).
     assert "votes" in sql
     assert "posts" in sql
+
+
+
+# ---------------------------------------------------------------------------
+# GROUP BY emission for ORDER BY containing an aggregate (dev_78)
+# ---------------------------------------------------------------------------
+
+
+def test_group_by_emitted_when_order_by_contains_aggregate():
+    """The dev_78 pattern: SELECT plain-column ORDER BY agg(col) DESC LIMIT 1.
+
+    SQLite (and standard SQL) rejects ``ORDER BY COUNT(c) DESC`` over an
+    unaggregated SELECT list with ``misuse of aggregate``. The fix:
+    when ORDER BY contains an aggregate criterion and the SELECT list
+    is all plain columns, emit ``GROUP BY <plain-cols>`` so the
+    aggregate has a per-group meaning.
+    """
+    from text_to_sql_planner.types.drc import (
+        AggregateVariable,
+        ColumnVariable,
+    )
+    # Use ``SortCriterion``-shaped objects for the order_by argument.
+    from dataclasses import dataclass
+
+    @dataclass
+    class _SortCrit:
+        column: str
+        direction: str = "asc"
+        aggregate: str = ""
+
+    table = _table_leaf("schools", ["GSserved", "City"])
+    sel = _selection_node(
+        table,
+        ComparisonNode(
+            operator="=",
+            left=VariableRefNode(name="City"),
+            right=LiteralNode(value="Adelanto", data_type="string"),
+        ),
+        output_columns=["GSserved", "City"],
+    )
+    proj = _projection_node(sel, ["GSserved"])
+    tree = OperationTree(root=proj)
+
+    result = convert_to_sql(
+        tree,
+        result_variables=[ColumnVariable(name="GSserved")],
+        order_by=[_SortCrit(column="GSserved", direction="desc", aggregate="COUNT")],
+        limit=1,
+    )
+    assert isinstance(result, SQLSuccess), result
+    sql = result.sql
+
+    # GROUP BY appears, scoped to the single SELECT-list column.
+    assert "GROUP BY" in sql, sql
+    # The SELECT list has GSserved (a plain column).
+    assert "GSserved" in sql
+    # ORDER BY references the aggregate.
+    assert "COUNT(" in sql
+    # LIMIT is preserved.
+    assert "LIMIT 1" in sql
+
+
+def test_no_group_by_when_order_by_has_no_aggregate():
+    """Plain SELECT with plain ORDER BY → no GROUP BY (regression check)."""
+    from text_to_sql_planner.types.drc import ColumnVariable
+    from dataclasses import dataclass
+
+    @dataclass
+    class _SortCrit:
+        column: str
+        direction: str = "asc"
+        aggregate: str = ""
+
+    table = _table_leaf("Employees", ["emp_id", "name", "hire_date"])
+    tree = OperationTree(root=table)
+
+    result = convert_to_sql(
+        tree,
+        result_variables=[
+            ColumnVariable(name="emp_id"),
+            ColumnVariable(name="name"),
+            ColumnVariable(name="hire_date"),
+        ],
+        order_by=[_SortCrit(column="hire_date", direction="asc")],
+        limit=10,
+    )
+    assert isinstance(result, SQLSuccess), result
+    # No GROUP BY when nothing's aggregated.
+    assert "GROUP BY" not in result.sql
+
+
+def test_group_by_with_mixed_select_and_aggregate_order_by():
+    """SELECT has multiple plain columns + ORDER BY aggregate → GROUP BY all SELECT cols."""
+    from text_to_sql_planner.types.drc import ColumnVariable
+    from dataclasses import dataclass
+
+    @dataclass
+    class _SortCrit:
+        column: str
+        direction: str = "asc"
+        aggregate: str = ""
+
+    table = _table_leaf("orders", ["region", "category", "qty"])
+    proj = _projection_node(table, ["region", "category"])
+    tree = OperationTree(root=proj)
+
+    result = convert_to_sql(
+        tree,
+        result_variables=[
+            ColumnVariable(name="region"),
+            ColumnVariable(name="category"),
+        ],
+        order_by=[_SortCrit(column="qty", direction="desc", aggregate="SUM")],
+        limit=5,
+    )
+    assert isinstance(result, SQLSuccess), result
+    sql = result.sql
+    # Both SELECT-list columns appear in the GROUP BY.
+    assert "GROUP BY" in sql
+    # Order doesn't matter — confirm both names appear in the GROUP BY clause.
+    group_by_clause = sql[sql.index("GROUP BY"):]
+    assert "region" in group_by_clause
+    assert "category" in group_by_clause
+
+
+def test_group_by_already_emitted_when_select_has_aggregate():
+    """When the SELECT list already mixes column + aggregate, the existing
+    GROUP-BY-from-mixed-select path still runs (regression check)."""
+    from text_to_sql_planner.types.drc import (
+        AggregateVariable,
+        ColumnVariable,
+    )
+
+    table = _table_leaf("orders", ["region", "qty"])
+    tree = OperationTree(root=table)
+
+    result = convert_to_sql(
+        tree,
+        result_variables=[
+            ColumnVariable(name="region"),
+            AggregateVariable(function="SUM", column="qty"),
+        ],
+    )
+    assert isinstance(result, SQLSuccess), result
+    sql = result.sql
+    assert "GROUP BY" in sql
+    assert "region" in sql
+    assert "SUM(" in sql

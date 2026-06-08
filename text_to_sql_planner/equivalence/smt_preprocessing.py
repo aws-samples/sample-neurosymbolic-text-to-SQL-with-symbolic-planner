@@ -105,6 +105,29 @@ def _eliminate_pass(node: DRCCondition) -> DRCCondition:
                 continue
             if _references(expr, var):
                 continue
+            # Membership slots are positional variable names — they
+            # accept variables, not literals. If ``var`` is bound to a
+            # literal but also appears as a membership slot inside the
+            # body, eliminating the existential would orphan the slot:
+            # ``_substitute`` (correctly) refuses to splice a literal
+            # into a positional slot, so the slot would silently become
+            # a free constant of the same name as the eliminated bound
+            # variable, changing the formula's semantics. The dev_78
+            # ``schools(..., City, ...) ∧ City = "Adelanto"`` case is
+            # the canonical instance: City is a membership slot, so
+            # eliminating the existential yields ``schools(..., City,
+            # ...)`` where ``City`` is now a free String constant
+            # instead of the literal "Adelanto".
+            #
+            # Skip elimination when ``expr`` is a literal AND ``var``
+            # appears as a membership-slot variable. Variable-to-
+            # variable substitution is still safe (slots accept
+            # variables), so we only block the literal case.
+            if (
+                isinstance(expr, LiteralNode)
+                and _appears_in_membership_slot(new_body, var)
+            ):
+                continue
             # Determine if `expr` mentions any bound name we're about to
             # remove from the binder. If `expr` is itself a fellow-bound
             # variable (e.g. emp_id_1 = emp_id_2 with both bound here),
@@ -281,6 +304,40 @@ def _references(node: DRCCondition, var: str) -> bool:
         return _references(node.left, var) or _references(node.right, var)
     if isinstance(node, FunctionCallNode):
         return any(_references(a, var) for a in node.arguments)
+    return False
+
+
+def _appears_in_membership_slot(node: DRCCondition, var: str) -> bool:
+    """Does ``node`` contain a membership term whose positional slot
+    list includes ``var``?
+
+    A positive answer means ``var`` is being used as a column-binding
+    name in some ``(in (...) Table)`` term. Eliminating ``var`` by
+    substituting a *literal* would orphan that slot — the resulting
+    membership would still mention the name ``var`` (now a free
+    constant) instead of the literal value. Variable-to-variable
+    substitution is fine; this helper only matters for the literal case.
+
+    Inner quantifiers that re-bind ``var`` shadow the search, mirroring
+    ``_references``.
+    """
+    if node is None:
+        return False
+    if isinstance(node, MembershipNode):
+        return var in node.variables
+    if isinstance(node, QuantifierNode):
+        if var in node.variables:
+            return False  # shadowed
+        return _appears_in_membership_slot(node.body, var)
+    if isinstance(node, LogicalConnectiveNode):
+        return (
+            _appears_in_membership_slot(node.left, var)
+            or _appears_in_membership_slot(node.right, var)
+        )
+    if isinstance(node, NotNode):
+        return _appears_in_membership_slot(node.operand, var)
+    # Comparison / arithmetic / function-call / variable-ref / literal:
+    # references count as references-only, not membership slots.
     return False
 
 

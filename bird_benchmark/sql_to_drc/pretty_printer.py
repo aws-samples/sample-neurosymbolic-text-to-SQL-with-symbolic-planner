@@ -71,6 +71,7 @@ from text_to_sql_planner.types.drc import (
     LiteralNode,
     LogicalConnectiveNode,
     MembershipNode,
+    QuantifierNode,
     QueryExpression,
     query_inner_drc,
 )
@@ -114,6 +115,18 @@ def _split_top_level_and(
         if isinstance(node, LogicalConnectiveNode) and node.operator == "and":
             visit(node.left)
             visit(node.right)
+            return
+        if isinstance(node, QuantifierNode) and node.kind == "exists":
+            # The translator wraps the body in an outer existential
+            # binding every FROM-clause variable that isn't a result
+            # variable (so the formula has no free filter variables).
+            # The pretty-printer treats those bindings transparently:
+            # the bound names are exactly the ones that already appear
+            # inside the body's memberships, so re-rendering them as
+            # SELECT-list aliases works the same way regardless of
+            # whether they're free or existentially bound. Descend
+            # into the body and continue collecting.
+            visit(node.body)
             return
         if isinstance(node, MembershipNode):
             memberships.append(node)

@@ -127,19 +127,41 @@ class TableRef:
 
 
 @dataclass
+class DerivedTable:
+    """A parenthesised subquery used as a FROM source.
+
+    SQL example::
+
+        FROM (SELECT m.id, COUNT(*) AS n FROM x WHERE … GROUP BY m.id) AS t
+
+    The inner :class:`SelectStatement` is parsed independently and
+    aliased to ``alias`` in the enclosing scope. The translator
+    inlines the subquery's body into the outer DRC, exposing each
+    of the subquery's projected columns under ``alias.col`` lookups.
+
+    Unlike :class:`TableRef`, ``alias`` is required — SQL requires
+    every derived table to be aliased.
+    """
+
+    subquery: "SelectStatement"
+    alias: str
+    pos: Position
+
+
+@dataclass
 class InnerJoin:
-    right: TableRef
+    right: "TableRef | DerivedTable"
     on: Expression
     pos: Position
 
 
 @dataclass
 class JoinChain:
-    base: TableRef
+    base: "TableRef | DerivedTable"
     joins: list[InnerJoin]
 
 
-TableSource = Union[TableRef, JoinChain]
+TableSource = Union[TableRef, DerivedTable, JoinChain]
 
 
 # --- SELECT statement ------------------------------------------------------
@@ -191,6 +213,7 @@ __all__ = [
     "ExistsExpr",
     "OrderKey",
     "TableRef",
+    "DerivedTable",
     "InnerJoin",
     "JoinChain",
     "TableSource",

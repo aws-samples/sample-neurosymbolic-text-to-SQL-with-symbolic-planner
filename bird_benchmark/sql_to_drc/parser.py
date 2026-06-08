@@ -41,7 +41,7 @@ Explicitly out-of-scope (Req 2.4)
 - ``HAVING`` clauses
 - Window functions (``... OVER (...)``)
 - ``CASE`` expressions
-- ``LIKE``, ``BETWEEN``, ``IS NULL`` / ``IS NOT NULL``, bare ``NULL``
+- ``BETWEEN``, ``IS NULL`` / ``IS NOT NULL``, bare ``NULL``
 - Recursive queries
 
 Each detected out-of-scope construct yields
@@ -76,6 +76,7 @@ from .ast import (
     AggregateFunction,
     BinaryOp,
     ColumnRef,
+    DerivedTable,
     ExistsExpr,
     Expression,
     FunctionCall,
@@ -334,7 +335,7 @@ class _Parser:
     # ----- grammar: table_source / table_ref ------------------------------
 
     def _parse_table_source(self) -> TableSource:
-        base = self._parse_table_ref()
+        base = self._parse_table_atom()
         joins: list[InnerJoin] = []
         while True:
             tok = self.peek()
@@ -343,7 +344,7 @@ class _Parser:
             kw = tok.text.upper()
             if kw == "JOIN":
                 join_tok = self.advance()
-                right = self._parse_table_ref()
+                right = self._parse_table_atom()
                 self.expect_keyword("ON")
                 on = self.parse_expr()
                 joins.append(
@@ -362,7 +363,7 @@ class _Parser:
                         _describe_expected("JOIN", bad), bad
                     )
                 self.advance()  # JOIN
-                right = self._parse_table_ref()
+                right = self._parse_table_atom()
                 self.expect_keyword("ON")
                 on = self.parse_expr()
                 joins.append(
@@ -387,6 +388,52 @@ class _Parser:
         if joins:
             return JoinChain(base=base, joins=joins)
         return base
+
+    def _parse_table_atom(self) -> TableRef | DerivedTable:
+        """Parse one FROM/JOIN table atom: either a bare table reference
+        or a parenthesised subquery (a derived table).
+
+        SQL grammar at this level::
+
+            table_atom := IDENT [AS? IDENT]              -- TableRef
+                        | "(" SELECT_stmt ")" AS? IDENT  -- DerivedTable
+
+        The derived-table form requires an alias (SQLite enforces
+        this; we mirror the constraint and emit a structured parse
+        error for missing alias).
+        """
+        # Derived table: ``(SELECT ...) [AS] alias``.
+        if self.at_op("("):
+            open_tok = self.advance()  # consume '('
+            if not self.at_keyword("SELECT") and not self.at_keyword("WITH"):
+                # Not a derived subquery — restore the paren and
+                # re-raise as a parse error. (We don't currently
+                # support parenthesised join expressions, just bare
+                # table refs and subqueries.)
+                bad = self.peek()
+                raise self._fail_parse(
+                    _describe_expected("SELECT", bad), bad
+                )
+            sub = self.parse_select_stmt()
+            self.expect_op(")")
+            # SQLite requires an alias on derived tables.
+            alias: str | None = None
+            if self.at_keyword("AS"):
+                self.advance()
+                alias = self.expect_ident().text
+            elif self.peek().kind == TokenKind.IDENT:
+                alias = self.advance().text
+            if alias is None:
+                bad = self.peek()
+                raise self._fail_parse(
+                    "derived table requires an alias", bad,
+                )
+            return DerivedTable(
+                subquery=sub,
+                alias=alias,
+                pos=Position(open_tok.line, open_tok.column),
+            )
+        return self._parse_table_ref()
 
     def _parse_table_ref(self) -> TableRef:
         name_tok = self.expect_ident()
@@ -527,8 +574,19 @@ class _Parser:
         if tok.kind == TokenKind.KEYWORD:
             kw = tok.text.upper()
             if kw == "LIKE":
-                raise self._fail_unsupported(
-                    "LIKE", "LIKE operator is not supported", tok
+                # ``lhs LIKE pattern`` — emitted as a binary operator with
+                # the literal ``LIKE`` keyword as the op string. The
+                # translator turns this into a ``FunctionCallNode("LIKE",
+                # [lhs, pattern])`` so the SMT layer can declare a
+                # consistent uninterpreted Bool predicate on both sides
+                # of the equivalence check.
+                op_tok = self.advance()
+                right = self._parse_concat_expr()
+                return BinaryOp(
+                    op="LIKE",
+                    left=left,
+                    right=right,
+                    pos=Position(op_tok.line, op_tok.column),
                 )
             if kw == "BETWEEN":
                 raise self._fail_unsupported(

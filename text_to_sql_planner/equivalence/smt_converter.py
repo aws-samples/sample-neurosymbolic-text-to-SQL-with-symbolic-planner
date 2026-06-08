@@ -48,6 +48,17 @@ def convert_to_smt(condition: DRCCondition) -> str:
             sorts = " ".join(["Int"] * arity)
         lines.append(f"(declare-fun {rel_name} ({sorts}) Bool)")
 
+    # Declare any uninterpreted DRC function (e.g. ``LIKE``,
+    # ``STRFTIME``) used by the formula. Without these
+    # declarations cvc5 hits an unknown function symbol and exits
+    # before attempting the proof.
+    fn_sigs = collect_function_signatures(condition, var_types)
+    for fn_name in sorted(fn_sigs):
+        arg_sorts, ret_sort = fn_sigs[fn_name]
+        ret_sort_smt = _smt_sort(ret_sort)
+        sorts_str = " ".join(arg_sorts)
+        lines.append(f"(declare-fun {fn_name} ({sorts_str}) {ret_sort_smt})")
+
     # Assert the formula
     formula = _convert_node(condition, var_types)
     lines.append(f"(assert {formula})")
@@ -144,6 +155,19 @@ def _infer_types(node: DRCCondition, var_types: dict[str, str]) -> None:
             var_types.setdefault(node.right.name, "Int")
         _infer_types(node.left, var_types)
         _infer_types(node.right, var_types)
+
+    elif isinstance(node, FunctionCallNode):
+        # ``LIKE(haystack, pattern)`` — both operands are SQL strings.
+        # SQLite only matches LIKE on TEXT (or text-affinity) columns,
+        # so any bare-variable operand is a String. Without this rule
+        # ``Title`` in ``WHERE Title LIKE '%data%'`` would default to
+        # Int and the LIKE declaration would mix sorts.
+        if node.function == "LIKE":
+            for arg in node.arguments:
+                if isinstance(arg, VariableRefNode):
+                    var_types[arg.name] = "String"
+        for arg in node.arguments:
+            _infer_types(arg, var_types)
 
 
 def _collect_relation_sorts(
@@ -391,7 +415,36 @@ def _convert_node_for_comparison(node: DRCCondition, var_types: dict[str, str], 
         int_val = _date_string_to_int(str(node.value))
         if int_val is not None:
             return str(int_val)
+        # Bare integer-shaped strings (e.g. ``"1980"``, ``"42"``) compared
+        # under an ordering operator collapse to their integer value too.
+        # SQLite's STRFTIME-vs-year-literal pattern (``STRFTIME('%Y', dob)
+        # > '1980'``) lands here: with the LHS uninterpreted function
+        # declared as ``Int``-returning, the RHS literal must also be
+        # ``Int`` or cvc5 rejects the comparison with a sort mismatch.
+        # We only do this for ordering operators because equality on
+        # the same shape ``= "1980"`` is genuinely a string comparison.
+        bare_int = _bare_int_string_to_int(str(node.value))
+        if bare_int is not None:
+            return str(bare_int)
     return _convert_node(node, var_types, scope)
+
+
+def _bare_int_string_to_int(s: str) -> int | None:
+    """Parse ``s`` as an integer, returning ``None`` if it isn't one.
+
+    Accepts an optional leading ``-`` and rejects empty / whitespace-only
+    inputs. Used by :func:`_convert_node_for_comparison` to coerce
+    bare-integer string literals (``"1980"``) under ordering operators
+    so they typecheck against an ``Int``-returning uninterpreted
+    function on the other side.
+    """
+    s = s.strip()
+    if not s:
+        return None
+    try:
+        return int(s)
+    except ValueError:
+        return None
 
 
 def _date_string_to_int(s: str) -> int | None:
@@ -480,3 +533,276 @@ def _convert_literal(node: LiteralNode) -> str:
         if isinstance(value, float) and value == int(value):
             return str(int(value))
         return str(value)
+
+
+# ---------------------------------------------------------------------------
+# Uninterpreted-function declarations
+#
+# DRC ``FunctionCallNode`` nodes whose head is not one of the
+# converter's built-ins (``CURRENT_DATE``, ``DATE_SUB``, ``DATE_ADD``,
+# ``DATEDIFF``) are emitted into the SMT script verbatim as
+# ``(<head> <args...>)``. cvc5 rejects such calls unless the head has
+# been declared, so we must emit a matching ``(declare-fun ...)`` for
+# every uninterpreted head, with sorts inferred from the call site.
+#
+# Two cases the BIRD evaluator hits in practice:
+#
+# 1. ``LIKE`` — emitted by the SQL→DRC translator from ``col LIKE
+#    '%pattern%'``. Always appears at a Boolean position (top-level
+#    conjunct in a WHERE clause), with two String operands.
+# 2. ``STRFTIME`` — preserved verbatim from BIRD's gold SQL. Appears
+#    inside an ordering comparison ``(> (STRFTIME '%Y' dob) '1980')``
+#    where both the column and the year literal are coerced to ``Int``
+#    by the existing inference rules.
+#
+# The collector returns one signature per head. When a head shows up
+# multiple times in the same condition, we unify the per-position
+# sorts the same way relation slots are unified (String wins over
+# Int). Return sort follows a similar rule: if any call site demands
+# a Bool return (head appears as a child of ``and``/``or``/``not``,
+# or as a top-level assertion), we declare the head Bool; otherwise
+# the return sort follows whatever sort the surrounding comparison /
+# arithmetic context demands.
+# ---------------------------------------------------------------------------
+
+# Built-in function heads the SMT converter translates natively, NOT
+# as uninterpreted-function calls. These must match the
+# ``_convert_function_call`` dispatch above.
+_SMT_BUILTIN_FUNCTIONS: frozenset[str] = frozenset(
+    {"CURRENT_DATE", "DATE_SUB", "DATE_ADD", "DATEDIFF"}
+)
+
+
+def collect_function_signatures(
+    condition: DRCCondition,
+    var_types: dict[str, str],
+) -> dict[str, tuple[list[str], str]]:
+    """Return a ``{function_head: (arg_sorts, return_sort)}`` map for
+    every uninterpreted ``FunctionCallNode`` in ``condition``.
+
+    Sort inference:
+
+    * Each argument's sort comes from its expression form — variables
+      look up in ``var_types``, literals use their own data type
+      (numeric ⇒ Int, string ⇒ String), nested function calls recurse,
+      etc. See :func:`_infer_node_sort`.
+    * The return sort is determined by where the call appears:
+      Bool when it sits at a Boolean position (assertion top, child of
+      a logical connective, child of NOT), and the comparison's
+      "other side" sort when it sits at a value position. Multiple
+      sites unify with String beating Int beating Bool (Bool only
+      survives if every site is Bool).
+    * Multiple sites for the same head unify per-argument-position
+      with the same String-wins rule.
+
+    Built-in heads in :data:`_SMT_BUILTIN_FUNCTIONS` are skipped — they
+    are translated natively, not declared.
+    """
+
+    signatures: dict[str, tuple[list[str], str]] = {}
+    _collect_function_signatures(
+        condition, var_types, signatures, return_context="bool",
+    )
+    return signatures
+
+
+def _collect_function_signatures(
+    node: DRCCondition,
+    var_types: dict[str, str],
+    sigs: dict[str, tuple[list[str], str]],
+    return_context: str,
+) -> None:
+    """Walk ``node``, recording each uninterpreted function call's
+    inferred sort signature. ``return_context`` is the sort the call
+    site demands: ``"bool"`` at logical / assertion positions, an
+    SMT sort name (``"Int"`` / ``"String"``) at value positions.
+    """
+    if node is None:
+        return
+
+    if isinstance(node, FunctionCallNode):
+        if node.function not in _SMT_BUILTIN_FUNCTIONS:
+            arg_sorts = [
+                _infer_node_sort(a, var_types) for a in node.arguments
+            ]
+            existing = sigs.get(node.function)
+            if existing is None:
+                sigs[node.function] = (arg_sorts, return_context)
+            else:
+                ex_args, ex_ret = existing
+                merged_args = _merge_sort_lists(ex_args, arg_sorts)
+                merged_ret = _merge_return_sort(ex_ret, return_context)
+                sigs[node.function] = (merged_args, merged_ret)
+        # Function arguments are value-position. Their sort context is
+        # whatever the function declares for that argument position —
+        # but since we're inferring that here, we recurse with
+        # ``"value"`` (a placeholder meaning "don't tighten the
+        # context"); only nested *Boolean* contexts matter for the
+        # outer call's return-sort decision.
+        for arg in node.arguments:
+            _collect_function_signatures(arg, var_types, sigs, "value")
+        return
+
+    if isinstance(node, ComparisonNode):
+        # Each side is at value position; the other side determines
+        # the return-sort context for any function call landing here.
+        # Under ordering operators, the same string-coercion rule that
+        # ``_convert_node_for_comparison`` uses (date strings → Int,
+        # bare-integer strings → Int) applies to the type-inference
+        # context too — otherwise a function on the other side gets
+        # declared with a String return that mismatches the literal's
+        # render as an Int.
+        is_ordering = node.operator in ("<", ">", "<=", ">=")
+        left_sort = _infer_node_sort_in_context(
+            node.right, var_types, is_ordering
+        )
+        right_sort = _infer_node_sort_in_context(
+            node.left, var_types, is_ordering
+        )
+        _collect_function_signatures(node.left, var_types, sigs, left_sort)
+        _collect_function_signatures(node.right, var_types, sigs, right_sort)
+        return
+
+    if isinstance(node, ArithmeticNode):
+        # Arithmetic operands are Int-context (the SMT layer translates
+        # ``+ - * /`` over Int arguments).
+        _collect_function_signatures(node.left, var_types, sigs, "Int")
+        _collect_function_signatures(node.right, var_types, sigs, "Int")
+        return
+
+    if isinstance(node, LogicalConnectiveNode):
+        _collect_function_signatures(node.left, var_types, sigs, "bool")
+        _collect_function_signatures(node.right, var_types, sigs, "bool")
+        return
+
+    if isinstance(node, NotNode):
+        _collect_function_signatures(node.operand, var_types, sigs, "bool")
+        return
+
+    if isinstance(node, QuantifierNode):
+        _collect_function_signatures(node.body, var_types, sigs, "bool")
+        return
+
+    # MembershipNode, VariableRefNode, LiteralNode: no nested function
+    # calls in our DRC AST, so nothing to recurse into.
+
+
+def _infer_node_sort(node: DRCCondition, var_types: dict[str, str]) -> str:
+    """Best-effort sort inference for an expression-position node.
+
+    Variables look up in ``var_types``, defaulting to ``Int``. Literals
+    use their data type. Function calls recurse. Arithmetic is ``Int``.
+    Anything else falls back to ``Int`` — the conservative choice that
+    matches the rest of the converter's defaults.
+    """
+    return _infer_node_sort_in_context(node, var_types, is_ordering=False)
+
+
+def _infer_node_sort_in_context(
+    node: DRCCondition, var_types: dict[str, str], is_ordering: bool
+) -> str:
+    """Like :func:`_infer_node_sort` but aware of ordering-comparison
+    coercion.
+
+    Under an ordering operator (``<`` / ``>`` / ``<=`` / ``>=``), a
+    string literal that parses as a date or as a bare integer is
+    rendered as the corresponding ``Int`` by
+    :func:`_convert_node_for_comparison`. The signature inference must
+    apply the same rule, otherwise a function on the other side of the
+    comparison gets declared with a ``String`` return sort and cvc5
+    rejects the comparison with an arithmetic-subterm error.
+    """
+    if isinstance(node, LiteralNode):
+        if node.data_type == "string" and is_ordering:
+            if _date_string_to_int(str(node.value)) is not None:
+                return "Int"
+            if _bare_int_string_to_int(str(node.value)) is not None:
+                return "Int"
+        if node.data_type == "string":
+            return "String"
+        return "Int"
+    if isinstance(node, VariableRefNode):
+        return var_types.get(node.name, "Int")
+    if isinstance(node, FunctionCallNode):
+        if node.function == "CURRENT_DATE":
+            return "Int"
+        if node.function in ("DATE_SUB", "DATE_ADD", "DATEDIFF"):
+            return "Int"
+        return "Int"
+    if isinstance(node, ArithmeticNode):
+        return "Int"
+    return "Int"
+
+
+def _merge_sort_lists(a: list[str], b: list[str]) -> list[str]:
+    """Per-position sort unification with String beating Int beating Bool.
+
+    Lists may have different lengths; the longer one's tail is kept
+    verbatim. This matches the relation-slot unification rule in
+    :func:`_collect_relation_sorts`.
+    """
+    out: list[str] = []
+    for i in range(max(len(a), len(b))):
+        left = a[i] if i < len(a) else None
+        right = b[i] if i < len(b) else None
+        if left is None:
+            out.append(right or "Int")
+        elif right is None:
+            out.append(left)
+        else:
+            out.append(_dominant_sort(left, right))
+    return out
+
+
+def _merge_return_sort(a: str, b: str) -> str:
+    """Unify two return-sort guesses. ``bool`` only survives if both
+    sites demand Bool — otherwise the value-position guess wins.
+
+    We treat ``"value"`` as "no preference"; a more specific guess
+    overrides it.
+    """
+    if a == b:
+        return a
+    if a == "value":
+        return b
+    if b == "value":
+        return a
+    if a == "bool" or b == "bool":
+        # One site says Bool, the other a value sort. Value wins —
+        # if a function appears in a comparison, it must return a
+        # value, even if it also appears bare somewhere (in which
+        # case the bare site is genuinely a Bool comparison too,
+        # which is unusual but legal).
+        return a if b == "bool" else b
+    return _dominant_sort(a, b)
+
+
+def _dominant_sort(a: str, b: str) -> str:
+    """Return the dominant sort between ``a`` and ``b``.
+
+    ``String`` beats ``Int`` beats ``Bool``. This mirrors the
+    relation-slot unification's "String wins" semantics: if any call
+    site uses the function with a String operand or in a String-yielding
+    comparison, the declaration must accommodate that or the script
+    fails to typecheck.
+    """
+    rank = {"Bool": 0, "Int": 1, "String": 2}
+    if rank.get(a, 1) >= rank.get(b, 1):
+        return a
+    return b
+
+
+def _smt_sort(sort_or_context: str) -> str:
+    """Translate a return-sort context tag back to an SMT-LIB sort.
+
+    ``"bool"`` (the assertion-position context) maps to ``"Bool"``.
+    ``"value"`` (the no-preference fallback) maps to ``"Int"`` —
+    nothing in the formula tightened the inference, so default to the
+    same sort the rest of the converter falls back to. Anything else
+    is already an SMT-LIB sort name and passes through unchanged.
+    """
+    if sort_or_context == "bool":
+        return "Bool"
+    if sort_or_context == "value":
+        return "Int"
+    return sort_or_context

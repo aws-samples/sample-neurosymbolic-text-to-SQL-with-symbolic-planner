@@ -461,6 +461,37 @@ def _build_equivalence_script(
             sorts = " ".join(["Int"] * arity)
         lines.append(f"(declare-fun {rel_name} ({sorts}) Bool)")
 
+    # Declare uninterpreted DRC function heads (e.g. ``LIKE``,
+    # ``STRFTIME``) used by either side of the equivalence check.
+    # The signatures are unified across both sides so a head that
+    # appears with the same arg-sorts and return-sort on both sides
+    # gets one consistent declaration; an arity mismatch here would
+    # be a genuine "the two sides are calling the same name with
+    # different shapes" bug, which the unification turns into a
+    # widened declaration both sides typecheck against.
+    from .smt_converter import collect_function_signatures, _smt_sort
+    fn_sigs1 = collect_function_signatures(expr1.condition, all_var_types)
+    fn_sigs2 = collect_function_signatures(expr2.condition, all_var_types)
+    all_fn_sigs: dict[str, tuple[list[str], str]] = {}
+    for fname, sig in fn_sigs1.items():
+        all_fn_sigs[fname] = sig
+    for fname, sig in fn_sigs2.items():
+        if fname not in all_fn_sigs:
+            all_fn_sigs[fname] = sig
+        else:
+            from .smt_converter import _merge_sort_lists, _merge_return_sort
+            ex_args, ex_ret = all_fn_sigs[fname]
+            new_args, new_ret = sig
+            all_fn_sigs[fname] = (
+                _merge_sort_lists(ex_args, new_args),
+                _merge_return_sort(ex_ret, new_ret),
+            )
+    for fn_name in sorted(all_fn_sigs):
+        arg_sorts, ret_sort = all_fn_sigs[fn_name]
+        ret_sort_smt = _smt_sort(ret_sort)
+        sorts_str = " ".join(arg_sorts)
+        lines.append(f"(declare-fun {fn_name} ({sorts_str}) {ret_sort_smt})")
+
     # Free variables = everything used in either condition that wasn't a
     # result variable on its own side. With substitution in place, the
     # result variables vanish from the formula, replaced by the shared
@@ -486,9 +517,31 @@ def _build_equivalence_script(
     # model that satisfies every assertion, so axioms here become
     # facts the equivalence proof gets to assume. The runner uses
     # this for foreign-key referential-integrity axioms.
+    #
+    # Axioms reference predicates at their full declared arity (the
+    # FK axioms the runner builds use every column of every joined
+    # table). The pre-SMT preprocessing pass above can prune unused
+    # slots out of the equivalence assertion's predicate calls,
+    # which in turn shrinks each predicate's ``(declare-fun ...)``
+    # signature to the slots actually used. When that happens, an
+    # axiom that calls the same predicate at *full* arity is
+    # ill-typed against the script's declaration, and cvc5 exits
+    # with a parse error before solving anything (dev_78's run-06
+    # was the first instance).
+    #
+    # We can't soundly *expand* a pruned predicate's declaration
+    # back to full width to satisfy the axioms — that would let the
+    # equivalence assertion's pruned calls typecheck against more
+    # slots than they were rendered with. The principled response
+    # is to drop axioms whose predicate calls don't match the
+    # post-pruning signatures: an FK axiom is *optional* extra
+    # information for the equivalence proof, so dropping it just
+    # means cvc5 has slightly less to work with — strictly better
+    # than crashing the solver.
     if axioms:
         for axiom in axioms:
-            lines.append(axiom)
+            if _axiom_predicate_arities_match(axiom, all_relations):
+                lines.append(axiom)
 
     # When the caller named the two sides, drop a comment above the
     # equivalence assertion that maps "first formula" -> LHS and
@@ -503,6 +556,220 @@ def _build_equivalence_script(
 
     lines.append("(check-sat)")
     return "\n".join(lines)
+
+
+def _axiom_predicate_arities_match(
+    axiom: str, predicate_arities: dict[str, int]
+) -> bool:
+    """Decide whether ``axiom`` is well-typed against the script's
+    predicate-arity declarations.
+
+    The axiom is an SMT-LIB ``(assert ...)`` string built by the
+    runner from BIRD's foreign-key metadata. Each axiom calls one or
+    more uninterpreted predicates (the table names) at the table's
+    *full* schema arity. The equivalence checker's pre-SMT
+    preprocessing may have pruned unused slots from those same
+    predicates inside the equivalence assertion, which compresses
+    each ``(declare-fun T (sorts) Bool)`` to the slots actually used.
+    When that happens an axiom referencing ``T`` at full width is
+    ill-typed against the script's declaration and cvc5 exits with
+    a parse error.
+
+    We solve this with two checks while walking the axiom's
+    S-expression form:
+
+    1. **Undeclared predicate** — if the axiom calls a relation
+       predicate that the equivalence script never declares (because
+       the query touches only a subset of the schema's tables, but
+       the FK metadata spans the whole database), cvc5 hits an
+       unknown function symbol and exits. Such an axiom is useless
+       for the proof anyway — it constrains tables the query doesn't
+       mention — so we drop it. Relation heads are distinguished
+       from SMT-LIB built-ins (``and``, ``=``, ``forall``, …) by an
+       explicit built-in set.
+    2. **Arity mismatch** — every predicate call ``(T arg1 …)`` whose
+       head ``T`` is a declared relation must call ``T`` with exactly
+       the declared number of arguments (slot pruning can shrink the
+       declared arity below the axiom's full-schema width).
+
+    Either check failing drops the axiom — it's optional information
+    for the equivalence proof, and shipping a malformed axiom to cvc5
+    crashes the entire solver.
+
+    Implementation: paren-balanced scan with quote awareness, same
+    technique used in the question-converter's last-S-expression
+    extractor. No regex, no string heuristics.
+    """
+
+    if not axiom:
+        return True
+    if not predicate_arities:
+        # No declared relations to check against. An axiom that
+        # references *any* relation predicate would be undeclared, so
+        # the safe thing is to drop it — but with an empty map we
+        # can't tell relation heads from built-ins, and the caller
+        # only invokes this when there are axioms to filter, so treat
+        # the empty-map case as "keep" (the caller guards axiom use
+        # behind the equivalence script having relations anyway).
+        return True
+
+    # Tokenise the axiom into atoms / parens, with quote awareness
+    # so a string literal like ``"foo bar"`` doesn't split.
+    tokens = _smt_tokenise(axiom)
+
+    # Walk the token stream; for each ``(`` whose immediately-next
+    # token is the head of a predicate call, count the remaining
+    # children at that depth and compare to the declared arity.
+    #
+    # Child counting: every direct child of an open ``(`` — whether
+    # it's an atom or a nested ``(...)`` form — counts as one. The
+    # head atom that immediately follows the open paren also counts
+    # as a child, so when we close the paren we subtract one to get
+    # the argument count. We bump the parent's counter both when we
+    # see a direct atom at the current depth AND when a nested form
+    # closes (the matching ``)``).
+    depth_stack: list[int] = []  # one entry per open paren — child count so far
+    head_stack: list[str | None] = []  # the head atom for each open paren
+    # ``binding_depth`` marks the paren depth at which a quantifier
+    # binding list begins (the ``((x Int) (y Int))`` after ``forall`` /
+    # ``exists`` / ``let``). Everything strictly inside that list is a
+    # sorted-variable declaration, NOT a predicate call, so we suspend
+    # the undeclared-predicate / arity checks until the list closes.
+    # ``None`` when we're not inside a binding list.
+    binding_depth: int | None = None
+
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok == "(":
+            # Look ahead for the head atom (the next non-paren token).
+            head: str | None = None
+            if i + 1 < len(tokens) and tokens[i + 1] not in ("(", ")"):
+                head = tokens[i + 1]
+
+            # If the immediately-enclosing form is a quantifier / let
+            # and this ``(`` opens its binding list, enter
+            # binding-list mode. The binding list is the first child
+            # *after* the head atom — and since the head atom already
+            # counted as child #1 (the "head counts as a child,
+            # subtract one later" convention), the parent's child
+            # count is exactly 1 at this point.
+            parent_is_binder = (
+                head_stack
+                and head_stack[-1] in ("forall", "exists", "let")
+            )
+            parent_child_count = depth_stack[-1] if depth_stack else -1
+            if (
+                binding_depth is None
+                and parent_is_binder
+                and parent_child_count == 1
+            ):
+                binding_depth = len(depth_stack)  # depth of the binding list
+
+            depth_stack.append(0)
+            head_stack.append(head)
+        elif tok == ")":
+            if not depth_stack:
+                # Unbalanced — bail conservatively (treat axiom as OK
+                # so we don't drop axioms over parser bugs).
+                return True
+            closing_depth = len(depth_stack) - 1
+            child_count = depth_stack.pop()
+            head = head_stack.pop()
+
+            # Are we closing the binding list itself?
+            if binding_depth is not None and closing_depth == binding_depth:
+                binding_depth = None
+            elif (
+                binding_depth is None
+                and head is not None
+                and head not in _SMT_BUILTIN_HEADS
+            ):
+                # A non-built-in head outside any binding list is a
+                # relation predicate call.
+                if head not in predicate_arities:
+                    # Undeclared relation — cvc5 would reject the
+                    # whole script. Drop the axiom.
+                    return False
+                # ``child_count`` counts every child token at this
+                # depth, including the head atom itself, so subtract
+                # one to get the argument count.
+                actual_args = child_count - 1
+                if actual_args != predicate_arities[head]:
+                    return False
+            # The closed form is itself a direct child of its parent.
+            if depth_stack:
+                depth_stack[-1] += 1
+        else:
+            # A direct atomic child of the current open paren.
+            if depth_stack:
+                depth_stack[-1] += 1
+        i += 1
+
+    return True
+
+
+# SMT-LIB heads that are *not* relation-predicate calls. Any other
+# ``(head …)`` form in an FK axiom is a call to a table predicate,
+# whose declaration / arity we then verify. Sort names (``Int`` /
+# ``String``) never appear in head position in the axioms the runner
+# builds, so they don't need to be listed here.
+_SMT_BUILTIN_HEADS: frozenset[str] = frozenset(
+    {
+        "assert", "forall", "exists", "let",
+        "and", "or", "not", "=>", "ite",
+        "=", "!=", "distinct", "<", ">", "<=", ">=",
+        "+", "-", "*", "/",
+    }
+)
+
+
+def _smt_tokenise(text: str) -> list[str]:
+    """Return a list of paren / atom tokens for an SMT-LIB string.
+
+    Atoms are runs of non-whitespace, non-paren, non-quote characters.
+    Double-quoted strings (with backslash-escape support) are emitted
+    as single atoms so quoted parens / spaces don't split.
+    Semicolon comments (``;; …``) are skipped to end-of-line.
+    """
+
+    tokens: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch.isspace():
+            i += 1
+            continue
+        if ch == ";":
+            # Skip rest of line.
+            while i < n and text[i] != "\n":
+                i += 1
+            continue
+        if ch == "(" or ch == ")":
+            tokens.append(ch)
+            i += 1
+            continue
+        if ch == '"':
+            j = i + 1
+            while j < n:
+                if text[j] == "\\" and j + 1 < n:
+                    j += 2
+                    continue
+                if text[j] == '"':
+                    j += 1
+                    break
+                j += 1
+            tokens.append(text[i:j])
+            i = j
+            continue
+        # Plain atom.
+        j = i
+        while j < n and not text[j].isspace() and text[j] not in "();\"":
+            j += 1
+        tokens.append(text[i:j])
+        i = j
+    return tokens
 
 
 async def _run_parallel_checks(

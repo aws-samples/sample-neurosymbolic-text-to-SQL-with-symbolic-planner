@@ -38,7 +38,9 @@ _MAX_NESTING_DEPTH = 50
 _COMPARISON_OPS = frozenset({"=", "!=", "<", ">", "<=", ">="})
 _ARITHMETIC_OPS = frozenset({"+", "-", "*", "/"})
 _LOGICAL_BINARY_OPS = frozenset({"and", "or", "implies"})
-_BUILTIN_FUNCTIONS = frozenset({"DATE_SUB", "DATE_ADD", "YEAR", "MONTH", "DAY", "DATEDIFF"})
+_BUILTIN_FUNCTIONS = frozenset(
+    {"DATE_SUB", "DATE_ADD", "YEAR", "MONTH", "DAY", "DATEDIFF", "LIKE"}
+)
 _QUANTIFIER_OPS = frozenset({"forall", "exists"})
 _AGGREGATE_FUNCS = frozenset({"COUNT", "SUM", "AVG", "MIN", "MAX"})
 
@@ -423,6 +425,12 @@ class _Parser:
             result = self._parse_membership()
         elif op in _BUILTIN_FUNCTIONS or op == "CURRENT_DATE":
             result = self._parse_function_call(op)
+        elif op.upper() == "LIKE":
+            # The LLM sometimes emits lowercase ``like``; the SQL→DRC
+            # translator emits uppercase ``LIKE``. Accept both and
+            # normalise to uppercase so the SMT converter sees one
+            # consistent function head.
+            result = self._parse_function_call("LIKE")
         else:
             raise ParseError(
                 offset=op_token.offset,

@@ -301,6 +301,7 @@ Syntax rules:
 - Quantifiers: (exists (var1 var2 ...) body), (forall (var1 var2 ...) body)
   - Quantifiers just bind variables. Use (in ...) inside the body to constrain them to a relation.
 - Date functions: CURRENT_DATE (today's date), (DATE_SUB expr days) (subtract days from a date), (DATEDIFF expr1 expr2) (days between two dates)
+- String pattern matching: (LIKE column "pattern") — SQL LIKE semantics. Use ``%`` as a wildcard in the pattern. ``"%data%"`` matches any string containing ``data``; ``"data%"`` matches a prefix; ``"%data"`` matches a suffix.
 - Literals: strings in double quotes "hello", numbers as-is 42
 - Variables: plain identifiers like name, age, id
 

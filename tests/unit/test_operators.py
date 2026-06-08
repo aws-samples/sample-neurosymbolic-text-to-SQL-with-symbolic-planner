@@ -938,25 +938,61 @@ class TestAggregate:
         )
         assert isinstance(result, OperatorFailure)
 
-    def test_rejects_input_with_more_than_one_result_variable(self):
-        """Aggregate is single-column only — project first if needed."""
+    def test_promotes_one_column_with_group_keys_intact(self):
+        """Group-by mode: input has multiple result variables; the named
+        column is promoted, the others stay as plain group keys."""
+        from text_to_sql_planner.types.drc import AggregateVariable
+
         rel = DRCExpression(
             result_variables=[
+                ColumnVariable(name="dept_id"),
                 ColumnVariable(name="emp_id"),
-                ColumnVariable(name="salary"),
             ],
             condition=MembershipNode(
-                variables=["emp_id", "salary"], relation="employees"
+                variables=["dept_id", "emp_id"], relation="employees"
             ),
         )
         result = apply_aggregate(
-            AggregateParams(function="SUM", column="salary"), [rel]
+            AggregateParams(function="COUNT", column="emp_id"), [rel]
         )
-        assert isinstance(result, OperatorFailure)
-        assert "exactly one" in result.error.lower()
+        assert isinstance(result, OperatorSuccess)
+        rvs = result.output.result_variables
+        assert len(rvs) == 2
+        # Original group key kept as ColumnVariable.
+        assert isinstance(rvs[0], ColumnVariable)
+        assert rvs[0].name == "dept_id"
+        # Aggregated column promoted to AggregateVariable.
+        assert isinstance(rvs[1], AggregateVariable)
+        assert rvs[1].function == "COUNT"
+        assert rvs[1].column == "emp_id"
+
+    def test_preserves_group_key_order(self):
+        """Multiple group keys retain their original positions; the
+        aggregated column appears in its original position too."""
+        from text_to_sql_planner.types.drc import AggregateVariable
+
+        rel = DRCExpression(
+            result_variables=[
+                ColumnVariable(name="region"),
+                ColumnVariable(name="sales"),  # being aggregated
+                ColumnVariable(name="quarter"),
+            ],
+            condition=MembershipNode(
+                variables=["region", "sales", "quarter"], relation="orders"
+            ),
+        )
+        result = apply_aggregate(
+            AggregateParams(function="SUM", column="sales"), [rel]
+        )
+        assert isinstance(result, OperatorSuccess)
+        rvs = result.output.result_variables
+        assert isinstance(rvs[0], ColumnVariable) and rvs[0].name == "region"
+        assert isinstance(rvs[1], AggregateVariable) and rvs[1].function == "SUM"
+        assert isinstance(rvs[2], ColumnVariable) and rvs[2].name == "quarter"
 
     def test_rejects_already_aggregate_input(self):
-        """Cannot stack aggregate over aggregate."""
+        """Cannot stack aggregate over aggregate (validation lives in the
+        per-result-variable kind check, not the result-variable count)."""
         from text_to_sql_planner.types.drc import AggregateVariable
 
         rel = DRCExpression(
@@ -969,10 +1005,29 @@ class TestAggregate:
             AggregateParams(function="SUM", column="x"), [rel]
         )
         assert isinstance(result, OperatorFailure)
-        assert "not already an aggregate" in result.error.lower()
+        assert "must not already be an" in result.error.lower()
+
+    def test_rejects_already_aggregate_when_mixed_with_keys(self):
+        """Even with group keys, an existing aggregate result variable is
+        not re-aggregatable."""
+        from text_to_sql_planner.types.drc import AggregateVariable
+
+        rel = DRCExpression(
+            result_variables=[
+                ColumnVariable(name="dept_id"),
+                AggregateVariable(function="COUNT", column="emp_id"),
+            ],
+            condition=MembershipNode(
+                variables=["dept_id", "emp_id"], relation="employees"
+            ),
+        )
+        result = apply_aggregate(
+            AggregateParams(function="SUM", column="emp_id"), [rel]
+        )
+        assert isinstance(result, OperatorFailure)
 
     def test_rejects_column_mismatch(self):
-        """The ``column`` parameter must match the input's single column."""
+        """The ``column`` parameter must name one of the input's result variables."""
         rel = self._single_col_relation("BountyAmount")
         result = apply_aggregate(
             AggregateParams(function="SUM", column="Score"),
