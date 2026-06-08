@@ -252,6 +252,52 @@ def tokenize(sql: str) -> list[Token]:
             )
             continue
 
+        # --- backtick-quoted identifier (MySQL/SQLite-flavour) ------------
+        # SQLite accepts ```ident``` as an identifier-only quoting form
+        # (no string fallback). BIRD's gold queries use this for column
+        # names containing spaces or punctuation — e.g.
+        # ``T1.`Charter Funding Type``` or ``T2.`date```. Run-15 dev_18
+        # / dev_1109 surfaced the missing support as a
+        # ``ConverterError: unexpected character '\``` and the cases
+        # came back ``skipped``.
+        #
+        # Doubled backticks ```` `` ```` inside the body are unescaped
+        # to a single backtick, mirroring SQLite's escape convention
+        # for the other quote characters.
+        if ch == "`":
+            start_line, start_col = line, col
+            advance()  # opening backtick
+            buf = []
+            closed = False
+            while pos < n:
+                if sql[pos] == "`":
+                    if pos + 1 < n and sql[pos + 1] == "`":
+                        buf.append("`")
+                        advance(2)
+                        continue
+                    advance()  # closing backtick
+                    closed = True
+                    break
+                buf.append(sql[pos])
+                advance()
+            if not closed:
+                tokens.append(
+                    Token(
+                        TokenKind.LEX_ERROR,
+                        "unterminated backtick-quoted identifier",
+                        start_line,
+                        start_col,
+                    )
+                )
+                tokens.append(Token(TokenKind.EOF, "", line, col))
+                return tokens
+            # Backtick form is unambiguously an identifier — no
+            # string-fallback resolution needed (so ``quoted=False``).
+            tokens.append(
+                Token(TokenKind.IDENT, "".join(buf), start_line, start_col)
+            )
+            continue
+
         # --- numeric literal ---------------------------------------------
         # Pattern: \d+(\.\d+)?([eE][+-]?\d+)?
         if ch.isdigit():

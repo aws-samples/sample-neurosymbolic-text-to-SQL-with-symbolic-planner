@@ -56,6 +56,24 @@ def _extract_column_name(definition: str) -> str | None:
     """Extract column name from a column definition string.
 
     Returns the column name or None if this is a table-level constraint.
+
+    Handles three quoting styles:
+
+    * Bare identifier: ``my_col INTEGER`` → ``my_col``
+    * Backtick-quoted: ``` `My Col` INTEGER ``` → ``My Col``
+    * Double-quoted: ``"My Col" INTEGER`` → ``My Col``
+    * Single-quoted: ``'My Col' INTEGER`` → ``My Col``
+
+    For quoted forms, the name can contain *any* characters except the
+    quote — spaces, dashes, dots, parentheses are all preserved
+    verbatim. The previous implementation only captured ``\\w+`` even
+    inside quotes, so ``` `Examination Date` `` collapsed to
+    ``Examination`` and the run-15 dev_1298 schema (with three
+    ``aCL Ig*`` columns and an ``ANA Pattern`` column distinct from
+    ``ANA``) produced duplicate ``aCL`` and ``ANA`` columns. The
+    duplicates corrupted the DRC's column list, made the planner
+    pick the wrong slot when filtering, and indirectly drove the
+    LLM into the ``OPERATOR_SELECTION_FAILED`` retry loop.
     """
     definition = definition.strip()
     if not definition:
@@ -65,8 +83,16 @@ def _extract_column_name(definition: str) -> str | None:
     if _TABLE_CONSTRAINT_RE.match(definition):
         return None
 
-    # Column name is the first token; may be quoted/backticked
-    match = re.match(r"[`\"']?(\w+)[`\"']?", definition)
+    # Quoted column name: capture everything up to the matching quote.
+    if definition[0] in "`\"'":
+        quote = definition[0]
+        end = definition.find(quote, 1)
+        if end == -1:
+            return None  # malformed — unterminated quote
+        return definition[1:end]
+
+    # Bare identifier: word characters only.
+    match = re.match(r"(\w+)", definition)
     if match:
         return match.group(1)
     return None

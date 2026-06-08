@@ -306,3 +306,93 @@ class TestTableNameVariants:
 
         assert isinstance(result, TableConversionSuccess)
         assert result.relations[0].table_name == "users"
+
+
+
+class TestQuotedColumnNames:
+    r"""Quoted column names preserve internal whitespace and punctuation.
+
+    Background — run-15 dev_1298:
+    BIRD's ``Examination`` schema has columns named with backticks:
+    ``\`Examination Date\```, ``\`aCL IgG\```, ``\`aCL IgM\```,
+    ``\`aCL IgA\```, ``\`ANA Pattern\``` — distinct columns whose
+    bare-word prefix collides. The previous regex
+    ``[`\"']?(\w+)[`\"']?`` only captured ``\w+`` (no spaces), so
+    every multi-word backtick-quoted column collapsed to its first
+    word, producing duplicate ``aCL`` and ``ANA`` entries in the
+    column list. The duplicates corrupted the DRC's membership and
+    indirectly drove the LLM's planner-loop into
+    ``OPERATOR_SELECTION_FAILED``.
+    """
+
+    def test_backtick_quoted_column_with_space(self):
+        schema = "CREATE TABLE t (`First Date` DATE, `Last Date` DATE);"
+        result = convert_tables(schema)
+
+        assert isinstance(result, TableConversionSuccess)
+        # Both names survive in full — no collision on the bare prefix.
+        assert result.relations[0].columns == ["First Date", "Last Date"]
+
+    def test_backtick_quoted_column_with_dash(self):
+        r"""``\`T-CHO\``` keeps the dash — bare-word regex would have
+        truncated it to ``T``."""
+        schema = "CREATE TABLE t (id INT, `T-CHO` REAL, `TG` REAL);"
+        result = convert_tables(schema)
+
+        assert isinstance(result, TableConversionSuccess)
+        assert result.relations[0].columns == ["id", "T-CHO", "TG"]
+
+    def test_double_quoted_column_with_space(self):
+        schema = "CREATE TABLE t (\"Full Name\" TEXT, age INT);"
+        result = convert_tables(schema)
+
+        assert isinstance(result, TableConversionSuccess)
+        assert result.relations[0].columns == ["Full Name", "age"]
+
+    def test_dev_1298_examination_schema_columns_are_distinct(self):
+        """Reproduce the dev_1298 schema fragment — all six columns
+        must show up as distinct entries (no duplicate ``aCL`` or
+        ``ANA``)."""
+        schema = (
+            "CREATE TABLE Examination ("
+            "  ID INTEGER, "
+            "  `Examination Date` DATE, "
+            "  `aCL IgG` REAL, "
+            "  `aCL IgM` REAL, "
+            "  ANA INTEGER, "
+            "  `ANA Pattern` TEXT, "
+            "  `aCL IgA` REAL"
+            ");"
+        )
+        result = convert_tables(schema)
+
+        assert isinstance(result, TableConversionSuccess)
+        cols = result.relations[0].columns
+        assert cols == [
+            "ID",
+            "Examination Date",
+            "aCL IgG",
+            "aCL IgM",
+            "ANA",
+            "ANA Pattern",
+            "aCL IgA",
+        ]
+        # No duplicates — the run-15 bug produced three ``aCL`` entries
+        # and two ``ANA`` entries.
+        assert len(cols) == len(set(cols))
+
+    def test_unterminated_backtick_returns_none(self):
+        """Malformed input (open-backtick without close) is handled
+        gracefully by skipping the column rather than raising."""
+        # An unterminated backtick consumes the rest of the column
+        # definition. The converter should treat the column as
+        # un-extractable and either skip it or fall through. We
+        # assert it doesn't crash — exact behaviour is implementation-
+        # defined.
+        schema = "CREATE TABLE t (`bad INT, name TEXT);"
+        result = convert_tables(schema)
+        # Either succeeds with whatever columns it could extract, or
+        # fails cleanly. Not raising is the contract.
+        assert isinstance(
+            result, (TableConversionSuccess, TableConversionFailure)
+        )
