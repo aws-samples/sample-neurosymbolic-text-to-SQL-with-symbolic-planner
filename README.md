@@ -144,7 +144,7 @@ uv run python examples/example3.py
 ### Tests
 
 ```bash
-uv run pytest tests/ -q          # 727 tests, no external services needed
+uv run pytest tests/ -q          # 747 tests, no external services needed
 uv run pytest tests/unit -v      # unit suite only
 ```
 
@@ -345,7 +345,7 @@ text_to_sql_planner/
 bird_benchmark/                   # standalone BIRD benchmark harness (see below)
 
 tests/
-├── unit/                         # 727 fast tests, mocks LLM and cvc5
+├── unit/                         # 747 fast tests, mocks LLM and cvc5
 └── ...
 
 examples/                         # end-to-end smoke runs
@@ -519,6 +519,7 @@ out of the box.
 ### Three execution modes
 
 Single-test mode for fast iteration on a specific Test_Case:
+
 
 ```bash
 uv run python -m bird_benchmark single \

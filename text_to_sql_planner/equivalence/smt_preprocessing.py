@@ -863,6 +863,120 @@ def _days_since_epoch(year: int, month: int, day: int) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Pass 4: normalise integer-boundary comparisons
+#
+# ``<= N`` (where N is an integer literal) is rewritten to ``< N+1``,
+# and ``>= N`` is rewritten to ``> N-1``. This canonical form means
+# a date comparison like ``ExamDate <= 10226`` and its STRFTIME-rewrite
+# sibling ``ExamDate < 10227`` become structurally identical after both
+# pass through the normalisation. Without it, cvc5 sometimes can't
+# prove the equivalence of wide existential formulas that differ only
+# in this choice of boundary direction.
+#
+# The rewrite is semantics-preserving over Int: ``x <= N`` ↔ ``x < N+1``
+# and ``x >= N`` ↔ ``x > N-1`` for all integers. It does NOT fire for
+# String sorts (where the +1 arithmetic doesn't apply).
+# ---------------------------------------------------------------------------
+
+
+def normalise_integer_boundary_comparisons(
+    condition: DRCCondition,
+) -> DRCCondition:
+    """Rewrite ``<= N`` → ``< N+1`` and ``>= N`` → ``> N-1`` for
+    integer literals. See pass docstring above."""
+    return _normalise_boundary(condition)
+
+
+def _normalise_boundary(node: DRCCondition) -> DRCCondition:
+    if node is None:
+        return node
+    if isinstance(node, ComparisonNode):
+        rewritten = _try_normalise_boundary(node)
+        if rewritten is not None:
+            return rewritten
+        return ComparisonNode(
+            operator=node.operator,
+            left=_normalise_boundary(node.left),
+            right=_normalise_boundary(node.right),
+        )
+    if isinstance(node, LogicalConnectiveNode):
+        return LogicalConnectiveNode(
+            operator=node.operator,
+            left=_normalise_boundary(node.left),
+            right=_normalise_boundary(node.right),
+        )
+    if isinstance(node, NotNode):
+        return NotNode(operand=_normalise_boundary(node.operand))
+    if isinstance(node, QuantifierNode):
+        return QuantifierNode(
+            kind=node.kind,
+            variables=list(node.variables),
+            body=_normalise_boundary(node.body),
+        )
+    if isinstance(node, ArithmeticNode):
+        return ArithmeticNode(
+            operator=node.operator,
+            left=_normalise_boundary(node.left),
+            right=_normalise_boundary(node.right),
+        )
+    if isinstance(node, FunctionCallNode):
+        return FunctionCallNode(
+            function=node.function,
+            arguments=[_normalise_boundary(a) for a in node.arguments],
+        )
+    return node
+
+
+def _try_normalise_boundary(node: ComparisonNode) -> ComparisonNode | None:
+    """If the comparison is ``expr <= IntLit`` or ``IntLit >= expr``,
+    normalise to ``expr < IntLit+1`` / ``IntLit-1 > expr``.
+    Same for ``>= IntLit`` → ``> IntLit-1``."""
+    op = node.operator
+
+    # Case: expr <= N  →  expr < N+1
+    if op == "<=" and isinstance(node.right, LiteralNode) and _is_int_literal(node.right):
+        return ComparisonNode(
+            operator="<",
+            left=node.left,
+            right=LiteralNode(value=node.right.value + 1, data_type="number"),
+        )
+    # Case: N <= expr  →  N-1 < expr  (i.e. expr > N-1  → flip: N-1 < expr is just >= N on the left)
+    # Actually: N <= expr  ↔  expr >= N. Let's also normalise >= on the right:
+    # Case: expr >= N  →  expr > N-1
+    if op == ">=" and isinstance(node.right, LiteralNode) and _is_int_literal(node.right):
+        return ComparisonNode(
+            operator=">",
+            left=node.left,
+            right=LiteralNode(value=node.right.value - 1, data_type="number"),
+        )
+    # Case: N >= expr  →  N+1 > expr  (i.e. expr <= N → expr < N+1, already handled above as expr on left)
+    # Handle flipped forms too:
+    if op == "<=" and isinstance(node.left, LiteralNode) and _is_int_literal(node.left):
+        # N <= expr  ↔  expr >= N  →  expr > N-1
+        return ComparisonNode(
+            operator=">",
+            left=node.right,
+            right=LiteralNode(value=node.left.value - 1, data_type="number"),
+        )
+    if op == ">=" and isinstance(node.left, LiteralNode) and _is_int_literal(node.left):
+        # N >= expr  ↔  expr <= N  →  expr < N+1
+        return ComparisonNode(
+            operator="<",
+            left=node.right,
+            right=LiteralNode(value=node.left.value + 1, data_type="number"),
+        )
+    return None
+
+
+def _is_int_literal(node: LiteralNode) -> bool:
+    """True if the literal is a numeric integer (not float, not string)."""
+    return (
+        node.data_type == "number"
+        and isinstance(node.value, int)
+    )
+
+
+# ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
@@ -915,4 +1029,5 @@ def preprocess_for_smt_pair(
         after_pass1, keep_names=set(keep_names or ()),
     )
     after_pass2 = [drop_unused_slots(c, used) for c in after_pass1]
-    return [rewrite_strftime_year_comparisons(c) for c in after_pass2]
+    after_pass3 = [rewrite_strftime_year_comparisons(c) for c in after_pass2]
+    return [normalise_integer_boundary_comparisons(c) for c in after_pass3]

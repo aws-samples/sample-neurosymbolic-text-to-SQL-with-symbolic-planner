@@ -20,6 +20,11 @@ class TableRelation:
     columns: list[str]
     expression: DRCExpression
     column_types: dict[str, str] = field(default_factory=dict)  # col_name -> "Int" | "String"
+    # Maps sanitised DRC variable name → original SQL column name.
+    # Only populated for columns whose original name is not a valid
+    # bare identifier (contains spaces, dashes, parens, etc.). The
+    # SQL converter uses this to emit backtick-quoted originals.
+    original_column_names: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -50,6 +55,43 @@ _TABLE_CONSTRAINT_RE = re.compile(
     r"^\s*(?:PRIMARY\s+KEY|UNIQUE|CHECK|FOREIGN\s+KEY|CONSTRAINT|INDEX|KEY)\b",
     re.IGNORECASE,
 )
+
+# Regex matching valid bare identifiers (no quoting needed).
+_BARE_IDENT_RE = re.compile(r"^[A-Za-z_]\w*$")
+
+
+def _sanitise_column_name(name: str) -> str:
+    """Convert a raw SQL column name into a valid DRC variable identifier.
+
+    DRC variables are plain identifiers matching ``[A-Za-z_][A-Za-z0-9_]*``.
+    Column names extracted from BIRD schemas can contain spaces, dashes,
+    parentheses, percent signs, and other characters that the DRC parser
+    / S-expression syntax cannot represent as bare atoms. This function
+    replaces each run of non-identifier characters with a single
+    underscore, strips leading/trailing underscores, and ensures the
+    result starts with a letter or underscore.
+
+    Examples:
+        "Charter Funding Type"  → "Charter_Funding_Type"
+        "Percent (%) Eligible"  → "Percent_Eligible"
+        "2013-14 CALPADS ..."   → "_2013_14_CALPADS_..."
+        "aCL IgG"               → "aCL_IgG"
+        "T-CHO"                 → "T_CHO"
+        "ANA Pattern"           → "ANA_Pattern"
+    """
+    if _BARE_IDENT_RE.match(name):
+        return name
+    # Replace each run of non-word characters with a single underscore.
+    sanitised = re.sub(r"[^\w]+", "_", name)
+    # Strip leading/trailing underscores.
+    sanitised = sanitised.strip("_")
+    # If the result starts with a digit, prefix with underscore.
+    if sanitised and sanitised[0].isdigit():
+        sanitised = f"_{sanitised}"
+    # Edge case: completely empty after sanitisation (unlikely but defensive).
+    if not sanitised:
+        sanitised = "_col"
+    return sanitised
 
 
 def _extract_column_name(definition: str) -> str | None:
@@ -223,12 +265,25 @@ def convert_tables(schema: str) -> TableConversionResult:
         parts = _split_column_definitions(body)
         columns: list[str] = []
         column_types: dict[str, str] = {}
+        original_column_names: dict[str, str] = {}
 
         for part in parts:
             col_name = _extract_column_name(part)
             if col_name is not None:
-                columns.append(col_name)
-                column_types[col_name] = _extract_column_type(part)
+                sanitised = _sanitise_column_name(col_name)
+                # Handle duplicate sanitised names (rare but possible if
+                # e.g. "A B" and "A-B" both map to "A_B"). Disambiguate
+                # with a numeric suffix.
+                base = sanitised
+                counter = 2
+                while sanitised in column_types:
+                    sanitised = f"{base}_{counter}"
+                    counter += 1
+                columns.append(sanitised)
+                column_types[sanitised] = _extract_column_type(part)
+                # Track original name if it differs from the sanitised form.
+                if sanitised != col_name:
+                    original_column_names[sanitised] = col_name
 
         if not columns:
             return TableConversionFailure(
@@ -249,6 +304,7 @@ def convert_tables(schema: str) -> TableConversionResult:
                 columns=columns,
                 expression=expression,
                 column_types=column_types,
+                original_column_names=original_column_names,
             )
         )
 

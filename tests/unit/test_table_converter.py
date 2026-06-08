@@ -330,8 +330,13 @@ class TestQuotedColumnNames:
         result = convert_tables(schema)
 
         assert isinstance(result, TableConversionSuccess)
-        # Both names survive in full — no collision on the bare prefix.
-        assert result.relations[0].columns == ["First Date", "Last Date"]
+        # Spaces are replaced with underscores for valid DRC identifiers.
+        assert result.relations[0].columns == ["First_Date", "Last_Date"]
+        # Original names are tracked for SQL generation.
+        assert result.relations[0].original_column_names == {
+            "First_Date": "First Date",
+            "Last_Date": "Last Date",
+        }
 
     def test_backtick_quoted_column_with_dash(self):
         r"""``\`T-CHO\``` keeps the dash — bare-word regex would have
@@ -340,14 +345,17 @@ class TestQuotedColumnNames:
         result = convert_tables(schema)
 
         assert isinstance(result, TableConversionSuccess)
-        assert result.relations[0].columns == ["id", "T-CHO", "TG"]
+        # Dashes become underscores; bare ``TG`` is untouched.
+        assert result.relations[0].columns == ["id", "T_CHO", "TG"]
+        assert result.relations[0].original_column_names == {"T_CHO": "T-CHO"}
 
     def test_double_quoted_column_with_space(self):
         schema = "CREATE TABLE t (\"Full Name\" TEXT, age INT);"
         result = convert_tables(schema)
 
         assert isinstance(result, TableConversionSuccess)
-        assert result.relations[0].columns == ["Full Name", "age"]
+        assert result.relations[0].columns == ["Full_Name", "age"]
+        assert result.relations[0].original_column_names == {"Full_Name": "Full Name"}
 
     def test_dev_1298_examination_schema_columns_are_distinct(self):
         """Reproduce the dev_1298 schema fragment — all six columns
@@ -370,16 +378,19 @@ class TestQuotedColumnNames:
         cols = result.relations[0].columns
         assert cols == [
             "ID",
-            "Examination Date",
-            "aCL IgG",
-            "aCL IgM",
+            "Examination_Date",
+            "aCL_IgG",
+            "aCL_IgM",
             "ANA",
-            "ANA Pattern",
-            "aCL IgA",
+            "ANA_Pattern",
+            "aCL_IgA",
         ]
         # No duplicates — the run-15 bug produced three ``aCL`` entries
         # and two ``ANA`` entries.
         assert len(cols) == len(set(cols))
+        # Original names tracked.
+        assert result.relations[0].original_column_names["Examination_Date"] == "Examination Date"
+        assert result.relations[0].original_column_names["aCL_IgG"] == "aCL IgG"
 
     def test_unterminated_backtick_returns_none(self):
         """Malformed input (open-backtick without close) is handled

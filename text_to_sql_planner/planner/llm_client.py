@@ -542,20 +542,25 @@ async def summarize_relation(
     return f"Relation with columns {columns}"
 
 
-_SYSTEM_PROMPT_DISTINCT = """You decide whether a natural-language database question requires SELECT DISTINCT in the generated SQL.
+_SYSTEM_PROMPT_DISTINCT = """You decide whether a natural-language database question requires deduplication in the generated SQL.
 
-Use DISTINCT when the question asks for a *set* of distinct entities and the join structure could otherwise produce duplicate rows. Common signals:
-- "list all X that ..." or "which X ..." where X is a single entity that can match the predicate multiple ways (e.g. "employees that have two or more reviews" — joining with reviews twice would duplicate the employee otherwise)
-- "find every / all distinct / unique ..."
-- The selected columns don't include a unique identifier of the joined-in entities
+Answer YES when the question asks for a *count or list of distinct entities* and the query structure could produce duplicate rows for the same entity. Specifically:
+
+Use DISTINCT = true when:
+- "How many X have / are ..." where X is an entity that might appear multiple times in the result due to joins or multiple matching rows (e.g. "how many molecules have a triple bond" — a molecule with 3 triple bonds produces 3 rows; we want distinct molecules)
+- "List all X that ..." where X is a single entity that can match the predicate multiple ways (e.g. "employees that have two or more reviews" — joining with reviews duplicates the employee row)
+- "Find every / all distinct / unique ..."
+- The selected entity column is NOT a primary key of the base table being filtered
 
 Do NOT use DISTINCT when:
 - The question asks for one row per occurrence ("list all reviews", "list employees and their review IDs")
-- The question is an aggregation ("how many X", "average Y", "sum Z") — aggregates handle distinctness themselves
+- The question is a simple aggregation over a primary key column ("how many orders" where each order row is unique)
 - The question pairs multiple entities and each pair is meant to be a distinct row ("list employees with their departments")
 - The selected columns already include a unique identifier of every joined entity
 
-When in doubt, prefer not to use DISTINCT, since aggregations like COUNT count duplicates by design and unnecessary DISTINCT can hide bugs."""
+IMPORTANT: When DISTINCT is needed and the query uses COUNT, the SQL should emit COUNT(DISTINCT col), not SELECT DISTINCT ... COUNT(col). The use_distinct flag applies to both SELECT DISTINCT (for non-aggregate queries) and COUNT(DISTINCT ...) (for aggregate queries).
+
+When in doubt, prefer not to use DISTINCT — unnecessary DISTINCT can hide bugs."""
 
 
 _DISTINCT_TOOL = {

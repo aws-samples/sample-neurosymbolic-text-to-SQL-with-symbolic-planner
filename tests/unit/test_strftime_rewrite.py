@@ -399,3 +399,133 @@ async def test_dev_947_strftime_vs_date_comparison_resolves_with_real_cvc5():
     assert isinstance(result, EquivalentResult), (
         f"expected equivalent, got {type(result).__name__}: {result}"
     )
+
+
+
+# ---------------------------------------------------------------------------
+# Pass 4: integer-boundary normalisation
+#
+# ``<= N`` → ``< N+1`` and ``>= N`` → ``> N-1`` canonicalise boundary
+# comparisons so the planner's ``ExamDate <= 10226`` and the gold's
+# (STRFTIME-rewritten) ``ExamDate < 10227`` become structurally
+# identical after both sides are normalised.
+# ---------------------------------------------------------------------------
+
+from text_to_sql_planner.equivalence.smt_preprocessing import (
+    normalise_integer_boundary_comparisons,
+)
+
+
+def test_normalise_lte_to_lt_plus_one():
+    """``x <= 10226`` → ``x < 10227``."""
+    cond = ComparisonNode(
+        operator="<=",
+        left=VariableRefNode(name="x"),
+        right=LiteralNode(value=10226, data_type="number"),
+    )
+    out = normalise_integer_boundary_comparisons(cond)
+    assert isinstance(out, ComparisonNode)
+    assert out.operator == "<"
+    assert out.right.value == 10227
+
+
+def test_normalise_gte_to_gt_minus_one():
+    """``x >= 9862`` → ``x > 9861``."""
+    cond = ComparisonNode(
+        operator=">=",
+        left=VariableRefNode(name="x"),
+        right=LiteralNode(value=9862, data_type="number"),
+    )
+    out = normalise_integer_boundary_comparisons(cond)
+    assert isinstance(out, ComparisonNode)
+    assert out.operator == ">"
+    assert out.right.value == 9861
+
+
+def test_normalise_does_not_touch_strict_comparisons():
+    """``x < 10227`` and ``x > 9861`` already in canonical form."""
+    cond = ComparisonNode(
+        operator="<",
+        left=VariableRefNode(name="x"),
+        right=LiteralNode(value=10227, data_type="number"),
+    )
+    out = normalise_integer_boundary_comparisons(cond)
+    assert out.operator == "<"
+    assert out.right.value == 10227
+
+
+def test_normalise_does_not_touch_string_literals():
+    """String-typed literals don't get +1/-1 treatment."""
+    cond = ComparisonNode(
+        operator="<=",
+        left=VariableRefNode(name="name"),
+        right=LiteralNode(value="Z", data_type="string"),
+    )
+    out = normalise_integer_boundary_comparisons(cond)
+    # No change — string literals pass through.
+    assert out.operator == "<="
+    assert out.right.value == "Z"
+
+
+def test_normalise_descends_into_and():
+    """Normalisation reaches comparisons nested inside AND."""
+    cond = LogicalConnectiveNode(
+        operator="and",
+        left=ComparisonNode(
+            operator=">=",
+            left=VariableRefNode(name="d"),
+            right=LiteralNode(value=9862, data_type="number"),
+        ),
+        right=ComparisonNode(
+            operator="<=",
+            left=VariableRefNode(name="d"),
+            right=LiteralNode(value=10226, data_type="number"),
+        ),
+    )
+    out = normalise_integer_boundary_comparisons(cond)
+    assert isinstance(out, LogicalConnectiveNode)
+    assert out.left.operator == ">"
+    assert out.left.right.value == 9861
+    assert out.right.operator == "<"
+    assert out.right.right.value == 10227
+
+
+def test_dev_1164_both_sides_normalise_to_same_form():
+    """The exact dev_1164 shape: generated has ``<= 10226``, gold
+    (after STRFTIME rewrite) has ``< 10227``. After normalisation
+    both become ``< 10227``."""
+    # Generated side
+    gen = LogicalConnectiveNode(
+        operator="and",
+        left=ComparisonNode(
+            operator=">=",
+            left=VariableRefNode(name="ExamDate"),
+            right=LiteralNode(value=9862, data_type="number"),
+        ),
+        right=ComparisonNode(
+            operator="<=",
+            left=VariableRefNode(name="ExamDate"),
+            right=LiteralNode(value=10226, data_type="number"),
+        ),
+    )
+    # Gold side (after STRFTIME rewrite for '= 1997')
+    gold = LogicalConnectiveNode(
+        operator="and",
+        left=ComparisonNode(
+            operator=">=",
+            left=VariableRefNode(name="ExamDate"),
+            right=LiteralNode(value=9862, data_type="number"),
+        ),
+        right=ComparisonNode(
+            operator="<",
+            left=VariableRefNode(name="ExamDate"),
+            right=LiteralNode(value=10227, data_type="number"),
+        ),
+    )
+    gen_norm = normalise_integer_boundary_comparisons(gen)
+    gold_norm = normalise_integer_boundary_comparisons(gold)
+    # Both sides should now have the same shape.
+    assert gen_norm.right.operator == gold_norm.right.operator
+    assert gen_norm.right.right.value == gold_norm.right.right.value
+    assert gen_norm.left.operator == gold_norm.left.operator
+    assert gen_norm.left.right.value == gold_norm.left.right.value

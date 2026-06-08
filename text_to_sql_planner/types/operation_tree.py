@@ -21,6 +21,10 @@ class TableLeafNode:
     table_name: str = ""
     columns: list[str] = field(default_factory=list)
     expression: DRCExpression = None  # type: ignore
+    # Maps sanitised DRC variable name → original SQL column name.
+    # Used by the SQL converter to emit backtick-quoted originals
+    # for columns whose names contain spaces or special characters.
+    original_column_names: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass

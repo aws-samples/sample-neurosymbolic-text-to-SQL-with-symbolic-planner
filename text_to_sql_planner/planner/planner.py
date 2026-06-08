@@ -199,6 +199,7 @@ async def plan(
             table_name=tr.table_name,
             columns=tr.columns,
             expression=tr.expression,
+            original_column_names=tr.original_column_names,
         )
         available.append((tr.expression, tr.columns, leaf))
 
@@ -439,6 +440,49 @@ async def plan(
             break
 
         if not success_this_iteration:
+            # --- Salvage scan: re-check existing relations ----------------
+            # The retry loop exhausted without creating a new relation.
+            # Before giving up, scan all existing relations that have the
+            # same result-variable count as the target and re-check cvc5
+            # equivalence. This catches the "semantic equivalence trap":
+            # the planner may have already built the correct answer in a
+            # prior iteration, but the cvc5 check at that time returned
+            # not_equivalent due to structural DRC differences (nesting,
+            # variable ordering, etc.) that a fresh check — potentially
+            # after the DRC has been further simplified by preprocessing
+            # passes in intermediate steps — can now resolve.
+            target_rv_count = len(target_relation.result_variables)
+            for salvage_idx, (salvage_expr, salvage_cols, salvage_node) in enumerate(available):
+                # Skip base tables — they were checked in the degenerate-case
+                # loop at the start. Only intermediates are worth re-checking.
+                if salvage_idx < len(table_relations):
+                    continue
+                if len(salvage_expr.result_variables) != target_rv_count:
+                    continue
+                # Match result-variable types (column vs aggregate)
+                type_match = True
+                for rv1, rv2 in zip(salvage_expr.result_variables, target_relation.result_variables):
+                    if type(rv1) != type(rv2):
+                        type_match = False
+                        break
+                if not type_match:
+                    continue
+                print(f"\n> 🔎 Salvage re-check: relation [{salvage_idx}] vs target...\n", flush=True)
+                eq_result = await check_equivalence(
+                    salvage_expr, target_relation, config.equivalence_config,
+                    schema_types=schema_types,
+                    label=f"planner: salvage re-check [{salvage_idx}] vs target (iteration {iteration})",
+                    lhs_label=f"salvage [{salvage_idx}]",
+                    rhs_label="target",
+                )
+                if isinstance(eq_result, EquivalentResult):
+                    print(f"### ✅ EQUIVALENT (salvage) — Planning complete!\n")
+                    tree = OperationTree(root=salvage_node)
+                    return PlannerSuccess(
+                        operation_tree=tree,
+                        iterations=iteration,
+                    )
+            # Salvage scan didn't find a match either. Fail.
             print(f"\n> ❌ All retries exhausted at iteration {iteration}. Stopping.\n")
             return PlannerError(
                 error_type="operator_selection_failed",

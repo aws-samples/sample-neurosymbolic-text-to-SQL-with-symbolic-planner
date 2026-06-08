@@ -69,6 +69,24 @@ def _is_date_string(s: str) -> bool:
     return bool(re.match(r"^\d{4}[-/]\d{2}[-/]\d{2}$", s))
 
 
+# Regex matching bare SQL identifiers that don't need quoting.
+_BARE_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _quote_col(col: str) -> str:
+    """Quote a column name for SQL if it contains non-identifier chars.
+
+    Names with spaces, hyphens, dots, or other special characters are
+    wrapped in backticks. Plain identifiers pass through unchanged.
+    Used when building ``alias.column`` references in ``var_mapping``.
+    """
+    if _BARE_IDENT_RE.match(col):
+        return col
+    # Escape embedded backticks by doubling them, per SQLite convention.
+    escaped = col.replace("`", "``")
+    return f"`{escaped}`"
+
+
 def _days_to_interval(days_str: str) -> str:
     """Convert a number of days to the most readable interval unit.
 
@@ -269,7 +287,10 @@ class _SqlGenerator:
         ctx.from_clause = f"{node.table_name} {alias}"
         ctx.table_instances[node.table_name] = [alias]
         for col in node.columns:
-            ctx.var_mapping[col] = f"{alias}.{col}"
+            # Use the original SQL column name (which may have spaces)
+            # for the SQL reference, backtick-quoted if needed.
+            original = node.original_column_names.get(col, col)
+            ctx.var_mapping[col] = f"{alias}.{_quote_col(original)}"
         return ctx
 
     def _ctx_from_subquery(self, node: OperatorNode) -> _QueryContext:
@@ -298,7 +319,7 @@ class _SqlGenerator:
             # Strip aggregate/expression wrappers — only bare column names
             # survive into the derived table's schema.
             bare = self._extract_underlying_column(col)
-            ctx.var_mapping[bare] = f"{alias}.{bare}"
+            ctx.var_mapping[bare] = f"{alias}.{_quote_col(bare)}"
         return ctx
 
     def _ctx_rename(
@@ -1020,7 +1041,15 @@ class _SqlGenerator:
                     select_parts.append(qualified)
             elif isinstance(rv, AggregateVariable):
                 qualified_col = _lookup_at(i, rv.column)
-                select_parts.append(f"{rv.function}({qualified_col})")
+                # When ``distinct=True`` and the aggregate is COUNT,
+                # emit ``COUNT(DISTINCT col)`` so the SQL correctly
+                # deduplicates the counted entity. The DRC model is
+                # set-based (inherently distinct) but SQL bag semantics
+                # need an explicit DISTINCT inside the aggregate.
+                if distinct and rv.function == "COUNT":
+                    select_parts.append(f"COUNT(DISTINCT {qualified_col})")
+                else:
+                    select_parts.append(f"{rv.function}({qualified_col})")
 
         select_str = ", ".join(select_parts)
 
@@ -1029,9 +1058,12 @@ class _SqlGenerator:
         # results and obscures otherwise-suspicious duplication. We only
         # emit ``DISTINCT`` when the caller explicitly asked for it (via
         # the ``distinct`` flag, typically derived from a question-level
-        # analysis of user intent). When aggregates are present the flag
-        # is ignored: ``GROUP BY`` or the single-row aggregate result
-        # already make the projection distinct.
+        # analysis of user intent). When aggregates are present AND
+        # distinct is requested, DISTINCT goes inside COUNT (see the
+        # aggregate emission above) rather than on SELECT — this
+        # correctly maps "how many distinct X" to
+        # ``COUNT(DISTINCT X)`` rather than the nonsensical
+        # ``SELECT DISTINCT COUNT(X)``.
         if has_aggregates or not distinct:
             select_keyword = "SELECT"
         else:
