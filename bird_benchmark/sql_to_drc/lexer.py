@@ -105,7 +105,7 @@ _KEYWORDS: frozenset[str] = frozenset(
         "NOT", "IN", "EXISTS", "AS", "ASC", "DESC", "DISTINCT", "HAVING",
         "UNION", "INTERSECT", "EXCEPT", "WITH", "RECURSIVE", "CASE", "WHEN",
         "THEN", "ELSE", "END", "OVER", "PARTITION", "LIKE", "BETWEEN", "IS",
-        "NULL", "COUNT", "SUM", "AVG", "MIN", "MAX",
+        "NULL", "CAST", "COUNT", "SUM", "AVG", "MIN", "MAX",
     }
 )
 

@@ -10,6 +10,16 @@ from text_to_sql_planner.types.drc import DRCExpression
 
 from .smt_converter import convert_to_smt
 
+# Trivially-satisfiable script returned when result-variable types
+# conflict between the two sides. cvc5 will immediately return ``sat``
+# (= not equivalent) without needing to reason about the formulas.
+_TYPE_CONFLICT_SCRIPT = (
+    "; result-variable type conflict: Int vs String\n"
+    "(set-logic ALL)\n"
+    "(assert true)\n"
+    "(check-sat)"
+)
+
 
 def _indent_smt(script: str, width: int = 80) -> str:
     """Pretty-print an SMT-LIB script with indentation.
@@ -446,6 +456,49 @@ def _build_equivalence_script(
             return "String"
         return "Int"
 
+    # Check for type conflicts in result variables. If one side returns
+    # an Int column and the other a String column at the same position,
+    # the two expressions cannot be equivalent — short-circuit without
+    # calling cvc5 (which would crash with a type error anyway).
+    for i in range(len(rv_names_1)):
+        n1 = rv_names_1[i]
+        n2 = rv_names_2[i]
+        t1 = all_var_types.get(n1, "Int")
+        t2 = all_var_types.get(n2, "Int")
+        if t1 != t2:
+            # Type mismatch at result position i — not equivalent.
+            return _TYPE_CONFLICT_SCRIPT
+
+    # Detect free variables that collide with relation names (or
+    # uninterpreted function names). SMT-LIB doesn't allow a
+    # ``declare-const`` and a ``declare-fun`` with the same name;
+    # cvc5 exits with a parse error when it sees the variable used
+    # in function-call position. Rename the *variable* to avoid the
+    # clash — the relation name is canonical.
+    fn_names: set[str] = set(all_relations.keys())
+    # (function signatures will be collected later but their names
+    # come from the same DRC condition; pre-collect here for safety)
+    from .smt_converter import collect_function_signatures as _cfs
+    fn_names |= set(_cfs(expr1.condition, all_var_types).keys())
+    fn_names |= set(_cfs(expr2.condition, all_var_types).keys())
+
+    bound_originals = set(rv_names_1) | set(rv_names_2)
+    free_vars = (vars1 | vars2) - bound_originals
+    var_rename_map: dict[str, str] = {}  # original -> smt-safe name
+    for var in free_vars:
+        if var in fn_names:
+            candidate = f"_var_{var}"
+            while candidate in reserved or candidate in fn_names:
+                candidate = f"_var_{candidate}"
+            var_rename_map[var] = candidate
+            reserved.add(candidate)
+
+    # Inject collision renames into both scopes so _convert_node
+    # emits the safe name wherever the variable appears free.
+    for orig, safe in var_rename_map.items():
+        scope1.setdefault(orig, safe)
+        scope2.setdefault(orig, safe)
+
     # Convert each condition under its substitution scope.
     formula1 = _convert_node(expr1.condition, all_var_types, scope1)
     formula2 = _convert_node(expr2.condition, all_var_types, scope2)
@@ -496,11 +549,11 @@ def _build_equivalence_script(
     # result variable on its own side. With substitution in place, the
     # result variables vanish from the formula, replaced by the shared
     # names, so they should NOT be declared as free constants.
-    bound_originals = set(rv_names_1) | set(rv_names_2)
     all_variables = vars1 | vars2
     for var in sorted(all_variables - bound_originals):
+        smt_name = var_rename_map.get(var, var)
         sort = all_var_types.get(var, "Int")
-        lines.append(f"(declare-const {var} {sort})")
+        lines.append(f"(declare-const {smt_name} {sort})")
 
     if shared_names:
         bindings = " ".join(

@@ -13,7 +13,8 @@ class DRCExpression:
     condition: DRCCondition = None  # type: ignore
 
 
-# Result variable can be a plain column or an aggregate
+# Result variable can be a plain column, an aggregate, a conditional
+# aggregate, or arithmetic of aggregates.
 @dataclass
 class ColumnVariable:
     type: Literal["column"] = "column"
@@ -27,7 +28,24 @@ class AggregateVariable:
     column: str = ""
 
 
-ResultVariable = Union[ColumnVariable, AggregateVariable]
+@dataclass
+class CountIfVariable:
+    """Conditional aggregate: (COUNT_IF condition col)."""
+    type: Literal["count_if"] = "count_if"
+    condition: DRCCondition = None  # type: ignore
+    column: str = ""
+
+
+@dataclass
+class ArithmeticResultVariable:
+    """Arithmetic of result-variable sub-expressions: (/ left right)."""
+    type: Literal["arithmetic"] = "arithmetic"
+    operator: str = "/"  # +, -, *, /
+    left: ResultVariable = None  # type: ignore
+    right: ResultVariable = None  # type: ignore
+
+
+ResultVariable = Union[ColumnVariable, AggregateVariable, CountIfVariable, ArithmeticResultVariable]
 
 AggregateFunction = Literal["COUNT", "SUM", "AVG", "MIN", "MAX"]
 

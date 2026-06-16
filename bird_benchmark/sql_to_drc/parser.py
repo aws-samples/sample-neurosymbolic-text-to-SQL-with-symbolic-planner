@@ -729,6 +729,19 @@ class _Parser:
                 "null_literal", "NULL literal is not supported", tok
             )
 
+        # CAST(expr AS type) — treat as identity (strip the type annotation).
+        if self.at_keyword("CAST"):
+            self.advance()
+            self.expect_op("(")
+            inner = self.parse_expr()
+            self.expect_keyword("AS")
+            # Skip the type name (one or more identifier/keyword tokens,
+            # possibly with parenthesised precision like REAL(10,2)).
+            while not self.at_op(")"):
+                self.advance()
+            self.expect_op(")")
+            return inner
+
         # Parenthesised expression. Subqueries that appear bare in
         # primary position (e.g. scalar subqueries) are out of scope and
         # are reported as parse errors when the inner SELECT confuses

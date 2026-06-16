@@ -29,13 +29,33 @@ def convert_to_smt(condition: DRCCondition) -> str:
     _collect_symbols(condition, relations, variables)
     _infer_types(condition, var_types)
 
+    # Collect function names that will become declare-fun
+    fn_sigs = collect_function_signatures(condition, var_types)
+    fn_names: set[str] = set(relations.keys()) | set(fn_sigs.keys())
+
+    # Detect variables that collide with relation/function names and
+    # build a rename map to avoid cvc5 parse errors.
+    var_rename_map: dict[str, str] = {}
+    all_names: set[str] = set(variables) | fn_names
+    for var in variables:
+        if var in fn_names:
+            candidate = f"_var_{var}"
+            while candidate in all_names:
+                candidate = f"_var_{candidate}"
+            var_rename_map[var] = candidate
+            all_names.add(candidate)
+
+    # Build scope for _convert_node so renamed vars are emitted correctly
+    scope: dict[str, str] = {orig: safe for orig, safe in var_rename_map.items()}
+
     lines: list[str] = []
     lines.append("(set-logic ALL)")
 
-    # Declare all variables with inferred types
+    # Declare all variables with inferred types (using safe names)
     for var in sorted(variables):
+        smt_name = var_rename_map.get(var, var)
         sort = var_types.get(var, "Int")
-        lines.append(f"(declare-const {var} {sort})")
+        lines.append(f"(declare-const {smt_name} {sort})")
 
     # Declare relations as uninterpreted functions returning Bool
     # Use mixed sorts based on the variables used in membership
@@ -52,7 +72,6 @@ def convert_to_smt(condition: DRCCondition) -> str:
     # ``STRFTIME``) used by the formula. Without these
     # declarations cvc5 hits an unknown function symbol and exits
     # before attempting the proof.
-    fn_sigs = collect_function_signatures(condition, var_types)
     for fn_name in sorted(fn_sigs):
         arg_sorts, ret_sort = fn_sigs[fn_name]
         ret_sort_smt = _smt_sort(ret_sort)
@@ -60,7 +79,7 @@ def convert_to_smt(condition: DRCCondition) -> str:
         lines.append(f"(declare-fun {fn_name} ({sorts_str}) {ret_sort_smt})")
 
     # Assert the formula
-    formula = _convert_node(condition, var_types)
+    formula = _convert_node(condition, var_types, scope if scope else None)
     lines.append(f"(assert {formula})")
     lines.append("(check-sat)")
 

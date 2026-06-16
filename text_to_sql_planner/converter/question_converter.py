@@ -553,15 +553,23 @@ def _validate_free_variables(expr: DRCExpression) -> str | None:
     Returns an error message if invalid, None if valid.
     """
     from text_to_sql_planner.types.drc import (
-        ColumnVariable, AggregateVariable,
+        ColumnVariable, AggregateVariable, ArithmeticResultVariable, CountIfVariable,
     )
 
     result_var_names: set[str] = set()
-    for rv in expr.result_variables:
+    def _collect_rv_columns(rv):
         if isinstance(rv, ColumnVariable):
             result_var_names.add(rv.name)
         elif isinstance(rv, AggregateVariable):
             result_var_names.add(rv.column)
+        elif isinstance(rv, CountIfVariable):
+            result_var_names.add(rv.column)
+        elif isinstance(rv, ArithmeticResultVariable):
+            _collect_rv_columns(rv.left)
+            _collect_rv_columns(rv.right)
+
+    for rv in expr.result_variables:
+        _collect_rv_columns(rv)
 
     # Walk the condition with a running stack of currently-bound names.
     # Anything referenced while not in the stack and not a result

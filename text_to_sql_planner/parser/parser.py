@@ -13,8 +13,10 @@ from text_to_sql_planner.types.drc import (
     AggregateFunction,
     AggregateVariable,
     ArithmeticNode,
+    ArithmeticResultVariable,
     ColumnVariable,
     ComparisonNode,
+    CountIfVariable,
     DRCCondition,
     DRCExpression,
     FunctionCallNode,
@@ -328,8 +330,7 @@ class _Parser:
         variables: list[ResultVariable] = []
         while self._current().type is not TokenType.RPAREN:
             if self._current().type is TokenType.LPAREN:
-                # Aggregate variable: (AGG col)
-                variables.append(self._parse_aggregate_variable())
+                variables.append(self._parse_complex_result_variable())
             elif self._current().type is TokenType.SYMBOL:
                 token = self._advance()
                 variables.append(ColumnVariable(name=token.value))
@@ -340,6 +341,41 @@ class _Parser:
                     message=f"Unexpected token in result variables: {token.type.name}",
                 )
         return variables
+
+    def _parse_complex_result_variable(self) -> ResultVariable:
+        """Parse a parenthesized result variable: aggregate, COUNT_IF, or arithmetic."""
+        self._expect(TokenType.LPAREN, "before complex result variable")
+        self._enter()
+
+        func_token = self._expect(TokenType.SYMBOL, "expected function/operator name")
+        op = func_token.value
+
+        if op in _AGGREGATE_FUNCS:
+            col_token = self._expect(TokenType.SYMBOL, "expected column name in aggregate")
+            self._expect(TokenType.RPAREN, "after aggregate variable")
+            self._leave()
+            return AggregateVariable(function=op, column=col_token.value)  # type: ignore[arg-type]
+
+        if op == "COUNT_IF":
+            # (COUNT_IF condition col)
+            condition = self._parse_condition()
+            col_token = self._expect(TokenType.SYMBOL, "expected column name in COUNT_IF")
+            self._expect(TokenType.RPAREN, "after COUNT_IF variable")
+            self._leave()
+            return CountIfVariable(condition=condition, column=col_token.value)
+
+        if op in _ARITHMETIC_OPS:
+            # (/ left right) where left and right are themselves complex result variables
+            left = self._parse_complex_result_variable()
+            right = self._parse_complex_result_variable()
+            self._expect(TokenType.RPAREN, "after arithmetic result variable")
+            self._leave()
+            return ArithmeticResultVariable(operator=op, left=left, right=right)
+
+        raise ParseError(
+            offset=func_token.offset,
+            message=f"Unknown aggregate function: '{op}'",
+        )
 
     def _parse_aggregate_variable(self) -> AggregateVariable:
         self._expect(TokenType.LPAREN, "before aggregate function")

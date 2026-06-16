@@ -12,8 +12,10 @@ from typing import Union
 from text_to_sql_planner.types.drc import (
     AggregateVariable,
     ArithmeticNode,
+    ArithmeticResultVariable,
     ColumnVariable,
     ComparisonNode,
+    CountIfVariable,
     DRCCondition,
     DRCExpression,
     FunctionCallNode,
@@ -167,27 +169,43 @@ def _print_result_variables(variables: list[ResultVariable]) -> str:
     for var in variables:
         if var is None:
             raise _PrintInternalError(PrintError(message="Result variable is None", node=None))
-        if isinstance(var, ColumnVariable):
-            if not var.name:
-                raise _PrintInternalError(
-                    PrintError(message="ColumnVariable has empty name", node=var)
-                )
-            parts.append(var.name)
-        elif isinstance(var, AggregateVariable):
-            if not var.function:
-                raise _PrintInternalError(
-                    PrintError(message="AggregateVariable has empty function", node=var)
-                )
-            if not var.column:
-                raise _PrintInternalError(
-                    PrintError(message="AggregateVariable has empty column", node=var)
-                )
-            parts.append(f"({var.function} {var.column})")
-        else:
-            raise _PrintInternalError(
-                PrintError(message=f"Unknown result variable type: {type(var).__name__}", node=var)
-            )
+        parts.append(_print_single_result_variable(var))
     return " ".join(parts)
+
+
+def _print_single_result_variable(var: ResultVariable) -> str:
+    """Print a single result variable (recursive for arithmetic)."""
+    if isinstance(var, ColumnVariable):
+        if not var.name:
+            raise _PrintInternalError(
+                PrintError(message="ColumnVariable has empty name", node=var)
+            )
+        return var.name
+    elif isinstance(var, AggregateVariable):
+        if not var.function:
+            raise _PrintInternalError(
+                PrintError(message="AggregateVariable has empty function", node=var)
+            )
+        if not var.column:
+            raise _PrintInternalError(
+                PrintError(message="AggregateVariable has empty column", node=var)
+            )
+        return f"({var.function} {var.column})"
+    elif isinstance(var, CountIfVariable):
+        if not var.column:
+            raise _PrintInternalError(
+                PrintError(message="CountIfVariable has empty column", node=var)
+            )
+        cond_str = _print_condition(var.condition)
+        return f"(COUNT_IF {cond_str} {var.column})"
+    elif isinstance(var, ArithmeticResultVariable):
+        left_str = _print_single_result_variable(var.left)
+        right_str = _print_single_result_variable(var.right)
+        return f"({var.operator} {left_str} {right_str})"
+    else:
+        raise _PrintInternalError(
+            PrintError(message=f"Unknown result variable type: {type(var).__name__}", node=var)
+        )
 
 
 def _print_condition(node: DRCCondition) -> str:

@@ -294,6 +294,9 @@ Syntax rules:
 - Result variables can be plain column names OR aggregate functions:
   - Plain column: just the name, e.g. name, id, age
   - Aggregate: (COUNT col), (SUM col), (AVG col), (MIN col), (MAX col)
+  - Conditional aggregate: (COUNT_IF condition col) — counts col only where condition is true. Use for "what percentage of X satisfy Y" patterns: (/ (COUNT_IF (= status "A") id) (COUNT id)).
+  - Arithmetic of aggregates: (/ (COUNT col1) (COUNT col2)), (* (SUM col1) (AVG col2)), etc.
+    Use this for ratio/percentage questions like "average number of X per Y" = (/ (COUNT x) (COUNT y)).
 - Membership: (in (var1 var2 ...) TableName) — asserts that the tuple (var1, var2, ...) is a row in TableName
 - Logical: (and cond1 cond2), (or cond1 cond2), (not cond), (implies cond1 cond2)
   - ``and`` and ``or`` accept TWO OR MORE operands. NEVER write a unary ``(and X)`` or ``(or X)`` — if there is only one conjunct/disjunct, write the operand directly with no surrounding ``(and ...)`` or ``(or ...)``.
@@ -426,6 +429,22 @@ Question: "Show the top 5 employees and their salaries"
 Schema: CREATE TABLE Employees (emp_id INT, name VARCHAR, salary DECIMAL)
 Answer: (limit 5 (order-by ((salary desc)) (drc (name salary) (exists (emp_id) (in (emp_id name salary) Employees)))))
 Note: Contrast with the previous example. Here the question explicitly asks for BOTH name AND salary ("employees AND their salaries"), so both appear in the result variables. The trigger words for the multi-column projection are conjunctions ("and", "with their", "along with") between the entity and the metric.
+
+Ratio / percentage / average-per-entity patterns:
+- "What is the average number of X per Y" → divide COUNT(X) by COUNT(DISTINCT Y): ``(/ (COUNT x) (COUNT y))``
+- "What percentage of X satisfy condition C" → divide conditional count by total count: ``(/ (COUNT_IF condition col) (COUNT col))``
+- ``(COUNT_IF condition col)`` counts ``col`` only for rows where ``condition`` is true. It maps to SQL ``COUNT(CASE WHEN condition THEN col END)``.
+- The ``/`` operator in result-variable position produces SQL ``AGG1(...) / AGG2(...)`` in a single SELECT.
+
+Question: "What is the average number of badges per user with over 200 views?"
+Schema: CREATE TABLE badges (Id INT, UserId INT, Name TEXT); CREATE TABLE users (Id INT, Views INT, DisplayName TEXT)
+Answer: (drc ((/ (COUNT Id) (COUNT DisplayName))) (exists (UserId Name) (and (in (Id UserId Name) badges) (exists (uid Views) (and (in (uid Views DisplayName) users) (= uid UserId) (> Views 200))))))
+Note: The result is a ratio of two aggregates: total badge count divided by distinct user count. Both aggregates share the same underlying condition (users with Views > 200 who have badges).
+
+Question: "What percentage of patients with high GOT levels are diagnosed with SLE?"
+Schema: CREATE TABLE Patient (ID INT, Diagnosis TEXT); CREATE TABLE Laboratory (ID INT, GOT REAL)
+Answer: (drc ((/ (COUNT_IF (LIKE Diagnosis "%SLE%") ID) (COUNT ID))) (exists (GOT) (and (in (ID GOT) Laboratory) (>= GOT 60) (exists (Diagnosis) (in (ID Diagnosis) Patient)))))
+Note: ``COUNT_IF`` counts only rows where the condition (Diagnosis contains "SLE") is true. The denominator ``(COUNT ID)`` counts all rows matching the base filter (GOT >= 60). The ratio gives the percentage.
 
 Return ONLY the DRC expression in Lisp syntax, nothing else."""
 
