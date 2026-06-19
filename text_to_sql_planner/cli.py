@@ -66,8 +66,8 @@ def main() -> None:
     config_group.add_argument(
         "--cvc5-timeout",
         type=float,
-        default=30.0,
-        help="Timeout in seconds for cvc5 equivalence checks (default: 30).",
+        default=60.0,
+        help="Timeout in seconds for cvc5 equivalence checks (default: 60).",
     )
 
     # Output options

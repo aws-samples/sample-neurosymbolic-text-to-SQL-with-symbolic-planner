@@ -354,7 +354,12 @@ class _Translator:
         if stmt.where is not None:
             where_cond = self._translate_expr(stmt.where, scope)
 
-        body = _conjoin([*memberships, where_cond])
+        # ---- HAVING ----------------------------------------------------
+        having_cond: DRCCondition | None = None
+        if stmt.having is not None:
+            having_cond = self._translate_expr(stmt.having, scope)
+
+        body = _conjoin([*memberships, where_cond, having_cond])
 
         # ---- result_variables -----------------------------------------
         result_variables = self._translate_select_list(stmt, scope)
@@ -780,11 +785,68 @@ class _Translator:
                 left=LiteralNode(value=0, data_type="number"),
                 right=inner,
             )
+        if op in ("IS_NULL", "IS_NOT_NULL"):
+            # ``col IS NULL`` / ``col IS NOT NULL`` — model as an
+            # uninterpreted Bool predicate so both sides of an
+            # equivalence check share the same symbol. Semantically
+            # opaque to cvc5, but structurally consistent.
+            inner = self._translate_expr(expr.operand, scope)
+            return FunctionCallNode(function=op, arguments=[inner])
         raise self._fail_unsupported(
             f"unary_op_{op}",
             f"unsupported unary operator {op!r}",
             expr.pos,
         )
+
+    def _try_arithmetic_aggregate(
+        self, expr: "sql_ast.Expression", scope: "Scope"
+    ):
+        """If ``expr`` is an arithmetic operation whose both sides are
+        aggregates, return an ``ArithmeticAggregateVariable``. Otherwise
+        return ``None``.
+
+        Handles patterns like ``COUNT(T1.Id) / COUNT(DISTINCT T2.Name)``
+        and ``CAST(COUNT(x) AS REAL) / COUNT(y)`` (CAST is already
+        stripped by the parser).
+        """
+        from text_to_sql_planner.types.drc import ArithmeticAggregateVariable
+
+        if not isinstance(expr, sql_ast.BinaryOp):
+            return None
+        if expr.op not in ("+", "-", "*", "/"):
+            return None
+
+        left_agg = self._try_extract_aggregate(expr.left, scope)
+        right_agg = self._try_extract_aggregate(expr.right, scope)
+        if left_agg is None or right_agg is None:
+            return None
+
+        return ArithmeticAggregateVariable(
+            operator=expr.op,  # type: ignore[arg-type]
+            left=left_agg,
+            right=right_agg,
+        )
+
+    def _try_extract_aggregate(
+        self, expr: "sql_ast.Expression", scope: "Scope"
+    ):
+        """If ``expr`` is an Aggregate node, return the corresponding
+        ``AggregateVariable``. Otherwise return ``None``."""
+        if isinstance(expr, sql_ast.Aggregate):
+            column_name = "*"
+            if isinstance(expr.column, sql_ast.ColumnRef):
+                resolved = self._translate_column_ref(expr.column, scope)
+                if isinstance(resolved, VariableRefNode):
+                    column_name = resolved.name
+                else:
+                    column_name = expr.column.name
+            return AggregateVariable(
+                function=expr.function,  # type: ignore[arg-type]
+                column=column_name,
+            )
+        # Could be a number literal (e.g., * 100 or * 1.0) — treat as
+        # a "trivial aggregate" by wrapping it. Not supported yet.
+        return None
 
     def _translate_function_call(
         self, expr: sql_ast.FunctionCall, scope: Scope
@@ -943,6 +1005,28 @@ class _Translator:
                         column_name = resolved.name
                     else:
                         column_name = expr.column.name
+                elif isinstance(expr.column, sql_ast.CaseExpr):
+                    # Conditional aggregation: COUNT(CASE WHEN ... THEN col END)
+                    from text_to_sql_planner.types.drc import ConditionalAggregateVariable
+                    case = expr.column
+                    # Translate the WHEN condition.
+                    cond = self._translate_expr(case.when_condition, scope)
+                    # The THEN expression should be a column reference.
+                    col_name = "expr"
+                    if isinstance(case.then_expr, sql_ast.ColumnRef):
+                        resolved = self._translate_column_ref(case.then_expr, scope)
+                        if isinstance(resolved, VariableRefNode):
+                            col_name = resolved.name
+                        else:
+                            col_name = case.then_expr.name
+                    out.append(
+                        ConditionalAggregateVariable(
+                            function=expr.function,  # type: ignore[arg-type]
+                            column=col_name,
+                            condition=cond,
+                        )
+                    )
+                    continue
                 # ``Literal`` here is the ``COUNT(*)`` shorthand.
                 out.append(
                     AggregateVariable(
@@ -954,10 +1038,15 @@ class _Translator:
 
             # Computed expressions (concat, arithmetic, function calls)
             # in the SELECT list don't have a clean column-variable
-            # name. Emit a synthetic ``ColumnVariable`` so the projection
-            # at least has the right arity. Equivalence checking
-            # compares the *condition* — the projection of computed
-            # expressions is a presentation detail.
+            # name. Check if it's an arithmetic of two aggregates first
+            # (the dev_556 pattern: COUNT(x) / COUNT(DISTINCT y)).
+            arith_agg = self._try_arithmetic_aggregate(expr, scope)
+            if arith_agg is not None:
+                out.append(arith_agg)
+                continue
+
+            # Otherwise emit a synthetic ``ColumnVariable`` so the
+            # projection at least has the right arity.
             synth = item.alias or f"expr_{len(out) + 1}"
             if synth not in seen_names:
                 seen_names.add(synth)

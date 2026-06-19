@@ -669,7 +669,7 @@ def test_aggregate_count_over_root_projection_no_double_wrap():
     # No nested ``SELECT COUNT(`` inside a derived subquery.
     assert "FROM (\n" not in sql or "SELECT COUNT" not in sql.split("FROM (\n", 1)[1]
     # The aggregate references the underlying column (qualified by alias).
-    assert "COUNT(e1.emp_id)" in sql or "COUNT(emp_id)" in sql
+    assert "COUNT(DISTINCT e1.emp_id)" in sql or "COUNT(e1.emp_id)" in sql or "COUNT(emp_id)" in sql
 
 
 def test_plain_column_finalisation_skips_root_projection():

@@ -97,13 +97,11 @@ def test_translator_emits_function_call_for_like():
 
 
 def test_parser_still_rejects_between():
-    """``BETWEEN`` and ``IS NULL`` remain unsupported; only LIKE has
-    been promoted."""
+    """``BETWEEN`` is desugared to ``>= AND <=`` at parse time."""
     sql = "SELECT Id FROM posts WHERE Id BETWEEN 1 AND 10"
     result = convert_sql(sql, _SCHEMA_POSTS)
-    assert isinstance(result, ConverterError)
-    assert result.kind == "unsupported_feature"
-    assert result.feature == "BETWEEN"
+    # Should succeed now — BETWEEN desugars to (Id >= 1 AND Id <= 10)
+    assert not isinstance(result, ConverterError), f"Unexpected error: {result}"
 
 
 # ---------------------------------------------------------------------------

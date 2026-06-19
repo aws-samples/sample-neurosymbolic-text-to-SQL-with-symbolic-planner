@@ -176,9 +176,28 @@ async def convert_question(
                 # core DRC. The wrappers don't introduce new variables.
                 validation_error = _validate_free_variables(inner_drc)
                 if validation_error:
-                    last_error = validation_error
-                    print(f"⚠️ **Validation failed:** {validation_error}\n")
-                    continue
+                    # Auto-repair: wrap unquantified free variables in an
+                    # existential quantifier rather than burning a retry.
+                    repaired = _auto_repair_free_variables(inner_drc)
+                    if repaired is not None:
+                        inner_drc = repaired
+                        if query is not inner_drc:
+                            # Update the query wrapper to point at the repaired DRC
+                            from text_to_sql_planner.types.drc import (
+                                LimitExpression, OrderByExpression,
+                            )
+                            q = query
+                            while not isinstance(q, DRCExpression):
+                                if isinstance(q, LimitExpression):
+                                    q.inner = inner_drc if isinstance(q.inner, DRCExpression) else q.inner
+                                elif isinstance(q, OrderByExpression):
+                                    q.inner = inner_drc if isinstance(q.inner, DRCExpression) else q.inner
+                                break
+                        print(f"⚠️ **Auto-repaired free variables**\n")
+                    else:
+                        last_error = validation_error
+                        print(f"⚠️ **Validation failed:** {validation_error}\n")
+                        continue
 
                 print(f"✅ **Parse succeeded**\n")
                 pp = pretty_print_query(query)
@@ -539,6 +558,68 @@ def _has_unary_and_or(text: str) -> bool:
     return False
 
 
+def _collect_arith_agg_columns(rv, result_var_names: set) -> None:
+    """Recursively collect column names from an ArithmeticAggregateVariable."""
+    from text_to_sql_planner.types.drc import (
+        AggregateVariable, ArithmeticAggregateVariable,
+        ConditionalAggregateVariable, ScalarLiteralVariable,
+    )
+    for operand in (rv.left, rv.right):
+        if isinstance(operand, AggregateVariable):
+            result_var_names.add(operand.column)
+        elif isinstance(operand, ConditionalAggregateVariable):
+            result_var_names.add(operand.column)
+        elif isinstance(operand, ArithmeticAggregateVariable):
+            _collect_arith_agg_columns(operand, result_var_names)
+        # ScalarLiteralVariable has no column to add
+
+
+def _auto_repair_free_variables(expr: DRCExpression) -> DRCExpression | None:
+    """Wrap unquantified free variables in an existential quantifier.
+
+    When the LLM forgets to existentially bind variables that appear in
+    memberships or conditions but aren't result variables, this function
+    wraps the entire condition in ``(exists (free_vars...) condition)``.
+    Returns the repaired expression, or None if no repair is needed.
+    """
+    from text_to_sql_planner.types.drc import (
+        ColumnVariable, AggregateVariable,
+        ArithmeticAggregateVariable, ConditionalAggregateVariable,
+        QuantifierNode,
+    )
+
+    free_unbound: set[str] = set()
+    result_var_names: set[str] = set()
+    for rv in expr.result_variables:
+        if isinstance(rv, ColumnVariable):
+            result_var_names.add(rv.name)
+        elif isinstance(rv, AggregateVariable):
+            result_var_names.add(rv.column)
+        elif isinstance(rv, ArithmeticAggregateVariable):
+            _collect_arith_agg_columns(rv, result_var_names)
+        elif isinstance(rv, ConditionalAggregateVariable):
+            result_var_names.add(rv.column)
+            _collect_free_at_reference(
+                rv.condition, frozenset(), result_var_names, free_unbound,
+            )
+
+    _collect_free_at_reference(expr.condition, frozenset(), result_var_names, free_unbound)
+
+    if not free_unbound:
+        return None
+
+    # Wrap condition in existential quantifier for the free variables
+    repaired_condition = QuantifierNode(
+        kind="exists",
+        variables=sorted(free_unbound),
+        body=expr.condition,
+    )
+    return DRCExpression(
+        result_variables=expr.result_variables,
+        condition=repaired_condition,
+    )
+
+
 def _validate_free_variables(expr: DRCExpression) -> str | None:
     """Check that no variables are free in the condition except result variables.
 
@@ -553,28 +634,39 @@ def _validate_free_variables(expr: DRCExpression) -> str | None:
     Returns an error message if invalid, None if valid.
     """
     from text_to_sql_planner.types.drc import (
-        ColumnVariable, AggregateVariable, ArithmeticResultVariable, CountIfVariable,
+        ColumnVariable, AggregateVariable,
+        ArithmeticAggregateVariable, ConditionalAggregateVariable,
     )
 
+    # Walk the condition with a running stack of currently-bound names.
+    # Anything referenced while not in the stack and not a result
+    # variable is genuinely free. ``free_unbound`` is declared up front
+    # so the result-variable enumeration below can share it with the
+    # main condition walk when a ConditionalAggregateVariable result
+    # variable carries its own ``.condition`` sub-tree.
+    free_unbound: set[str] = set()
+
     result_var_names: set[str] = set()
-    def _collect_rv_columns(rv):
+    for rv in expr.result_variables:
         if isinstance(rv, ColumnVariable):
             result_var_names.add(rv.name)
         elif isinstance(rv, AggregateVariable):
             result_var_names.add(rv.column)
-        elif isinstance(rv, CountIfVariable):
+        elif isinstance(rv, ArithmeticAggregateVariable):
+            # Recursively collect column names from sub-aggregates.
+            _collect_arith_agg_columns(rv, result_var_names)
+        elif isinstance(rv, ConditionalAggregateVariable):
+            # The conditional aggregate's column is a projected slot,
+            # and its ``.condition`` sub-tree must be walked through
+            # the same free-variable analysis as the main condition so
+            # an unbound reference inside e.g. ``COUNT_IF`` lands in
+            # ``free_unbound`` and gets reported through the existing
+            # error path.
             result_var_names.add(rv.column)
-        elif isinstance(rv, ArithmeticResultVariable):
-            _collect_rv_columns(rv.left)
-            _collect_rv_columns(rv.right)
+            _collect_free_at_reference(
+                rv.condition, frozenset(), result_var_names, free_unbound,
+            )
 
-    for rv in expr.result_variables:
-        _collect_rv_columns(rv)
-
-    # Walk the condition with a running stack of currently-bound names.
-    # Anything referenced while not in the stack and not a result
-    # variable is genuinely free.
-    free_unbound: set[str] = set()
     _collect_free_at_reference(expr.condition, frozenset(), result_var_names, free_unbound)
 
     if free_unbound:
@@ -602,6 +694,7 @@ def _collect_free_at_reference(
     from text_to_sql_planner.types.drc import (
         QuantifierNode, LogicalConnectiveNode, NotNode, ComparisonNode,
         MembershipNode, ArithmeticNode, VariableRefNode, FunctionCallNode,
+        IsNotNullNode,
     )
 
     if node is None:
@@ -614,6 +707,17 @@ def _collect_free_at_reference(
         for v in node.variables:
             if v not in bound_stack and v not in result_vars:
                 free.add(v)
+        return
+    if isinstance(node, IsNotNullNode):
+        # ``IsNotNullNode.column`` is treated the same way a
+        # ``MembershipNode`` slot is: a column-binding name that's free
+        # unless covered by an enclosing existential or a result variable.
+        if (
+            node.column
+            and node.column not in bound_stack
+            and node.column not in result_vars
+        ):
+            free.add(node.column)
         return
     if isinstance(node, QuantifierNode):
         new_bound = bound_stack | set(node.variables)
@@ -645,6 +749,7 @@ def _collect_vars(node, vars_set: set[str]) -> None:
     from text_to_sql_planner.types.drc import (
         QuantifierNode, LogicalConnectiveNode, NotNode, ComparisonNode,
         MembershipNode, ArithmeticNode, VariableRefNode, LiteralNode, FunctionCallNode,
+        IsNotNullNode,
     )
 
     if node is None:
@@ -654,6 +759,11 @@ def _collect_vars(node, vars_set: set[str]) -> None:
     elif isinstance(node, MembershipNode):
         for v in node.variables:
             vars_set.add(v)
+    elif isinstance(node, IsNotNullNode):
+        # ``IsNotNullNode.column`` is a column-binding name treated the
+        # same way as a ``MembershipNode`` slot.
+        if node.column:
+            vars_set.add(node.column)
     elif isinstance(node, QuantifierNode):
         # Quantified vars are used but also bound
         for v in node.variables:
@@ -680,6 +790,7 @@ def _collect_bound_vars(node, bound_set: set[str]) -> None:
     from text_to_sql_planner.types.drc import (
         QuantifierNode, LogicalConnectiveNode, NotNode, ComparisonNode,
         MembershipNode, ArithmeticNode, FunctionCallNode,
+        IsNotNullNode,
     )
 
     if node is None:
@@ -702,3 +813,7 @@ def _collect_bound_vars(node, bound_set: set[str]) -> None:
     elif isinstance(node, FunctionCallNode):
         for arg in node.arguments:
             _collect_bound_vars(arg, bound_set)
+    elif isinstance(node, IsNotNullNode):
+        # ``IsNotNullNode`` does not introduce a quantifier binding;
+        # leaf node with no children to recurse into.
+        pass

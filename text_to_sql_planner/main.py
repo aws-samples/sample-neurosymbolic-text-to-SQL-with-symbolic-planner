@@ -61,6 +61,7 @@ async def run(
     question: str,
     schema: str,
     config: PlannerConfig | None = None,
+    evidence: str | None = None,
 ) -> TextToSQLResult:
     """Convert a natural language question into a SQL SELECT statement.
 
@@ -75,6 +76,7 @@ async def run(
         question: The natural language question.
         schema: The database schema (CREATE TABLE statements).
         config: Planner configuration (optional).
+        evidence: Optional BIRD evidence string with column/value mappings.
 
     Returns:
         TextToSQLSuccess with the SQL and operation tree, or
@@ -97,8 +99,12 @@ async def run(
         )
 
     # --- Step 1: Convert question to DRC ---
+    effective_question = question.strip()
+    if evidence and evidence.strip():
+        effective_question = f"{question.strip()}\n\nEvidence (TRUST these mappings — they override your interpretation of the question):\n{evidence.strip()}"
+
     question_result = await convert_question(
-        question=question.strip(),
+        question=effective_question,
         schema=schema,
         config=config.llm_config,
     )
@@ -165,8 +171,19 @@ async def run(
             code=ErrorCode.SQL_CONVERSION_FAILED,
         )
 
+    from text_to_sql_planner.sql.simplifier import simplify_sql
+    raw_sql = sql_result.sql
+    # The simplifier's parser cannot correctly handle UNION/EXCEPT inside
+    # derived-table subqueries — it mis-parses them and produces broken SQL.
+    # Skip simplification for queries that use set operations.
+    import re
+    if re.search(r'\bUNION\b|\bEXCEPT\b', raw_sql, re.IGNORECASE):
+        final_sql = raw_sql
+    else:
+        final_sql = simplify_sql(raw_sql)
+
     return TextToSQLSuccess(
-        sql=sql_result.sql,
+        sql=final_sql,
         operation_tree=simplified_tree,
         target_expression=target_expression,
         target_query=target_query,

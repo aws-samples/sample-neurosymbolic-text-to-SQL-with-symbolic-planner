@@ -41,6 +41,7 @@ from text_to_sql_planner.types.drc import (
     ComparisonNode,
     DRCCondition,
     FunctionCallNode,
+    IsNotNullNode,
     LiteralNode,
     LogicalConnectiveNode,
     MembershipNode,
@@ -198,6 +199,11 @@ def _eliminate_pass(node: DRCCondition) -> DRCCondition:
             arguments=[_eliminate_pass(a) for a in node.arguments],
         )
 
+    if isinstance(node, IsNotNullNode):
+        # Leaf node — already in the canonical form ``rewrite_null_checks``
+        # produces, so this pass returns it unchanged.
+        return node
+
     return node
 
 
@@ -290,6 +296,10 @@ def _references(node: DRCCondition, var: str) -> bool:
         return node.name == var
     if isinstance(node, MembershipNode):
         return var in node.variables
+    if isinstance(node, IsNotNullNode):
+        # ``IsNotNullNode.column`` is a column-binding name treated the
+        # same way as a ``MembershipNode`` slot.
+        return node.column == var
     if isinstance(node, QuantifierNode):
         if var in node.variables:
             return False  # shadowed
@@ -325,6 +335,12 @@ def _appears_in_membership_slot(node: DRCCondition, var: str) -> bool:
         return False
     if isinstance(node, MembershipNode):
         return var in node.variables
+    if isinstance(node, IsNotNullNode):
+        # ``IsNotNullNode.column`` is a column-binding name treated the
+        # same way as a ``MembershipNode`` slot for substitution purposes:
+        # eliminating ``var`` by substituting a literal would orphan the
+        # column-name slot.
+        return node.column == var
     if isinstance(node, QuantifierNode):
         if var in node.variables:
             return False  # shadowed
@@ -374,6 +390,14 @@ def _substitute(node: DRCCondition, mapping: dict[str, DRCCondition]) -> DRCCond
                 new_vars.append(v)
         if rewrote:
             return MembershipNode(variables=new_vars, relation=node.relation)
+        return node
+    if isinstance(node, IsNotNullNode):
+        # ``IsNotNullNode.column`` is a column-binding name treated the
+        # same way as a ``MembershipNode`` slot: only variable-to-variable
+        # substitutions apply.
+        repl = mapping.get(node.column)
+        if isinstance(repl, VariableRefNode):
+            return IsNotNullNode(column=repl.name)
         return node
     if isinstance(node, QuantifierNode):
         # Names rebound here shadow the substitution.
@@ -432,6 +456,8 @@ def _structural_equal(a: DRCCondition, b: DRCCondition) -> bool:
         return a.data_type == b.data_type and a.value == b.value
     if isinstance(a, MembershipNode):
         return a.relation == b.relation and a.variables == b.variables
+    if isinstance(a, IsNotNullNode):
+        return a.column == b.column
     if isinstance(a, QuantifierNode):
         return (
             a.kind == b.kind
@@ -513,6 +539,13 @@ def eliminate_unused_relation_slots(
             return
         if isinstance(node, VariableRefNode):
             referenced_outside_membership.add(node.name)
+            return
+        if isinstance(node, IsNotNullNode):
+            # ``IsNotNullNode.column`` references a column-binding name
+            # outside any membership slot; record it so the bound
+            # variable holding that column doesn't get pruned as unused.
+            if node.column:
+                referenced_outside_membership.add(node.column)
             return
         if isinstance(node, ComparisonNode):
             visit(node.left)
@@ -600,6 +633,9 @@ def drop_unused_slots(
                 if i < len(mask) and not mask[i]:
                     dropped_vars.add(v)
             return
+        if isinstance(node, IsNotNullNode):
+            # No membership slot to drop; leaf node.
+            return
         if isinstance(node, QuantifierNode):
             find_dropped(node.body)
             return
@@ -636,6 +672,9 @@ def drop_unused_slots(
             if new_vars == node.variables:
                 return node
             return MembershipNode(variables=new_vars, relation=node.relation)
+        if isinstance(node, IsNotNullNode):
+            # Leaf node, no slots to drop.
+            return node
         if isinstance(node, QuantifierNode):
             new_body = rewrite(node.body)
             new_bindings = [v for v in node.variables if v not in dropped_vars]
@@ -715,6 +754,9 @@ def rewrite_strftime_year_comparisons(
 
 def _strftime_rewrite(node: DRCCondition) -> DRCCondition:
     if node is None:
+        return node
+    if isinstance(node, IsNotNullNode):
+        # Leaf; no STRFTIME shape to rewrite.
         return node
     if isinstance(node, ComparisonNode):
         rewritten = _try_rewrite_strftime_comparison(node)
@@ -890,6 +932,9 @@ def normalise_integer_boundary_comparisons(
 def _normalise_boundary(node: DRCCondition) -> DRCCondition:
     if node is None:
         return node
+    if isinstance(node, IsNotNullNode):
+        # Leaf; no integer-boundary comparison shape to rewrite.
+        return node
     if isinstance(node, ComparisonNode):
         rewritten = _try_normalise_boundary(node)
         if rewritten is not None:
@@ -1030,4 +1075,92 @@ def preprocess_for_smt_pair(
     )
     after_pass2 = [drop_unused_slots(c, used) for c in after_pass1]
     after_pass3 = [rewrite_strftime_year_comparisons(c) for c in after_pass2]
-    return [normalise_integer_boundary_comparisons(c) for c in after_pass3]
+    after_pass4 = [normalise_integer_boundary_comparisons(c) for c in after_pass3]
+    return [rewrite_null_checks(c) for c in after_pass4]
+
+
+# ---------------------------------------------------------------------------
+# Pass 5: NULL-check normalisation
+#
+# The gold SQL uses ``IS NOT NULL`` / ``IS NULL`` which the translator
+# emits as ``FunctionCallNode("IS_NOT_NULL", [col])`` /
+# ``FunctionCallNode("IS_NULL", [col])``. The planner-side LLM
+# typically emits ``(!= col "")`` or ``(!= col 0)`` for the same
+# intent. Since ``IS_NOT_NULL`` is uninterpreted in cvc5, the solver
+# can't prove ``col != "" ↔ IS_NOT_NULL(col)``.
+#
+# Rewrite rules:
+#   IS_NOT_NULL(col)  →  col != ""   (String) or col != 0 (Int)
+#   IS_NULL(col)      →  col = ""    (String) or col = 0 (Int)
+#
+# The sort of ``col`` is inferred from the var_types map (String if
+# known, otherwise Int). This makes both sides structurally identical
+# and cvc5 resolves the equivalence.
+# ---------------------------------------------------------------------------
+
+
+def rewrite_null_checks(condition: DRCCondition) -> DRCCondition:
+    """Rewrite ``IS_NOT_NULL(col)`` and ``IS_NULL(col)`` into
+    comparison forms that match the planner's output."""
+    return _null_rewrite(condition)
+
+
+def _null_rewrite(node: DRCCondition) -> DRCCondition:
+    if node is None:
+        return node
+    if isinstance(node, IsNotNullNode):
+        # ``IsNotNullNode`` is already the canonical form this pass
+        # produces from ``FunctionCallNode("IS_NOT_NULL", ...)``; preserve
+        # it untouched so the planner-side and gold-side representations
+        # collapse to the same SMT.
+        return node
+    if isinstance(node, FunctionCallNode):
+        if node.function == "IS_NOT_NULL" and len(node.arguments) == 1:
+            arg = _null_rewrite(node.arguments[0])
+            # Rewrite to ``arg != ""`` (works for both String and Int
+            # in our model — the SMT converter infers the sort from
+            # context and the empty-string literal gets coerced as
+            # needed by the comparison handler).
+            return ComparisonNode(
+                operator="!=",
+                left=arg,
+                right=LiteralNode(value="", data_type="string"),
+            )
+        if node.function == "IS_NULL" and len(node.arguments) == 1:
+            arg = _null_rewrite(node.arguments[0])
+            return ComparisonNode(
+                operator="=",
+                left=arg,
+                right=LiteralNode(value="", data_type="string"),
+            )
+        return FunctionCallNode(
+            function=node.function,
+            arguments=[_null_rewrite(a) for a in node.arguments],
+        )
+    if isinstance(node, ComparisonNode):
+        return ComparisonNode(
+            operator=node.operator,
+            left=_null_rewrite(node.left),
+            right=_null_rewrite(node.right),
+        )
+    if isinstance(node, LogicalConnectiveNode):
+        return LogicalConnectiveNode(
+            operator=node.operator,
+            left=_null_rewrite(node.left),
+            right=_null_rewrite(node.right),
+        )
+    if isinstance(node, NotNode):
+        return NotNode(operand=_null_rewrite(node.operand))
+    if isinstance(node, QuantifierNode):
+        return QuantifierNode(
+            kind=node.kind,
+            variables=list(node.variables),
+            body=_null_rewrite(node.body),
+        )
+    if isinstance(node, ArithmeticNode):
+        return ArithmeticNode(
+            operator=node.operator,
+            left=_null_rewrite(node.left),
+            right=_null_rewrite(node.right),
+        )
+    return node

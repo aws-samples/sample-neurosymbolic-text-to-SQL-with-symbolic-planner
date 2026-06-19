@@ -11,14 +11,15 @@ from typing import Union
 
 from text_to_sql_planner.types.drc import (
     AggregateVariable,
+    ArithmeticAggregateVariable,
     ArithmeticNode,
-    ArithmeticResultVariable,
     ColumnVariable,
     ComparisonNode,
-    CountIfVariable,
+    ConditionalAggregateVariable,
     DRCCondition,
     DRCExpression,
     FunctionCallNode,
+    IsNotNullNode,
     LimitExpression,
     LiteralNode,
     LogicalConnectiveNode,
@@ -28,6 +29,7 @@ from text_to_sql_planner.types.drc import (
     QuantifierNode,
     QueryExpression,
     ResultVariable,
+    ScalarLiteralVariable,
     SortCriterion,
     VariableRefNode,
 )
@@ -160,6 +162,22 @@ class _PrintInternalError(Exception):
         super().__init__(print_error.message)
 
 
+def _print_aggregate_operand(operand) -> str:
+    """Print an aggregate operand in lisp form."""
+    if isinstance(operand, ScalarLiteralVariable):
+        return str(operand.value)
+    if isinstance(operand, ColumnVariable):
+        return operand.name
+    if isinstance(operand, ConditionalAggregateVariable):
+        cond_str = _print_condition(operand.condition)
+        return f"({operand.function}_IF {cond_str} {operand.column})"
+    if isinstance(operand, ArithmeticAggregateVariable):
+        left_str = _print_aggregate_operand(operand.left)
+        right_str = _print_aggregate_operand(operand.right)
+        return f"({operand.operator} {left_str} {right_str})"
+    return f"({operand.function} {operand.column})"
+
+
 def _print_result_variables(variables: list[ResultVariable]) -> str:
     """Print the result variables list."""
     if variables is None:
@@ -169,43 +187,36 @@ def _print_result_variables(variables: list[ResultVariable]) -> str:
     for var in variables:
         if var is None:
             raise _PrintInternalError(PrintError(message="Result variable is None", node=None))
-        parts.append(_print_single_result_variable(var))
+        if isinstance(var, ColumnVariable):
+            if not var.name:
+                raise _PrintInternalError(
+                    PrintError(message="ColumnVariable has empty name", node=var)
+                )
+            parts.append(var.name)
+        elif isinstance(var, AggregateVariable):
+            if not var.function:
+                raise _PrintInternalError(
+                    PrintError(message="AggregateVariable has empty function", node=var)
+                )
+            if not var.column:
+                raise _PrintInternalError(
+                    PrintError(message="AggregateVariable has empty column", node=var)
+                )
+            parts.append(f"({var.function} {var.column})")
+        elif isinstance(var, ArithmeticAggregateVariable):
+            left_str = _print_aggregate_operand(var.left)
+            right_str = _print_aggregate_operand(var.right)
+            parts.append(f"({var.operator} {left_str} {right_str})")
+        elif isinstance(var, ConditionalAggregateVariable):
+            cond_str = _print_condition(var.condition)
+            parts.append(f"({var.function}_IF {cond_str} {var.column})")
+        elif isinstance(var, ScalarLiteralVariable):
+            parts.append(str(var.value))
+        else:
+            raise _PrintInternalError(
+                PrintError(message=f"Unknown result variable type: {type(var).__name__}", node=var)
+            )
     return " ".join(parts)
-
-
-def _print_single_result_variable(var: ResultVariable) -> str:
-    """Print a single result variable (recursive for arithmetic)."""
-    if isinstance(var, ColumnVariable):
-        if not var.name:
-            raise _PrintInternalError(
-                PrintError(message="ColumnVariable has empty name", node=var)
-            )
-        return var.name
-    elif isinstance(var, AggregateVariable):
-        if not var.function:
-            raise _PrintInternalError(
-                PrintError(message="AggregateVariable has empty function", node=var)
-            )
-        if not var.column:
-            raise _PrintInternalError(
-                PrintError(message="AggregateVariable has empty column", node=var)
-            )
-        return f"({var.function} {var.column})"
-    elif isinstance(var, CountIfVariable):
-        if not var.column:
-            raise _PrintInternalError(
-                PrintError(message="CountIfVariable has empty column", node=var)
-            )
-        cond_str = _print_condition(var.condition)
-        return f"(COUNT_IF {cond_str} {var.column})"
-    elif isinstance(var, ArithmeticResultVariable):
-        left_str = _print_single_result_variable(var.left)
-        right_str = _print_single_result_variable(var.right)
-        return f"({var.operator} {left_str} {right_str})"
-    else:
-        raise _PrintInternalError(
-            PrintError(message=f"Unknown result variable type: {type(var).__name__}", node=var)
-        )
 
 
 def _print_condition(node: DRCCondition) -> str:
@@ -238,6 +249,13 @@ def _print_condition(node: DRCCondition) -> str:
             )
         vars_str = " ".join(node.variables)
         return f"(in ({vars_str}) {node.relation})"
+
+    if isinstance(node, IsNotNullNode):
+        if not node.column:
+            raise _PrintInternalError(
+                PrintError(message="IsNotNullNode has empty column", node=node)
+            )
+        return f"(is-not-null {node.column})"
 
     if isinstance(node, QuantifierNode):
         if node.kind not in ("forall", "exists"):

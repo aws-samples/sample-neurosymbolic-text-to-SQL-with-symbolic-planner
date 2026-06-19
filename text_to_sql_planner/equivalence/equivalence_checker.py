@@ -10,16 +10,6 @@ from text_to_sql_planner.types.drc import DRCExpression
 
 from .smt_converter import convert_to_smt
 
-# Trivially-satisfiable script returned when result-variable types
-# conflict between the two sides. cvc5 will immediately return ``sat``
-# (= not equivalent) without needing to reason about the formulas.
-_TYPE_CONFLICT_SCRIPT = (
-    "; result-variable type conflict: Int vs String\n"
-    "(set-logic ALL)\n"
-    "(assert true)\n"
-    "(check-sat)"
-)
-
 
 def _indent_smt(script: str, width: int = 80) -> str:
     """Pretty-print an SMT-LIB script with indentation.
@@ -371,7 +361,10 @@ def _build_equivalence_script(
             return rv.name
         if isinstance(rv, AggregateVariable):
             return rv.column
-        raise ValueError(f"Unknown result variable type: {type(rv).__name__}")
+        # Arithmetic/conditional aggregates and scalar literals don't
+        # have a single canonical "name"; use a positional placeholder
+        # so the preprocessing pass can still track them.
+        return f"__agg_{id(rv)}"
 
     rv_names_1 = [_rv_name(rv) for rv in expr1.result_variables]
     rv_names_2 = [_rv_name(rv) for rv in expr2.result_variables]
@@ -427,11 +420,23 @@ def _build_equivalence_script(
     _collect_relation_sorts(expr2.condition, all_var_types, rel_sorts)
 
     # Pick fresh shared names for the universally quantified result
-    # variables. Avoid collisions with anything declared or referenced
-    # anywhere in either expression.
+    # variables. When there's a mix of ColumnVariable and AggregateVariable
+    # (GROUP BY pattern), only universally quantify the ColumnVariables —
+    # the aggregate columns are existentially bound in the conditions.
+    # When ALL result variables are aggregates (no group keys), quantify
+    # them all as before for backward compatibility.
     reserved = set(vars1) | set(vars2) | set(rv_names_1) | set(rv_names_2)
+    has_column_vars = any(isinstance(rv, ColumnVariable) for rv in expr1.result_variables)
+    has_aggregate_vars = any(not isinstance(rv, ColumnVariable) for rv in expr1.result_variables)
+    mixed_group_by = has_column_vars and has_aggregate_vars
+
     shared_names: list[str] = []
+    quantified_indices: list[int] = []
     for i in range(len(rv_names_1)):
+        rv1 = expr1.result_variables[i]
+        # Skip aggregates from the forall only in GROUP BY (mixed) pattern
+        if mixed_group_by and not isinstance(rv1, ColumnVariable):
+            continue
         base = f"_rv_{i}"
         candidate = base
         counter = 2
@@ -439,69 +444,48 @@ def _build_equivalence_script(
             candidate = f"{base}_{counter}"
             counter += 1
         shared_names.append(candidate)
+        quantified_indices.append(i)
         reserved.add(candidate)
 
     # Per-side scope maps so each formula's result-variable references
-    # resolve to the shared names.
-    scope1 = {orig: shared for orig, shared in zip(rv_names_1, shared_names)}
-    scope2 = {orig: shared for orig, shared in zip(rv_names_2, shared_names)}
+    # resolve to the shared names. Only map quantified result variables.
+    scope1 = {}
+    scope2 = {}
+    for qi, si in enumerate(quantified_indices):
+        scope1[rv_names_1[si]] = shared_names[qi]
+        scope2[rv_names_2[si]] = shared_names[qi]
 
     # Determine the type for each shared name (String wins over Int).
-    def _shared_sort(idx: int) -> str:
-        n1 = rv_names_1[idx]
-        n2 = rv_names_2[idx]
+    def _shared_sort(qi: int) -> str:
+        si = quantified_indices[qi]
+        n1 = rv_names_1[si]
+        n2 = rv_names_2[si]
         t1 = all_var_types.get(n1, "Int")
         t2 = all_var_types.get(n2, "Int")
         if t1 == "String" or t2 == "String":
             return "String"
         return "Int"
 
-    # Check for type conflicts in result variables. If one side returns
-    # an Int column and the other a String column at the same position,
-    # the two expressions cannot be equivalent — short-circuit without
-    # calling cvc5 (which would crash with a type error anyway).
-    for i in range(len(rv_names_1)):
-        n1 = rv_names_1[i]
-        n2 = rv_names_2[i]
-        t1 = all_var_types.get(n1, "Int")
-        t2 = all_var_types.get(n2, "Int")
-        if t1 != t2:
-            # Type mismatch at result position i — not equivalent.
-            return _TYPE_CONFLICT_SCRIPT
-
-    # Detect free variables that collide with relation names (or
-    # uninterpreted function names). SMT-LIB doesn't allow a
-    # ``declare-const`` and a ``declare-fun`` with the same name;
-    # cvc5 exits with a parse error when it sees the variable used
-    # in function-call position. Rename the *variable* to avoid the
-    # clash — the relation name is canonical.
-    fn_names: set[str] = set(all_relations.keys())
-    # (function signatures will be collected later but their names
-    # come from the same DRC condition; pre-collect here for safety)
-    from .smt_converter import collect_function_signatures as _cfs
-    fn_names |= set(_cfs(expr1.condition, all_var_types).keys())
-    fn_names |= set(_cfs(expr2.condition, all_var_types).keys())
-
-    bound_originals = set(rv_names_1) | set(rv_names_2)
-    free_vars = (vars1 | vars2) - bound_originals
-    var_rename_map: dict[str, str] = {}  # original -> smt-safe name
-    for var in free_vars:
-        if var in fn_names:
-            candidate = f"_var_{var}"
-            while candidate in reserved or candidate in fn_names:
-                candidate = f"_var_{candidate}"
-            var_rename_map[var] = candidate
-            reserved.add(candidate)
-
-    # Inject collision renames into both scopes so _convert_node
-    # emits the safe name wherever the variable appears free.
-    for orig, safe in var_rename_map.items():
-        scope1.setdefault(orig, safe)
-        scope2.setdefault(orig, safe)
-
     # Convert each condition under its substitution scope.
     formula1 = _convert_node(expr1.condition, all_var_types, scope1)
     formula2 = _convert_node(expr2.condition, all_var_types, scope2)
+
+    # In the GROUP BY pattern, aggregate columns are not universally
+    # quantified. Wrap each formula in existential quantifiers for
+    # the aggregate columns so cvc5 sees them as "there exists some
+    # value" rather than as free constants pinned to specific values.
+    if mixed_group_by:
+        for i in range(len(rv_names_1)):
+            rv1 = expr1.result_variables[i]
+            if not isinstance(rv1, ColumnVariable):
+                col1 = rv_names_1[i]
+                col2 = rv_names_2[i]
+                sort1 = all_var_types.get(col1, "Int")
+                sort2 = all_var_types.get(col2, "Int")
+                if col1 not in scope1:  # not already substituted
+                    formula1 = f"(exists (({col1} {sort1})) {formula1})"
+                if col2 not in scope2:
+                    formula2 = f"(exists (({col2} {sort2})) {formula2})"
 
     # Build the script.
     lines: list[str] = []
@@ -549,11 +533,11 @@ def _build_equivalence_script(
     # result variable on its own side. With substitution in place, the
     # result variables vanish from the formula, replaced by the shared
     # names, so they should NOT be declared as free constants.
+    bound_originals = set(rv_names_1) | set(rv_names_2)
     all_variables = vars1 | vars2
     for var in sorted(all_variables - bound_originals):
-        smt_name = var_rename_map.get(var, var)
         sort = all_var_types.get(var, "Int")
-        lines.append(f"(declare-const {smt_name} {sort})")
+        lines.append(f"(declare-const {var} {sort})")
 
     if shared_names:
         bindings = " ".join(
@@ -973,6 +957,7 @@ def _propagate_types_from_relations(condition, rel_sorts: dict[str, list[str]], 
     from text_to_sql_planner.types.drc import (
         MembershipNode, LogicalConnectiveNode, NotNode,
         QuantifierNode, ComparisonNode, ArithmeticNode, FunctionCallNode,
+        IsNotNullNode,
     )
 
     if condition is None:
@@ -1006,3 +991,9 @@ def _propagate_types_from_relations(condition, rel_sorts: dict[str, list[str]], 
     elif isinstance(condition, FunctionCallNode):
         for arg in condition.arguments:
             _propagate_types_from_relations(arg, rel_sorts, var_types)
+
+    elif isinstance(condition, IsNotNullNode):
+        # ``IsNotNullNode`` does not pin a sort by itself — its column's
+        # sort is inferred elsewhere (a comparison against a literal, a
+        # membership site, etc.). No relation-sort propagation here.
+        pass

@@ -13,6 +13,7 @@ RAOperatorType = Literal[
     "cartesian_product", "union", "difference", "division",
     "rename",
     "aggregate",
+    "ratio",
     "anti_join",
 ]
 
@@ -114,6 +115,30 @@ class AggregateParams:
 
 
 @dataclass
+class RatioParams:
+    """Ratio of two aggregates: (/ (F1 col1) (F2 col2)).
+
+    Takes an input with exactly 2 ColumnVariable result variables and
+    produces a single ArithmeticResultVariable wrapping two
+    AggregateVariables.
+
+    When ``numerator_condition`` is set (a DRC condition lisp string),
+    the numerator becomes a CountIfVariable instead of a plain
+    AggregateVariable, producing ``(/ (COUNT_IF cond col1) (F2 col2))``.
+    """
+
+    type: Literal["ratio"] = "ratio"
+    operator: str = "/"  # arithmetic operator: +, -, *, /
+    numerator_function: Literal["COUNT", "SUM", "AVG", "MIN", "MAX"] = "COUNT"
+    numerator_column: str = ""
+    denominator_function: Literal["COUNT", "SUM", "AVG", "MIN", "MAX"] = "COUNT"
+    denominator_column: str = ""
+    numerator_condition: str | None = None  # optional lisp condition for COUNT_IF
+    denominator_condition: str | None = None  # optional lisp condition for COUNT_IF on denominator
+    scalar_multiplier: int | float | None = None  # optional scalar (e.g. 100 for percentage)
+
+
+@dataclass
 class AntiJoinParams:
     """Anti-join: rows of the left input whose key is NOT present in the right.
 
@@ -137,6 +162,7 @@ OperatorParams = Union[
     CartesianProductParams, UnionParams, DifferenceParams, DivisionParams,
     RenameParams,
     AggregateParams,
+    RatioParams,
     AntiJoinParams,
 ]
 

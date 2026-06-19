@@ -27,9 +27,12 @@ from text_to_sql_planner.types.operators import (
     RenameParams,
     AggregateParams,
     AntiJoinParams,
+    RatioParams,
 )
 from text_to_sql_planner.types.drc import (
+    ArithmeticNode,
     ComparisonNode,
+    IsNotNullNode,
     LogicalConnectiveNode,
     NotNode,
     VariableRefNode,
@@ -40,6 +43,9 @@ from text_to_sql_planner.types.drc import (
     DRCCondition,
     ColumnVariable,
     AggregateVariable,
+    ArithmeticAggregateVariable,
+    ConditionalAggregateVariable,
+    ScalarLiteralVariable,
 )
 
 
@@ -164,6 +170,8 @@ class _AliasGenerator:
 
     def __init__(self):
         self._counters: dict[str, int] = {}
+        # Track which alias was assigned to which table_name (most recent).
+        self._last_alias: dict[str, str] = {}
 
     def next_alias(self, table_name: str) -> str:
         """Generate next unique alias for a table.
@@ -173,7 +181,14 @@ class _AliasGenerator:
         prefix = table_name[0].lower() if table_name else "t"
         count = self._counters.get(prefix, 0) + 1
         self._counters[prefix] = count
-        return f"{prefix}{count}"
+        alias = f"{prefix}{count}"
+        self._last_alias[table_name] = alias
+        return alias
+
+    def peek_alias(self, table_name: str) -> str | None:
+        """Return the most recent alias assigned to ``table_name``, or
+        ``None`` if the table hasn't been aliased yet."""
+        return self._last_alias.get(table_name)
 
 
 # --- SQL Generator ---
@@ -272,7 +287,7 @@ class _SqlGenerator:
             return self._ctx_cartesian(node, params, inputs)
         elif isinstance(params, RenameParams):
             return self._ctx_rename(node, params, inputs)
-        elif isinstance(params, (ProjectionParams, UnionParams, DifferenceParams, DivisionParams, AntiJoinParams, AggregateParams)):
+        elif isinstance(params, (ProjectionParams, UnionParams, DifferenceParams, DivisionParams, AntiJoinParams, AggregateParams, RatioParams)):
             # Non-flattenable operators get wrapped as a derived subquery
             return self._ctx_from_subquery(node)
         else:
@@ -620,20 +635,20 @@ class _SqlGenerator:
     # --- Set operators (UNION, EXCEPT) ---
 
     def _convert_set_op(self, node: OperatorNode, sql_op: str) -> str:
-        """Set-op operators (``UNION``, ``EXCEPT``) -> ``(...) <OP> (...)``.
+        """Set-op operators (``UNION``, ``EXCEPT``) -> ``left <OP> right``.
 
         Both inputs must already produce union-compatible row shapes; the
         operator layer is responsible for that and the SQL we emit just
-        composes them with the SQL-level keyword.
+        composes them with the SQL-level keyword. Operands are NOT
+        wrapped in parentheses — SQLite rejects ``(SELECT ...) UNION
+        (SELECT ...)`` inside a derived-table context.
         """
         inputs = node.inputs
         if len(inputs) < 2:
             raise _ConversionError(f"{sql_op} requires exactly 2 inputs")
         left_sql = self._convert_node(inputs[0])
         right_sql = self._convert_node(inputs[1])
-        left_indented = self._indent_sql(left_sql, 2)
-        right_indented = self._indent_sql(right_sql, 2)
-        return f"(\n{left_indented}\n)\n{sql_op}\n(\n{right_indented}\n)"
+        return f"{left_sql}\n{sql_op}\n{right_sql}"
 
     # --- Anti-join ---
 
@@ -752,7 +767,7 @@ class _SqlGenerator:
         if not params.join_columns:
             return SQLFailure(error="Anti-join requires at least one join column")
 
-        has_aggregates = any(isinstance(rv, AggregateVariable) for rv in result_variables)
+        has_aggregates = any(isinstance(rv, (AggregateVariable, ArithmeticAggregateVariable, ConditionalAggregateVariable)) for rv in result_variables)
 
         left = anti_node.inputs[0]
         right = anti_node.inputs[1]
@@ -777,9 +792,25 @@ class _SqlGenerator:
                     select_parts.append(f"{qualified} AS {rv.name}")
                 else:
                     select_parts.append(qualified)
+            elif isinstance(rv, ArithmeticAggregateVariable):
+                left_sql = _format_aggregate(rv.left, _lookup_at, i, condition_to_sql=self._condition_to_sql, var_map=left_ctx.var_mapping)
+                right_sql = _format_aggregate(rv.right, _lookup_at, i, condition_to_sql=self._condition_to_sql, var_map=left_ctx.var_mapping)
+                if rv.operator == "/":
+                    select_parts.append(f"CAST({left_sql} AS REAL) / {right_sql}")
+                else:
+                    select_parts.append(f"{left_sql} {rv.operator} {right_sql}")
+            elif isinstance(rv, ConditionalAggregateVariable):
+                qualified_col = _lookup_at(i, rv.column)
+                cond_sql = self._condition_to_sql(rv.condition, left_ctx.var_mapping)
+                select_parts.append(
+                    f"{rv.function}(CASE WHEN {cond_sql} THEN {qualified_col} END)"
+                )
             elif isinstance(rv, AggregateVariable):
                 qualified_col = _lookup_at(i, rv.column)
-                select_parts.append(f"{rv.function}({qualified_col})")
+                if rv.function == "COUNT":
+                    select_parts.append(f"COUNT({qualified_col})")
+                else:
+                    select_parts.append(f"{rv.function}({qualified_col})")
         select_str = ", ".join(select_parts)
 
         # NOT EXISTS subquery against the right side. When the right
@@ -854,7 +885,19 @@ class _SqlGenerator:
                 if col in rv_name_to_idx:
                     qualified = _lookup_at(rv_name_to_idx[col], col)
                 else:
-                    qualified = self._resolve_var(col, left_ctx.var_mapping)
+                    try:
+                        qualified = self._resolve_var(col, left_ctx.var_mapping)
+                    except _ConversionError:
+                        qualified = self._resolve_order_by_column(
+                            col, tree.root if hasattr(tree, 'root') else original_root
+                        )
+                        if qualified is None:
+                            return SQLFailure(
+                                error=(
+                                    f"ORDER BY column '{col}' not found in "
+                                    f"any joined table"
+                                )
+                            )
                 if crit.aggregate:
                     qualified = f"{crit.aggregate}({qualified})"
                 direction = (crit.direction or "asc").upper()
@@ -940,7 +983,7 @@ class _SqlGenerator:
         ``GROUP BY`` (mixed columns and aggregates) or single-row
         aggregation already produce a distinct result.
         """
-        has_aggregates = any(isinstance(rv, AggregateVariable) for rv in result_variables)
+        has_aggregates = any(isinstance(rv, (AggregateVariable, ArithmeticAggregateVariable, ConditionalAggregateVariable)) for rv in result_variables)
 
         # When the tree's root is itself a projection, ``_build_context``
         # would wrap it as a derived subquery (via ``_ctx_from_subquery``)
@@ -989,13 +1032,38 @@ class _SqlGenerator:
             if isinstance(params, ProjectionParams):
                 effective_root = effective_root.inputs[0]
                 continue
-            if (
-                isinstance(params, AggregateParams)
-                and _aggregate_matches_target(params, result_variables)
-            ):
+            if isinstance(params, AggregateParams):
+                # Peel through: (a) single-agg that matches target, or
+                # (b) GROUP BY pattern (mixed column + aggregate result vars)
+                # where _generate_with_result_vars handles the rendering.
+                if _aggregate_matches_target(params, result_variables):
+                    effective_root = effective_root.inputs[0]
+                    continue
+                # GROUP BY case: multiple result vars with at least one aggregate
+                has_col = any(isinstance(rv, ColumnVariable) for rv in result_variables)
+                has_agg = any(isinstance(rv, (AggregateVariable, ArithmeticAggregateVariable, ConditionalAggregateVariable)) for rv in result_variables)
+                if has_col and has_agg:
+                    effective_root = effective_root.inputs[0]
+                    continue
+            if isinstance(params, RatioParams):
+                # The ratio's semantics are already encoded in the
+                # target's ArithmeticAggregateVariable result variables.
+                # Peel through to the underlying data relation.
                 effective_root = effective_root.inputs[0]
                 continue
             break
+
+        # If ORDER BY references columns NOT in the effective_root's
+        # output, peel projections from join inputs so those columns
+        # are visible in the flattened FROM clause (dev_999 fix).
+        if order_by and isinstance(effective_root, OperatorNode):
+            order_cols = {c.column for c in order_by if c.column}
+            effective_cols = set(self._get_node_columns(effective_root))
+            missing = order_cols - effective_cols
+            if missing:
+                effective_root = _peel_inner_projections(
+                    effective_root, missing
+                )
 
         # Special case: when the effective root is an anti-join, render
         # it directly as the outer SELECT instead of wrapping it as a
@@ -1039,15 +1107,23 @@ class _SqlGenerator:
                     select_parts.append(f"{qualified} AS {rv.name}")
                 else:
                     select_parts.append(qualified)
+            elif isinstance(rv, ArithmeticAggregateVariable):
+                left_sql = _format_aggregate(rv.left, _lookup_at, i, condition_to_sql=self._condition_to_sql, var_map=ctx.var_mapping)
+                right_sql = _format_aggregate(rv.right, _lookup_at, i, condition_to_sql=self._condition_to_sql, var_map=ctx.var_mapping)
+                if rv.operator == "/":
+                    select_parts.append(f"CAST({left_sql} AS REAL) / {right_sql}")
+                else:
+                    select_parts.append(f"{left_sql} {rv.operator} {right_sql}")
+            elif isinstance(rv, ConditionalAggregateVariable):
+                qualified_col = _lookup_at(i, rv.column)
+                cond_sql = self._condition_to_sql(rv.condition, ctx.var_mapping)
+                select_parts.append(
+                    f"{rv.function}(CASE WHEN {cond_sql} THEN {qualified_col} END)"
+                )
             elif isinstance(rv, AggregateVariable):
                 qualified_col = _lookup_at(i, rv.column)
-                # When ``distinct=True`` and the aggregate is COUNT,
-                # emit ``COUNT(DISTINCT col)`` so the SQL correctly
-                # deduplicates the counted entity. The DRC model is
-                # set-based (inherently distinct) but SQL bag semantics
-                # need an explicit DISTINCT inside the aggregate.
-                if distinct and rv.function == "COUNT":
-                    select_parts.append(f"COUNT(DISTINCT {qualified_col})")
+                if rv.function == "COUNT":
+                    select_parts.append(f"COUNT({qualified_col})")
                 else:
                     select_parts.append(f"{rv.function}({qualified_col})")
 
@@ -1105,7 +1181,25 @@ class _SqlGenerator:
                     # resolution against the inner var_map. This handles
                     # ORDER BY on a column the user named outside the
                     # SELECT list (rare but allowed in standard SQL).
-                    qualified = self._resolve_var(col, ctx.var_mapping)
+                    # If that also fails (the column was projected away
+                    # before the final node), search all table-leaf
+                    # nodes in the tree — the FROM clause already joins
+                    # them so their columns are in scope for ORDER BY.
+                    try:
+                        qualified = self._resolve_var(col, ctx.var_mapping)
+                    except _ConversionError:
+                        # Fallback: scan tree for the column in any
+                        # table leaf's original columns.
+                        qualified = self._resolve_order_by_column(
+                            col, tree.root
+                        )
+                        if qualified is None:
+                            return SQLFailure(
+                                error=(
+                                    f"ORDER BY column '{col}' not found in "
+                                    f"any joined table"
+                                )
+                            )
                 if crit.aggregate:
                     qualified = f"{crit.aggregate}({qualified})"
                 direction = (crit.direction or "asc").upper()
@@ -1156,6 +1250,49 @@ class _SqlGenerator:
             f"Available: {sorted(var_map)}"
         )
 
+    def _resolve_order_by_column(
+        self, col: str, tree_node
+    ) -> str | None:
+        """Find an ORDER BY column in any table leaf of the operation tree.
+
+        SQL allows ``ORDER BY col`` where ``col`` is from any joined
+        table in the FROM clause, even if the SELECT list doesn't
+        include it. When the planner's projection drops the column
+        before SQL emission, the main ``_resolve_var`` fails. This
+        fallback walks the tree, finds the first ``TableLeafNode``
+        whose columns contain ``col``, and returns a qualified
+        ``alias.col`` reference. The FROM clause already joins all
+        these tables so the reference is valid.
+
+        Returns ``None`` if no table leaf has the column.
+        """
+        from text_to_sql_planner.types.operation_tree import (
+            TableLeafNode,
+            OperatorNode,
+        )
+
+        def _find_in_tree(node) -> str | None:
+            if isinstance(node, TableLeafNode):
+                if col in node.columns:
+                    alias = self._aliases.peek_alias(node.table_name)
+                    if alias is None:
+                        # Table not yet aliased — use the table name
+                        # directly (shouldn't happen in practice since
+                        # the FROM was already built).
+                        original = node.original_column_names.get(col, col)
+                        return f"{node.table_name}.{_quote_col(original)}"
+                    original = node.original_column_names.get(col, col)
+                    return f"{alias}.{_quote_col(original)}"
+                return None
+            if isinstance(node, OperatorNode):
+                for inp in node.inputs:
+                    result = _find_in_tree(inp)
+                    if result is not None:
+                        return result
+            return None
+
+        return _find_in_tree(tree_node)
+
     # --- Condition to SQL ---
 
     def _condition_to_sql(self, condition: DRCCondition, var_map: dict[str, str]) -> str:
@@ -1182,6 +1319,11 @@ class _SqlGenerator:
             return self._quantifier_to_sql(condition, var_map)
         elif isinstance(condition, FunctionCallNode):
             return self._function_to_sql(condition, var_map)
+        elif isinstance(condition, ArithmeticNode):
+            return self._arithmetic_to_sql(condition, var_map)
+        elif isinstance(condition, IsNotNullNode):
+            resolved = self._resolve_var(condition.column, var_map)
+            return f"{resolved} IS NOT NULL"
         else:
             raise _ConversionError(f"Unsupported condition type: {type(condition).__name__}")
 
@@ -1264,6 +1406,12 @@ class _SqlGenerator:
                 return node.function
             args = ", ".join(self._condition_to_sql(a, var_map) for a in node.arguments)
             return f"{node.function}({args})"
+
+    def _arithmetic_to_sql(self, node: ArithmeticNode, var_map: dict[str, str]) -> str:
+        """Convert an arithmetic node to SQL (e.g. ``col * 100 / col2``)."""
+        left = self._condition_to_sql(node.left, var_map)
+        right = self._condition_to_sql(node.right, var_map)
+        return f"({left} {node.operator} {right})"
 
     def _quantifier_to_sql(self, node: QuantifierNode, outer_var_map: dict[str, str]) -> str:
         """Convert a quantifier (EXISTS/FORALL) to a correlated subquery."""
@@ -1438,6 +1586,52 @@ class _SqlGenerator:
 # --- Helpers (module-level) ---
 
 
+def _format_aggregate(
+    agg, lookup_at, position: int, *, condition_to_sql=None, var_map=None
+) -> str:
+    """Format a ``ResultVariable`` as a SQL fragment inside an arithmetic aggregate.
+
+    Handles ``AggregateVariable``, ``ConditionalAggregateVariable``,
+    nested ``ArithmeticAggregateVariable``, and ``ScalarLiteralVariable``.
+    """
+    from text_to_sql_planner.types.drc import (
+        ScalarLiteralVariable,
+        ConditionalAggregateVariable,
+        ArithmeticAggregateVariable,
+        ColumnVariable,
+    )
+    if isinstance(agg, ScalarLiteralVariable):
+        return str(agg.value)
+    if isinstance(agg, ColumnVariable):
+        if var_map and agg.name in var_map:
+            return var_map[agg.name]
+        return lookup_at(position, agg.name)
+    if isinstance(agg, ArithmeticAggregateVariable):
+        left_sql = _format_aggregate(agg.left, lookup_at, position, condition_to_sql=condition_to_sql, var_map=var_map)
+        right_sql = _format_aggregate(agg.right, lookup_at, position, condition_to_sql=condition_to_sql, var_map=var_map)
+        if agg.operator == "/":
+            return f"(CAST({left_sql} AS REAL) / {right_sql})"
+        return f"({left_sql} {agg.operator} {right_sql})"
+    if isinstance(agg, ConditionalAggregateVariable):
+        if var_map and agg.column in var_map:
+            qualified_col = var_map[agg.column]
+        else:
+            qualified_col = lookup_at(position, agg.column)
+        if condition_to_sql is not None and var_map is not None:
+            cond_sql = condition_to_sql(agg.condition, var_map)
+        else:
+            cond_sql = "1"
+        return f"{agg.function}(CASE WHEN {cond_sql} THEN {qualified_col} END)"
+    # AggregateVariable (the common case)
+    if var_map and agg.column in var_map:
+        qualified_col = var_map[agg.column]
+    else:
+        qualified_col = lookup_at(position, agg.column)
+    if agg.function == "COUNT":
+        return f"COUNT({qualified_col})"
+    return f"{agg.function}({qualified_col})"
+
+
 def _maybe_emit_group_by(
     parts: list[str],
     has_aggregates: bool,
@@ -1510,6 +1704,78 @@ def _aggregate_matches_target(
     if not isinstance(rv, AggregateVariable):
         return False
     return rv.function == params.function and rv.column == params.column
+
+
+def _peel_inner_projections(node, missing_cols: set[str]):
+    """Recursively peel ProjectionParams from join inputs when they hide
+    ORDER BY columns.
+
+    When a join's input is ``projection(['raceId']) → selection → results``,
+    the projection drops ``fastestLapTime``. If ``fastestLapTime`` is needed
+    for ORDER BY, we replace that input with the projection's own input
+    (the selection node), which still has all columns including
+    ``fastestLapTime``. The join then sees the full table and the SQL
+    converter can reference the ORDER BY column directly.
+
+    Only peels projections whose removal exposes at least one missing
+    column. Leaves non-projection inputs and inputs that don't help
+    untouched.
+    """
+    from text_to_sql_planner.types.operation_tree import OperatorNode, TableLeafNode
+    from text_to_sql_planner.types.operators import ProjectionParams, JoinParams
+
+    if not isinstance(node, OperatorNode) or not node.inputs:
+        return node
+
+    new_inputs = []
+    changed = False
+    for inp in node.inputs:
+        if (
+            isinstance(inp, OperatorNode)
+            and isinstance(inp.params, ProjectionParams)
+            and inp.inputs
+        ):
+            # Check if peeling this projection would expose any of the
+            # missing ORDER BY columns.
+            inner = inp.inputs[0]
+            inner_cols = set(_get_node_columns_static(inner))
+            if inner_cols & missing_cols:
+                new_inputs.append(inner)
+                changed = True
+                continue
+        # Recurse into join inputs (a join might contain another join
+        # whose child is the offending projection).
+        peeled = _peel_inner_projections(inp, missing_cols)
+        if peeled is not inp:
+            new_inputs.append(peeled)
+            changed = True
+        else:
+            new_inputs.append(inp)
+
+    if not changed:
+        return node
+
+    # Rebuild the node with updated inputs. We also need to update
+    # output_columns to include the newly-exposed columns.
+    from dataclasses import replace
+    new_node = replace(node, inputs=new_inputs)
+    return new_node
+
+
+def _get_node_columns_static(node) -> list[str]:
+    """Get output columns from a node without needing a class instance."""
+    from text_to_sql_planner.types.operation_tree import OperatorNode, TableLeafNode
+
+    if isinstance(node, TableLeafNode):
+        return node.columns
+    if isinstance(node, OperatorNode):
+        if node.output_columns:
+            return node.output_columns
+        # Fall back to first input's columns (for selection, which
+        # passes through).
+        if node.inputs:
+            return _get_node_columns_static(node.inputs[0])
+    return []
 
 
 # --- Public API ---

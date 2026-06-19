@@ -27,7 +27,7 @@ from text_to_sql_planner.types.operators import (
 
 
 def _get_columns(expr: DRCExpression) -> list[str]:
-    return [rv.name if isinstance(rv, ColumnVariable) else rv.column for rv in expr.result_variables]
+    return [rv.name if isinstance(rv, ColumnVariable) else getattr(rv, "column", f"__expr_{i}__") for i, rv in enumerate(expr.result_variables)]
 
 
 def _rename_variable(condition: DRCCondition, old_name: str, new_name: str) -> DRCCondition:
@@ -110,14 +110,14 @@ def apply_cartesian_product(
         # Build output variables with renamed columns
         output_variables = []
         for rv in r1.result_variables:
-            col_name = rv.name if isinstance(rv, ColumnVariable) else rv.column
+            col_name = rv.name if isinstance(rv, ColumnVariable) else getattr(rv, "column", "__expr__")
             if col_name in r1_renames:
                 output_variables.append(ColumnVariable(name=r1_renames[col_name]))
             else:
                 output_variables.append(rv)
 
         for rv in r2.result_variables:
-            col_name = rv.name if isinstance(rv, ColumnVariable) else rv.column
+            col_name = rv.name if isinstance(rv, ColumnVariable) else getattr(rv, "column", "__expr__")
             if col_name in r2_renames:
                 output_variables.append(ColumnVariable(name=r2_renames[col_name]))
             else:

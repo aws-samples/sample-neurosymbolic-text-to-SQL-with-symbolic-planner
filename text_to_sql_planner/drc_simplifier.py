@@ -97,6 +97,7 @@ from text_to_sql_planner.types.drc import (
     DRCCondition,
     DRCExpression,
     FunctionCallNode,
+    IsNotNullNode,
     LiteralNode,
     LogicalConnectiveNode,
     MembershipNode,
@@ -638,6 +639,14 @@ def _alpha_rename_node(
             return node
         return MembershipNode(variables=new_vars, relation=node.relation)
 
+    if isinstance(node, IsNotNullNode):
+        # ``IsNotNullNode.column`` is renamed under ``scope`` the same way
+        # ``MembershipNode.variables[i]`` is.
+        new_col = scope.get(node.column, node.column)
+        if new_col == node.column:
+            return node
+        return IsNotNullNode(column=new_col)
+
     if isinstance(node, QuantifierNode):
         # Allocate a fresh name for each bound variable, in order. The
         # stable sequence (`_v0, _v1, …`) is what gives canonicalisation.
@@ -715,6 +724,13 @@ def _collect_free_vars(
         for v in node.variables:
             if v not in bound_stack:
                 free.add(v)
+        return
+    if isinstance(node, IsNotNullNode):
+        # ``IsNotNullNode.column`` is a column-binding name, free unless
+        # bound by an enclosing quantifier — same treatment as a
+        # ``MembershipNode`` slot.
+        if node.column and node.column not in bound_stack:
+            free.add(node.column)
         return
     if isinstance(node, QuantifierNode):
         new_bound = bound_stack | set(node.variables)
@@ -845,6 +861,13 @@ def _walk(node: DRCCondition, rule: Callable[[DRCCondition], DRCCondition]) -> D
             node = FunctionCallNode(function=node.function, arguments=new_args)
         return rule(node)
 
+    if isinstance(node, IsNotNullNode):
+        # Leaf node — no condition-tree children to recurse into; the
+        # bound-variable-like ``column`` field is a string. Just apply
+        # the rule, mirroring the ``MembershipNode`` / ``LiteralNode``
+        # leaf-walk path.
+        return rule(node)
+
     # Leaves — no recursion, just apply the rule.
     return rule(node)
 
@@ -891,6 +914,10 @@ def _references(node: DRCCondition, var: str) -> bool:
         return node.name == var
     if isinstance(node, MembershipNode):
         return var in node.variables
+    if isinstance(node, IsNotNullNode):
+        # ``IsNotNullNode.column`` is a column-binding name treated the
+        # same as a ``MembershipNode`` slot.
+        return node.column == var
     if isinstance(node, QuantifierNode):
         if var in node.variables:
             return False  # shadowed
@@ -915,11 +942,18 @@ def _appears_in_membership(node: DRCCondition, var: str) -> bool:
     Used by the equality-elimination pass to decide whether a
     literal-substituent rewrite would leave a dangling slot reference.
     Tracks quantifier shadowing the same way as ``_references``.
+
+    ``IsNotNullNode.column`` is also treated as a positional slot
+    identifier here: substituting a literal for a name that appears as
+    an ``IsNotNullNode`` column would leave the column name dangling
+    the same way it would for a membership slot.
     """
     if node is None:
         return False
     if isinstance(node, MembershipNode):
         return var in node.variables
+    if isinstance(node, IsNotNullNode):
+        return node.column == var
     if isinstance(node, QuantifierNode):
         if var in node.variables:
             return False
@@ -1034,6 +1068,15 @@ def _substitute(
         if rewrote:
             return MembershipNode(variables=new_vars, relation=node.relation)
         return node
+    if isinstance(node, IsNotNullNode):
+        # ``IsNotNullNode.column`` is a column-binding name handled the
+        # same way as a ``MembershipNode`` slot: only variable-to-variable
+        # substitutions apply (a literal substituent has no representation
+        # as a column name, so the original is kept).
+        repl = mapping.get(node.column)
+        if isinstance(repl, VariableRefNode):
+            return IsNotNullNode(column=repl.name)
+        return node
     if isinstance(node, QuantifierNode):
         rebound = set(node.variables)
         inner_map = {k: v for k, v in mapping.items() if k not in rebound}
@@ -1084,6 +1127,8 @@ def _structural_equal(a: DRCCondition, b: DRCCondition) -> bool:
         return a.data_type == b.data_type and a.value == b.value
     if isinstance(a, MembershipNode):
         return a.relation == b.relation and a.variables == b.variables
+    if isinstance(a, IsNotNullNode):
+        return a.column == b.column
     if isinstance(a, QuantifierNode):
         return (
             a.kind == b.kind
@@ -1128,6 +1173,8 @@ def _signature(node: DRCCondition) -> tuple:
         return ("lit", node.data_type, node.value)
     if isinstance(node, MembershipNode):
         return ("in", node.relation, tuple(node.variables))
+    if isinstance(node, IsNotNullNode):
+        return ("isnotnull", node.column)
     if isinstance(node, QuantifierNode):
         return ("q", node.kind, tuple(node.variables), _signature(node.body))
     if isinstance(node, LogicalConnectiveNode):

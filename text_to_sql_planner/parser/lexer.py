@@ -95,6 +95,9 @@ class Lexer:
         if ch == '"':
             return self._read_string()
 
+        if ch == '`':
+            return self._read_backtick_identifier()
+
         # Number detection: starts with digit, or '-' followed by digit
         if ch.isdigit() or (
             ch == "-"
@@ -145,6 +148,28 @@ class Lexer:
                 self._pos += 1
 
         raise _make_error(start, "Unterminated string literal", self._source)
+
+    def _read_backtick_identifier(self) -> Token:
+        """Read a backtick-quoted identifier: `column name with spaces`."""
+        start = self._pos
+        self._pos += 1  # skip opening backtick
+        chars: list[str] = []
+
+        while self._pos < self._length:
+            ch = self._source[self._pos]
+            if ch == '`':
+                # Check for escaped backtick (double backtick)
+                if self._pos + 1 < self._length and self._source[self._pos + 1] == '`':
+                    chars.append('`')
+                    self._pos += 2
+                else:
+                    self._pos += 1  # skip closing backtick
+                    return Token(TokenType.SYMBOL, "".join(chars), start)
+            else:
+                chars.append(ch)
+                self._pos += 1
+
+        raise _make_error(start, "Unterminated backtick identifier", self._source)
 
     def _read_number(self) -> Token:
         """Read an integer or float literal."""

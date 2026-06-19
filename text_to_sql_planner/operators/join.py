@@ -36,7 +36,7 @@ from text_to_sql_planner.types.operators import (
 
 def _get_columns(expr: DRCExpression) -> list[str]:
     """Extract column names from a DRC expression's result variables."""
-    return [rv.name if isinstance(rv, ColumnVariable) else rv.column for rv in expr.result_variables]
+    return [rv.name if isinstance(rv, ColumnVariable) else getattr(rv, "column", f"__expr_{i}__") for i, rv in enumerate(expr.result_variables)]
 
 
 def _rename_variable(condition: DRCCondition, old_name: str, new_name: str) -> DRCCondition:
@@ -112,11 +112,11 @@ def apply_join(params: JoinParams, inputs: list[DRCExpression]) -> OperatorResul
     r2_renames: dict[str, str] = {}  # old_name -> new_name
     seen_names: set[str] = set()
     for rv in r1.result_variables:
-        col_name = rv.name if isinstance(rv, ColumnVariable) else rv.column
+        col_name = rv.name if isinstance(rv, ColumnVariable) else getattr(rv, "column", "__expr__")
         seen_names.add(col_name)
 
     for rv in r2.result_variables:
-        col_name = rv.name if isinstance(rv, ColumnVariable) else rv.column
+        col_name = rv.name if isinstance(rv, ColumnVariable) else getattr(rv, "column", "__expr__")
         if col_name in join_columns:
             continue  # Skip join columns (already in output from r1)
         if col_name in seen_names:

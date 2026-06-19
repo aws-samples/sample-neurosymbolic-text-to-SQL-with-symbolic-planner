@@ -144,6 +144,7 @@ _OPERATOR_TOOL = {
                     "projection",
                     "rename",
                     "aggregate",
+                    "ratio",
                     "cartesian_product",
                     "union",
                     "difference",
@@ -158,7 +159,7 @@ _OPERATOR_TOOL = {
             },
             "params": {
                 "type": "object",
-                "description": "Operator-specific parameters. For selection: {condition: <lisp-string>}. For projection: {columns: [col1, col2]}. For join: {join_columns: [col]}. For rename: {mapping: {old_name: new_name, ...}}. For aggregate: {function: 'COUNT'|'SUM'|'AVG'|'MIN'|'MAX', column: <name-of-input's-single-column>}. For cartesian_product/union/difference/division: {}.",
+                "description": "Operator-specific parameters. For selection: {condition: <lisp-string>}. For projection: {columns: [col1, col2]}. For join: {join_columns: [col]}. For rename: {mapping: {old_name: new_name, ...}}. For aggregate: {function: 'COUNT'|'SUM'|'AVG'|'MIN'|'MAX', column: <name-of-input's-single-column>}. For ratio: {operator: '/'|'-'|'+'|'*', numerator_function: 'COUNT', numerator_column: 'col1', denominator_function: 'COUNT', denominator_column: 'col2', numerator_condition: '<optional lisp condition for COUNT_IF on numerator>', denominator_condition: '<optional lisp condition for COUNT_IF on denominator>', scalar_multiplier: <optional number like 100 for percentage>}. For cartesian_product/union/difference/division: {}.",
             },
         },
         "required": ["reasoning", "operator", "input_indices", "params"],
@@ -305,6 +306,7 @@ Syntax rules:
   - Quantifiers just bind variables. Use (in ...) inside the body to constrain them to a relation.
 - Date functions: CURRENT_DATE (today's date), (DATE_SUB expr days) (subtract days from a date), (DATEDIFF expr1 expr2) (days between two dates)
 - String pattern matching: (LIKE column "pattern") — SQL LIKE semantics. Use ``%`` as a wildcard in the pattern. ``"%data%"`` matches any string containing ``data``; ``"data%"`` matches a prefix; ``"%data"`` matches a suffix.
+- NULL check: (is-not-null column) — SQL ``column IS NOT NULL``. Use this whenever the evidence or question says "is not null" or "is not empty" or "has a value". Do NOT use ``(!= column "")`` or ``(not (= column NULL))`` — those have wrong SQL NULL semantics.
 - Literals: strings in double quotes "hello", numbers as-is 42
 - Variables: plain identifiers like name, age, id
 
@@ -314,6 +316,8 @@ IMPORTANT RULES:
 - When the question asks "how many", "count", "total number of", etc., use (COUNT col) in the result variables.
 - For age/date calculations, use CURRENT_DATE and (DATE_SUB CURRENT_DATE days). For example, "at least 30 years old" means (>= (DATE_SUB CURRENT_DATE 10950) date_of_birth) where 10950 = 30*365.
 - Quantifiers bind variables; membership (in) constrains them to a table. Always pair them.
+- When "Evidence" is provided after the question, it contains AUTHORITATIVE column-to-concept mappings. ALWAYS follow these mappings exactly — they override any other interpretation of the question. For example, if evidence says "X refers to column = 'value'", use ONLY that column/value in your DRC, even if the English phrasing suggests something else.
+- When evidence provides an inequality operator like ``column != 'value'`` or ``column <> 'value'``, use it as a direct comparison ``(!= column "value")`` in the condition — do NOT convert it into a ``(not (exists ...))`` pattern. The evidence's operator choice is intentional.
 
 Examples:
 
@@ -356,6 +360,7 @@ Cardinality patterns ("at least N", "two or more", "more than N", "exactly N"):
 - "exactly N" → assert N distinct witnesses AND ``(not (exists ...))`` for a SINGLE (N+1)-th witness distinct from all the prior ones.
 - Each witness must be wrapped in its own existential quantifier and constrained by an (in ...) membership.
 - Witnesses must be pairwise distinct via (!= ...) on the identifying columns.
+- CRITICAL: The witness pattern is ONLY practical for N ≤ 3. For N > 3 (e.g., "more than 5", "at least 10", "over 15"), DO NOT use the witness pattern — it creates N self-joins with O(N²) inequality checks that produce unusable SQL. Instead, express the cardinality constraint as a GROUP BY + COUNT aggregate: project the grouping key and the counted column, then use the ratio operator or aggregate to compute COUNT, and filter via the condition. For example, "employees with more than 5 reviews" → project (emp_id, review_id) from the join, then use aggregate COUNT with a selection condition.
 
 CRITICAL — the negation in "exactly N" is ONE existential, NOT a chain.
 The shape is always:
@@ -414,6 +419,7 @@ Ranking questions ("which X has the highest/lowest Y", "what is the X with the m
 - This convention matches how the question is phrased in English: "which gas station has the highest revenue" asks for *the gas station*, not *(gas station, revenue)*. Adding the ranking column to the SELECT list answers a different question ("show me each gas station with its revenue, then pick the top one").
 - The ranking criterion can still be an aggregate in the ``order-by`` key — that's fine, aggregate keys don't have to mirror result variables.
 - This rule applies whenever the question uses superlative or ranking phrasing: "highest", "lowest", "most", "least", "top", "bottom", "biggest", "smallest", "first", "last by …".
+- CRITICAL: NEVER use ``forall`` to express "the row with the maximum/minimum value". Instead, ALWAYS use ``(limit 1 (order-by ((col desc)) ...))``. The ``forall`` approach (asserting "for all other rows, this row's value >= theirs") is logically equivalent but MUCH harder for the planner to build. The ``order-by + limit`` approach maps directly to SQL ``ORDER BY col DESC LIMIT 1`` and is trivial to construct.
 
 Question: "Which gas station has the highest amount of revenue?"
 Schema: CREATE TABLE Transactions (TransactionID INT, GasStationID INT, Price REAL)
@@ -445,6 +451,11 @@ Question: "What percentage of patients with high GOT levels are diagnosed with S
 Schema: CREATE TABLE Patient (ID INT, Diagnosis TEXT); CREATE TABLE Laboratory (ID INT, GOT REAL)
 Answer: (drc ((/ (COUNT_IF (LIKE Diagnosis "%SLE%") ID) (COUNT ID))) (exists (GOT) (and (in (ID GOT) Laboratory) (>= GOT 60) (exists (Diagnosis) (in (ID Diagnosis) Patient)))))
 Note: ``COUNT_IF`` counts only rows where the condition (Diagnosis contains "SLE") is true. The denominator ``(COUNT ID)`` counts all rows matching the base filter (GOT >= 60). The ratio gives the percentage.
+
+IMPORTANT — percentage multiplication:
+- When the evidence or question says "percentage" and the evidence formula explicitly includes ``* 100``, you MUST wrap the ratio in ``(* ... 100)`` to produce a 0–100 value. Example: ``(* (/ (COUNT_IF condition col) (COUNT col)) 100)``
+- When the evidence gives a formula like ``DIVIDE(X, Y) * 100``, replicate that EXACTLY as ``(* (/ X Y) 100)`` in the arithmetic aggregate result variable.
+- A bare ``(/ (COUNT_IF ...) (COUNT ...))`` produces a 0-to-1 decimal, NOT a percentage. Only omit ``* 100`` if the evidence omits it.
 
 Return ONLY the DRC expression in Lisp syntax, nothing else."""
 

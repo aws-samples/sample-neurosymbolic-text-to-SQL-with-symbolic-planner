@@ -75,6 +75,7 @@ from .ast import (
     Aggregate,
     AggregateFunction,
     BinaryOp,
+    CaseExpr,
     ColumnRef,
     DerivedTable,
     ExistsExpr,
@@ -183,7 +184,7 @@ class _Parser:
 
     def expect_ident(self) -> Token:
         tok = self.peek()
-        if tok.kind != TokenKind.IDENT:
+        if tok.kind not in (TokenKind.IDENT, TokenKind.KEYWORD):
             raise self._fail_parse(_describe_expected("identifier", tok), tok)
         return self.advance()
 
@@ -248,16 +249,14 @@ class _Parser:
             where = self.parse_expr()
 
         group_by: list[ColumnRef] = []
+        having: Expression | None = None
         if self.at_keyword("GROUP"):
             self.advance()
             self.expect_keyword("BY")
             group_by = self._parse_column_list()
-            # HAVING follows GROUP BY in standard SQL but is out of scope.
             if self.at_keyword("HAVING"):
-                tok = self.peek()
-                raise self._fail_unsupported(
-                    "having_clause", "HAVING clause is not supported", tok
-                )
+                self.advance()
+                having = self.parse_expr()
 
         order_by: list[OrderKey] = []
         if self.at_keyword("ORDER"):
@@ -290,6 +289,7 @@ class _Parser:
             from_source=from_source,
             where=where,
             group_by=group_by,
+            having=having,
             order_by=order_by,
             limit=limit,
             pos=Position(line=select_tok.line, column=select_tok.column),
@@ -589,14 +589,36 @@ class _Parser:
                     pos=Position(op_tok.line, op_tok.column),
                 )
             if kw == "BETWEEN":
-                raise self._fail_unsupported(
-                    "BETWEEN", "BETWEEN operator is not supported", tok
+                # ``lhs BETWEEN lo AND hi`` → ``BinaryOp("AND",
+                #   BinaryOp(">=", lhs, lo), BinaryOp("<=", lhs, hi))``
+                # Syntactic sugar: the translator sees two comparisons.
+                between_tok = self.advance()  # BETWEEN
+                lo = self._parse_concat_expr()
+                self.expect_keyword("AND")
+                hi = self._parse_concat_expr()
+                pos = Position(between_tok.line, between_tok.column)
+                return BinaryOp(
+                    op="AND",
+                    left=BinaryOp(op=">=", left=left, right=lo, pos=pos),
+                    right=BinaryOp(op="<=", left=left, right=hi, pos=pos),
+                    pos=pos,
                 )
             if kw == "IS":
-                raise self._fail_unsupported(
-                    "IS_NULL",
-                    "IS NULL / IS NOT NULL is not supported",
-                    tok,
+                # ``lhs IS NULL`` / ``lhs IS NOT NULL`` — emit as a
+                # unary function-call-style node that the translator
+                # turns into ``FunctionCallNode("IS_NULL", [lhs])`` or
+                # ``FunctionCallNode("IS_NOT_NULL", [lhs])``.
+                is_tok = self.advance()  # IS
+                negated = False
+                if self.at_keyword("NOT"):
+                    self.advance()  # NOT
+                    negated = True
+                self.expect_keyword("NULL")
+                op_name = "IS_NOT_NULL" if negated else "IS_NULL"
+                return UnaryOp(
+                    op=op_name,
+                    operand=left,
+                    pos=Position(is_tok.line, is_tok.column),
                 )
             if kw == "IN":
                 self.advance()
@@ -712,15 +734,50 @@ class _Parser:
     def _parse_primary(self) -> Expression:
         tok = self.peek()
 
-        # CASE expressions are out of scope.
+        # CASE WHEN expressions — parsed as a simple single-branch
+        # form: ``CASE WHEN cond THEN expr [ELSE expr] END``.
         if self.at_keyword("CASE"):
-            raise self._fail_unsupported(
-                "case_expression", "CASE expression is not supported", tok
-            )
+            return self._parse_case_expr()
 
         # EXISTS subqueries.
         if self.at_keyword("EXISTS"):
             return self._parse_exists_expr()
+
+        # CAST(expr AS type) — a type coercion that doesn't change the
+        # logical value (just tells the SQL engine to render the result
+        # with a particular affinity). We parse and discard the ``AS
+        # type`` suffix, returning the inner expression unchanged.
+        # Without this, ``CAST(COUNT(T1.Id) AS REAL)`` in BIRD gold
+        # SQL triggers ``parse_error: expected ), got 'AS'`` and the
+        # gold side fails to convert (dev_556 in run-21).
+        if self.at_keyword("CAST"):
+            self.advance()  # CAST
+            self.expect_op("(")
+            inner = self.parse_expr()
+            # Consume ``AS type_name`` (the type may be multi-word like
+            # ``DOUBLE PRECISION`` or carry precision ``DECIMAL(10,2)``).
+            if self.at_keyword("AS"):
+                self.advance()  # AS
+                # Consume type tokens until we hit the closing ``)``
+                # for the CAST. Track paren depth so precision like
+                # ``DECIMAL(10,2)`` doesn't prematurely stop.
+                depth = 0
+                while True:
+                    t = self.peek()
+                    if t.kind == TokenKind.EOF:
+                        break
+                    if t.kind == TokenKind.OP and t.text == "(":
+                        depth += 1
+                        self.advance()
+                    elif t.kind == TokenKind.OP and t.text == ")":
+                        if depth == 0:
+                            break
+                        depth -= 1
+                        self.advance()
+                    else:
+                        self.advance()
+            self.expect_op(")")
+            return inner
 
         # Bare NULL literal: out of scope. The translator does not have a
         # null type and ``IS NULL`` is already gated in comparison.
@@ -728,19 +785,6 @@ class _Parser:
             raise self._fail_unsupported(
                 "null_literal", "NULL literal is not supported", tok
             )
-
-        # CAST(expr AS type) — treat as identity (strip the type annotation).
-        if self.at_keyword("CAST"):
-            self.advance()
-            self.expect_op("(")
-            inner = self.parse_expr()
-            self.expect_keyword("AS")
-            # Skip the type name (one or more identifier/keyword tokens,
-            # possibly with parenthesised precision like REAL(10,2)).
-            while not self.at_op(")"):
-                self.advance()
-            self.expect_op(")")
-            return inner
 
         # Parenthesised expression. Subqueries that appear bare in
         # primary position (e.g. scalar subqueries) are out of scope and
@@ -793,8 +837,37 @@ class _Parser:
                 return self._parse_function_call()
             return self._parse_column_ref()
 
+        # A KEYWORD token not followed by '(' is likely a column name
+        # that collides with a SQL keyword (e.g., Count, Name, Date,
+        # Type, Status). Treat it as a column reference.
+        if tok.kind == TokenKind.KEYWORD and not self.at_op("(", offset=1):
+            return self._parse_column_ref()
+
         # Anything else is a parse error.
         raise self._fail_parse(_describe_unexpected(tok), tok)
+
+    def _parse_case_expr(self) -> CaseExpr:
+        """Parse ``CASE WHEN cond THEN expr [ELSE expr] END``.
+
+        Only supports a single WHEN branch (the common BIRD pattern
+        for conditional aggregation inside COUNT/SUM).
+        """
+        case_tok = self.advance()  # CASE
+        self.expect_keyword("WHEN")
+        when_cond = self.parse_expr()
+        self.expect_keyword("THEN")
+        then_expr = self.parse_expr()
+        else_expr: Expression | None = None
+        if self.at_keyword("ELSE"):
+            self.advance()
+            else_expr = self.parse_expr()
+        self.expect_keyword("END")
+        return CaseExpr(
+            when_condition=when_cond,
+            then_expr=then_expr,
+            else_expr=else_expr,
+            pos=Position(case_tok.line, case_tok.column),
+        )
 
     def _parse_aggregate(self) -> Aggregate:
         name_tok = self.advance()
@@ -804,7 +877,7 @@ class _Parser:
         if self.at_keyword("DISTINCT"):
             self.advance()
             distinct = True
-        column: ColumnRef | Literal
+        column: ColumnRef | Literal | CaseExpr
         if self.at_op("*"):
             star = self.advance()
             column = Literal(
@@ -812,6 +885,8 @@ class _Parser:
                 data_type="string",
                 pos=Position(star.line, star.column),
             )
+        elif self.at_keyword("CASE"):
+            column = self._parse_case_expr()
         else:
             column = self._parse_column_ref()
         self.expect_op(")")

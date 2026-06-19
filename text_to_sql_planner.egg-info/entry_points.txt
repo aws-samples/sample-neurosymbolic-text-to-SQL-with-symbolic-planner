@@ -1,0 +1,2 @@
+[console_scripts]
+text-to-sql = text_to_sql_planner.cli:main

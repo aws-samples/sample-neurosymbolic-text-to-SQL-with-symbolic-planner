@@ -13,13 +13,12 @@ from text_to_sql_planner.types.drc import (
     AggregateFunction,
     AggregateVariable,
     ArithmeticNode,
-    ArithmeticResultVariable,
     ColumnVariable,
     ComparisonNode,
-    CountIfVariable,
     DRCCondition,
     DRCExpression,
     FunctionCallNode,
+    IsNotNullNode,
     LimitExpression,
     LiteralNode,
     LogicalConnectiveNode,
@@ -286,20 +285,35 @@ class _Parser:
         column = ""
         aggregate: Union[AggregateFunction, None] = None  # type: ignore[assignment]
         if self._current().type is TokenType.LPAREN:
-            # (AGG col)
+            # Could be (AGG col) or a complex arithmetic expression.
+            # Peek the first symbol after '(' to determine.
             self._expect(TokenType.LPAREN, "before aggregate in sort key")
             self._enter()
             agg_tok = self._expect(TokenType.SYMBOL, "expected aggregate function name")
-            if agg_tok.value not in _AGGREGATE_FUNCS:
+            if agg_tok.value in _AGGREGATE_FUNCS:
+                col_tok = self._expect(TokenType.SYMBOL, "expected column name in aggregate sort key")
+                self._expect(TokenType.RPAREN, "after aggregate in sort key")
+                self._leave()
+                aggregate = agg_tok.value  # type: ignore[assignment]
+                column = col_tok.value
+            elif agg_tok.value in _ARITHMETIC_OPS:
+                # Arithmetic expression as sort key — skip it by consuming
+                # until the matching closing paren. Use the expression as
+                # a synthetic column name "expr".
+                depth = 1
+                while depth > 0 and not self._at_end():
+                    t = self._advance()
+                    if t.type is TokenType.LPAREN:
+                        depth += 1
+                    elif t.type is TokenType.RPAREN:
+                        depth -= 1
+                self._leave()
+                column = "expr"
+            else:
                 raise ParseError(
                     offset=agg_tok.offset,
                     message=f"Unknown aggregate function in order-by: '{agg_tok.value}'",
                 )
-            col_tok = self._expect(TokenType.SYMBOL, "expected column name in aggregate sort key")
-            self._expect(TokenType.RPAREN, "after aggregate in sort key")
-            self._leave()
-            aggregate = agg_tok.value  # type: ignore[assignment]
-            column = col_tok.value
         elif self._current().type is TokenType.SYMBOL:
             tok = self._advance()
             column = tok.value
@@ -330,7 +344,10 @@ class _Parser:
         variables: list[ResultVariable] = []
         while self._current().type is not TokenType.RPAREN:
             if self._current().type is TokenType.LPAREN:
-                variables.append(self._parse_complex_result_variable())
+                # Could be:
+                # - Aggregate: (COUNT col)
+                # - Arithmetic aggregate: (/ (COUNT x) (COUNT y))
+                variables.append(self._parse_aggregate_or_arithmetic_variable())
             elif self._current().type is TokenType.SYMBOL:
                 token = self._advance()
                 variables.append(ColumnVariable(name=token.value))
@@ -342,39 +359,159 @@ class _Parser:
                 )
         return variables
 
-    def _parse_complex_result_variable(self) -> ResultVariable:
-        """Parse a parenthesized result variable: aggregate, COUNT_IF, or arithmetic."""
-        self._expect(TokenType.LPAREN, "before complex result variable")
+    def _parse_aggregate_or_arithmetic_variable(self) -> ResultVariable:
+        """Parse either ``(AGG col)`` or ``(op (AGG col) (AGG col))``
+        or ``(COUNT_IF condition col)``."""
+        from text_to_sql_planner.types.drc import ArithmeticAggregateVariable, ConditionalAggregateVariable
+
+        self._expect(TokenType.LPAREN, "before aggregate/arithmetic")
         self._enter()
 
-        func_token = self._expect(TokenType.SYMBOL, "expected function/operator name")
-        op = func_token.value
+        head = self._current()
+        if head.type is not TokenType.SYMBOL:
+            raise ParseError(
+                offset=head.offset,
+                message=f"Expected function name or operator, got {head.type.name}",
+            )
 
-        if op in _AGGREGATE_FUNCS:
-            col_token = self._expect(TokenType.SYMBOL, "expected column name in aggregate")
-            self._expect(TokenType.RPAREN, "after aggregate variable")
+        # Arithmetic operator in result-variable position:
+        # (/ (COUNT x) (COUNT y))
+        if head.value in ("+", "-", "*", "/"):
+            op_token = self._advance()
+            left = self._parse_inner_aggregate()
+            right = self._parse_inner_aggregate()
+            self._expect(TokenType.RPAREN, "after arithmetic aggregate")
             self._leave()
-            return AggregateVariable(function=op, column=col_token.value)  # type: ignore[arg-type]
+            return ArithmeticAggregateVariable(
+                operator=op_token.value,  # type: ignore[arg-type]
+                left=left,
+                right=right,
+            )
 
-        if op == "COUNT_IF":
-            # (COUNT_IF condition col)
-            condition = self._parse_condition()
-            col_token = self._expect(TokenType.SYMBOL, "expected column name in COUNT_IF")
-            self._expect(TokenType.RPAREN, "after COUNT_IF variable")
+        # Conditional aggregate: (COUNT_IF condition col) or (SUM_IF ...)
+        if head.value.endswith("_IF") and head.value[:-3] in _AGGREGATE_FUNCS:
+            return self._parse_conditional_aggregate_inner(head)
+
+        # Plain aggregate: (COUNT col)
+        if head.value not in _AGGREGATE_FUNCS:
+            raise ParseError(
+                offset=head.offset,
+                message=f"Unknown aggregate function: '{head.value}'",
+            )
+        func_token = self._advance()
+        col_token = self._expect(TokenType.SYMBOL, "expected column name in aggregate")
+        self._expect(TokenType.RPAREN, "after aggregate variable")
+        self._leave()
+        return AggregateVariable(
+            function=func_token.value,  # type: ignore[arg-type]
+            column=col_token.value,
+        )
+
+    def _parse_inner_aggregate(self) -> ResultVariable:
+        """Parse a parenthesised ``(AGG col)`` or ``(AGG_IF cond col)``
+        or nested arithmetic ``(/ (AGG col) (AGG col))``
+        inside an arithmetic aggregate.
+
+        Also accepts a bare NUMBER token (not parenthesised) for scalar
+        literal operands like ``100`` in ``(* (/ ...) 100)``, and a bare
+        SYMBOL token for column variable references like ``cons2013`` in
+        ``(- cons2013 cons2012)``.
+        """
+        # Allow bare number literal without parentheses
+        if self._current().type is TokenType.NUMBER:
+            tok = self._advance()
+            from text_to_sql_planner.types.drc import ScalarLiteralVariable
+            if "." in tok.value:
+                return ScalarLiteralVariable(value=float(tok.value))
+            return ScalarLiteralVariable(value=int(tok.value))
+
+        # Allow bare symbol (column variable reference) without parentheses
+        if self._current().type is TokenType.SYMBOL and self._current().value not in _AGGREGATE_FUNCS and not self._current().value.endswith("_IF") and self._current().value not in ("+", "-", "*", "/"):
+            tok = self._advance()
+            return ColumnVariable(name=tok.value)
+
+        self._expect(TokenType.LPAREN, "before inner aggregate")
+        self._enter()
+        head = self._current()
+        if head.type is not TokenType.SYMBOL:
+            raise ParseError(
+                offset=head.offset,
+                message=f"Expected aggregate function name, got {head.type.name}",
+            )
+        # Conditional aggregate: (COUNT_IF condition col) / (SUM_IF ...)
+        # Routed before the _AGGREGATE_FUNCS membership check so the
+        # _IF suffix is recognised inside arithmetic aggregates.
+        if head.value.endswith("_IF") and head.value[:-3] in _AGGREGATE_FUNCS:
+            return self._parse_conditional_aggregate_inner(head)
+        # Nested arithmetic: (/ (COUNT x) (COUNT y)) inside outer arithmetic
+        if head.value in ("+", "-", "*", "/"):
+            from text_to_sql_planner.types.drc import ArithmeticAggregateVariable
+            op_token = self._advance()
+            left = self._parse_inner_aggregate()
+            right = self._parse_inner_aggregate()
+            self._expect(TokenType.RPAREN, "after nested arithmetic aggregate")
             self._leave()
-            return CountIfVariable(condition=condition, column=col_token.value)
-
-        if op in _ARITHMETIC_OPS:
-            # (/ left right) where left and right are themselves complex result variables
-            left = self._parse_complex_result_variable()
-            right = self._parse_complex_result_variable()
-            self._expect(TokenType.RPAREN, "after arithmetic result variable")
+            return ArithmeticAggregateVariable(
+                operator=op_token.value,
+                left=left,
+                right=right,
+            )
+        func_token = self._advance()
+        if func_token.value not in _AGGREGATE_FUNCS:
+            # Not an aggregate — treat as a function call (e.g. YEAR, DATEDIFF).
+            # Consume all arguments until closing paren, represent as ColumnVariable.
+            depth = 1
+            while depth > 0 and not self._at_end():
+                t = self._advance()
+                if t.type is TokenType.LPAREN:
+                    depth += 1
+                elif t.type is TokenType.RPAREN:
+                    depth -= 1
             self._leave()
-            return ArithmeticResultVariable(operator=op, left=left, right=right)
+            return ColumnVariable(name=func_token.value)
+        col_token = self._expect(TokenType.SYMBOL, "expected column name")
+        self._expect(TokenType.RPAREN, "after inner aggregate")
+        self._leave()
+        return AggregateVariable(
+            function=func_token.value,  # type: ignore[arg-type]
+            column=col_token.value,
+        )
 
-        raise ParseError(
-            offset=func_token.offset,
-            message=f"Unknown aggregate function: '{op}'",
+    def _parse_conditional_aggregate_inner(
+        self, head: Token
+    ) -> "ConditionalAggregateVariable":
+        """Parse the body of a ``(COUNT_IF cond col)`` / ``(SUM_IF cond col)`` form.
+
+        Caller invariants:
+
+        * The current parser position is the head ``SYMBOL`` token.
+        * The enclosing ``(`` has already been consumed and ``_enter()``
+          called.
+        * ``head.value[:-3]`` is in ``_AGGREGATE_FUNCS``.
+
+        The helper consumes the head, the condition, the column ``SYMBOL``,
+        and the closing ``)``, then calls ``_leave()`` and returns the
+        :class:`ConditionalAggregateVariable` node. ``ParseError`` is
+        raised through the existing ``_expect`` machinery on malformed
+        input so error messages and offsets stay identical to the
+        pre-extraction behaviour.
+        """
+        from text_to_sql_planner.types.drc import ConditionalAggregateVariable
+
+        func_name = head.value[:-3]  # Strip _IF suffix
+        self._advance()
+        # Parse the condition (a full DRC condition expression).
+        condition = self._parse_condition()
+        # Parse the column name.
+        col_token = self._expect(
+            TokenType.SYMBOL, "expected column name in conditional aggregate"
+        )
+        self._expect(TokenType.RPAREN, "after conditional aggregate")
+        self._leave()
+        return ConditionalAggregateVariable(
+            function=func_name,  # type: ignore[arg-type]
+            column=col_token.value,
+            condition=condition,
         )
 
     def _parse_aggregate_variable(self) -> AggregateVariable:
@@ -459,6 +596,11 @@ class _Parser:
             result = self._parse_arithmetic(op)
         elif op == "in":
             result = self._parse_membership()
+        elif op == "is-not-null":
+            col_token = self._expect(
+                TokenType.SYMBOL, "expected column name in is-not-null"
+            )
+            result = IsNotNullNode(column=col_token.value)
         elif op in _BUILTIN_FUNCTIONS or op == "CURRENT_DATE":
             result = self._parse_function_call(op)
         elif op.upper() == "LIKE":
@@ -654,3 +796,17 @@ def parse_query(source: str) -> QueryParserResult:
         return QueryParserSuccess(query=query)
     except ParseError as e:
         return QueryParserFailure(error=e)
+
+
+def parse_condition(source: str):
+    """Parse a DRC condition S-expression string into a condition AST node.
+
+    Returns the condition node on success, None on any parse error.
+    """
+    try:
+        tokens = Lexer.tokenize(source)
+        parser = _Parser(tokens)
+        condition = parser._parse_condition()
+        return condition
+    except (ParseError, IndexError):
+        return None

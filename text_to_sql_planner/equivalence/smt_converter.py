@@ -7,6 +7,7 @@ from text_to_sql_planner.types.drc import (
     ComparisonNode,
     DRCCondition,
     FunctionCallNode,
+    IsNotNullNode,
     LiteralNode,
     LogicalConnectiveNode,
     MembershipNode,
@@ -29,33 +30,13 @@ def convert_to_smt(condition: DRCCondition) -> str:
     _collect_symbols(condition, relations, variables)
     _infer_types(condition, var_types)
 
-    # Collect function names that will become declare-fun
-    fn_sigs = collect_function_signatures(condition, var_types)
-    fn_names: set[str] = set(relations.keys()) | set(fn_sigs.keys())
-
-    # Detect variables that collide with relation/function names and
-    # build a rename map to avoid cvc5 parse errors.
-    var_rename_map: dict[str, str] = {}
-    all_names: set[str] = set(variables) | fn_names
-    for var in variables:
-        if var in fn_names:
-            candidate = f"_var_{var}"
-            while candidate in all_names:
-                candidate = f"_var_{candidate}"
-            var_rename_map[var] = candidate
-            all_names.add(candidate)
-
-    # Build scope for _convert_node so renamed vars are emitted correctly
-    scope: dict[str, str] = {orig: safe for orig, safe in var_rename_map.items()}
-
     lines: list[str] = []
     lines.append("(set-logic ALL)")
 
-    # Declare all variables with inferred types (using safe names)
+    # Declare all variables with inferred types
     for var in sorted(variables):
-        smt_name = var_rename_map.get(var, var)
         sort = var_types.get(var, "Int")
-        lines.append(f"(declare-const {smt_name} {sort})")
+        lines.append(f"(declare-const {var} {sort})")
 
     # Declare relations as uninterpreted functions returning Bool
     # Use mixed sorts based on the variables used in membership
@@ -72,6 +53,7 @@ def convert_to_smt(condition: DRCCondition) -> str:
     # ``STRFTIME``) used by the formula. Without these
     # declarations cvc5 hits an unknown function symbol and exits
     # before attempting the proof.
+    fn_sigs = collect_function_signatures(condition, var_types)
     for fn_name in sorted(fn_sigs):
         arg_sorts, ret_sort = fn_sigs[fn_name]
         ret_sort_smt = _smt_sort(ret_sort)
@@ -79,7 +61,7 @@ def convert_to_smt(condition: DRCCondition) -> str:
         lines.append(f"(declare-fun {fn_name} ({sorts_str}) {ret_sort_smt})")
 
     # Assert the formula
-    formula = _convert_node(condition, var_types, scope if scope else None)
+    formula = _convert_node(condition, var_types)
     lines.append(f"(assert {formula})")
     lines.append("(check-sat)")
 
@@ -188,6 +170,13 @@ def _infer_types(node: DRCCondition, var_types: dict[str, str]) -> None:
         for arg in node.arguments:
             _infer_types(arg, var_types)
 
+    elif isinstance(node, IsNotNullNode):
+        # ``IsNotNullNode`` does not pin a sort by itself. The column's
+        # sort comes from elsewhere in the formula (a comparison with a
+        # literal, a membership-slot site, etc.); when no other constraint
+        # pins it, the Int default applies at conversion time.
+        pass
+
 
 def _collect_relation_sorts(
     node: DRCCondition,
@@ -262,6 +251,11 @@ def _collect_relation_sorts(
         _collect_relation_sorts(node.left, var_types, rel_sorts)
         _collect_relation_sorts(node.right, var_types, rel_sorts)
 
+    elif isinstance(node, IsNotNullNode):
+        # ``IsNotNullNode`` does not pin a relation slot's sort by
+        # itself — the column's sort comes from elsewhere.
+        pass
+
 
 def _collect_symbols(
     node: DRCCondition,
@@ -298,6 +292,13 @@ def _collect_symbols(
             relations[node.relation] = max(
                 relations.get(node.relation, 0), len(node.variables)
             )
+
+    elif isinstance(node, IsNotNullNode):
+        # ``IsNotNullNode.column`` is a column-binding name, treated the
+        # same way as a ``MembershipNode`` slot variable: record it so it
+        # gets a ``(declare-const)`` when free.
+        if node.column:
+            variables.add(node.column)
 
     elif isinstance(node, ArithmeticNode):
         if node.left is not None:
@@ -346,6 +347,16 @@ def _convert_node(node: DRCCondition, var_types: dict[str, str] | None = None, s
     elif isinstance(node, VariableRefNode):
         # Use the renamed name if in scope
         return scope.get(node.name, node.name)
+    elif isinstance(node, IsNotNullNode):
+        # Mirror the SMT form ``rewrite_null_checks`` produces today
+        # (a comparison against the empty-string / zero sentinel) so
+        # gold-side ``IS_NOT_NULL(col)`` and planner-side
+        # ``IsNotNullNode(col)`` collapse to the same SMT.
+        col_name = scope.get(node.column, node.column)
+        sort = var_types.get(node.column, "Int")
+        if sort == "String":
+            return f'(not (= {col_name} ""))'
+        return f"(not (= {col_name} 0))"
     else:
         raise ValueError(f"Unknown DRC node type: {type(node)}")
 

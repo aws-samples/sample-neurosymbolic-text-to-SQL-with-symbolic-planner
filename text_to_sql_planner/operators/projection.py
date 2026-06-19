@@ -26,7 +26,7 @@ _AGGREGATE_FUNCS = {"COUNT", "SUM", "AVG", "MIN", "MAX"}
 
 def _get_columns(expr: DRCExpression) -> list[str]:
     """Extract column names from a DRC expression's result variables."""
-    return [rv.name if isinstance(rv, ColumnVariable) else rv.column for rv in expr.result_variables]
+    return [rv.name if isinstance(rv, ColumnVariable) else getattr(rv, "column", f"__expr_{i}__") for i, rv in enumerate(expr.result_variables)]
 
 
 def _parse_column_spec(col: str) -> ResultVariable:

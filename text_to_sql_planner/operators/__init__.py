@@ -30,6 +30,7 @@ from text_to_sql_planner.operators.difference import apply_difference
 from text_to_sql_planner.operators.division import apply_division
 from text_to_sql_planner.operators.rename import apply_rename
 from text_to_sql_planner.operators.aggregate import apply_aggregate
+from text_to_sql_planner.operators.ratio import apply_ratio
 
 
 __all__ = [
@@ -47,7 +48,7 @@ __all__ = [
 
 
 # Operators that require exactly 1 input relation
-_UNARY_OPERATORS = {"selection", "projection", "rename", "aggregate"}
+_UNARY_OPERATORS = {"selection", "projection", "rename", "aggregate", "ratio"}
 
 # Operators that require exactly 2 input relations
 _BINARY_OPERATORS = {"join", "cartesian_product", "union", "difference", "division"}
@@ -111,6 +112,9 @@ def apply_operator(application: OperatorApplication) -> OperatorResult:
 
     elif operator == "aggregate":
         return apply_aggregate(params, inputs)
+
+    elif operator == "ratio":
+        return apply_ratio(params, inputs)
 
     # Should never reach here due to validation above
     return OperatorFailure(error=f"Unhandled operator: '{operator}'")

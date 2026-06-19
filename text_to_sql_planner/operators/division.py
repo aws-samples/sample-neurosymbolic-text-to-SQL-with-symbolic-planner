@@ -25,7 +25,7 @@ from text_to_sql_planner.types.operators import (
 
 def _get_columns(expr: DRCExpression) -> list[str]:
     """Extract column names from a DRC expression's result variables."""
-    return [rv.name if isinstance(rv, ColumnVariable) else rv.column for rv in expr.result_variables]
+    return [rv.name if isinstance(rv, ColumnVariable) else getattr(rv, "column", "__expr__") for rv in expr.result_variables]
 
 
 def apply_division(params: DivisionParams, inputs: list[DRCExpression]) -> OperatorResult:
@@ -57,7 +57,7 @@ def apply_division(params: DivisionParams, inputs: list[DRCExpression]) -> Opera
     output_col_names = [col for col in r1_columns if col not in r2_columns]
     output_variables: list[ResultVariable] = []
     for rv in r1.result_variables:
-        col_name = rv.name if isinstance(rv, ColumnVariable) else rv.column
+        col_name = rv.name if isinstance(rv, ColumnVariable) else getattr(rv, "column", "__expr__")
         if col_name in output_col_names:
             output_variables.append(rv)
 

@@ -35,7 +35,7 @@ from text_to_sql_planner.types.operators import (
 def _get_columns(expr: DRCExpression) -> list[str]:
     """Extract column names from a DRC expression's result variables."""
     return [
-        rv.name if isinstance(rv, ColumnVariable) else rv.column
+        rv.name if isinstance(rv, ColumnVariable) else getattr(rv, "column", "__expr__")
         for rv in expr.result_variables
     ]
 

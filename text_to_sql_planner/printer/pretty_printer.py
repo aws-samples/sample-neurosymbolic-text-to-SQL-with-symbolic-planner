@@ -10,12 +10,15 @@ from __future__ import annotations
 
 from text_to_sql_planner.types.drc import (
     AggregateVariable,
+    ArithmeticAggregateVariable,
     ArithmeticNode,
     ColumnVariable,
     ComparisonNode,
+    ConditionalAggregateVariable,
     DRCCondition,
     DRCExpression,
     FunctionCallNode,
+    IsNotNullNode,
     LimitExpression,
     LiteralNode,
     LogicalConnectiveNode,
@@ -25,6 +28,7 @@ from text_to_sql_planner.types.drc import (
     QuantifierNode,
     QueryExpression,
     ResultVariable,
+    ScalarLiteralVariable,
     SortCriterion,
     VariableRefNode,
 )
@@ -145,6 +149,22 @@ def _pretty_sort_criterion(c: SortCriterion) -> str:
     return f"{head} {c.direction.upper()}"
 
 
+def _print_agg_operand_pretty(operand) -> str:
+    """Print an aggregate operand in pretty form."""
+    if isinstance(operand, ScalarLiteralVariable):
+        return str(operand.value)
+    if isinstance(operand, ColumnVariable):
+        return operand.name
+    if isinstance(operand, ConditionalAggregateVariable):
+        cond_str = _print_condition(operand.condition)
+        return f"{operand.function}_IF({cond_str}, {operand.column})"
+    if isinstance(operand, ArithmeticAggregateVariable):
+        left_str = _print_agg_operand_pretty(operand.left)
+        right_str = _print_agg_operand_pretty(operand.right)
+        return f"{left_str} {operand.operator} {right_str}"
+    return f"{operand.function}({operand.column})"
+
+
 def _print_result_variables(variables: list[ResultVariable]) -> str:
     """Print the result variables as comma-separated list.
 
@@ -174,6 +194,15 @@ def _print_result_variables(variables: list[ResultVariable]) -> str:
                     PrintError(message="AggregateVariable has empty column", node=var)
                 )
             agg_parts.append(f"{var.function}({var.column})")
+        elif isinstance(var, ArithmeticAggregateVariable):
+            left_str = _print_agg_operand_pretty(var.left)
+            right_str = _print_agg_operand_pretty(var.right)
+            agg_parts.append(f"{left_str} {var.operator} {right_str}")
+        elif isinstance(var, ConditionalAggregateVariable):
+            cond_str = _print_condition(var.condition)
+            agg_parts.append(f"{var.function}_IF({cond_str}, {var.column})")
+        elif isinstance(var, ScalarLiteralVariable):
+            agg_parts.append(str(var.value))
         else:
             raise _PrintInternalError(
                 PrintError(message=f"Unknown result variable type: {type(var).__name__}", node=var)
@@ -211,6 +240,13 @@ def _print_condition(node: DRCCondition, parent_precedence: int = 0) -> str:
             )
         vars_str = ",".join(node.variables)
         return f"{vars_str} {_IN} {node.relation}"
+
+    if isinstance(node, IsNotNullNode):
+        if not node.column:
+            raise _PrintInternalError(
+                PrintError(message="IsNotNullNode has empty column", node=node)
+            )
+        return f"{node.column} IS NOT NULL"
 
     if isinstance(node, QuantifierNode):
         if node.kind not in ("forall", "exists"):

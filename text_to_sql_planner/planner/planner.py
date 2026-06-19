@@ -40,6 +40,7 @@ from text_to_sql_planner.types.operators import (
     OperatorSuccess,
     OperatorFailure,
     ProjectionParams,
+    RatioParams,
     RenameParams,
     SelectionParams,
     UnionParams,
@@ -82,10 +83,20 @@ PlannerResult = Union[PlannerSuccess, PlannerError]
 
 def _get_columns_from_expression(expr: DRCExpression) -> list[str]:
     """Extract column names from a DRC expression's result variables."""
+    from text_to_sql_planner.types.drc import (
+        ArithmeticResultVariable,
+        CountIfVariable,
+    )
     columns = []
     for rv in expr.result_variables:
         if hasattr(rv, "name"):
             columns.append(rv.name)
+        elif isinstance(rv, ArithmeticResultVariable):
+            # Use the numerator's column as the representative name
+            if hasattr(rv.left, "column"):
+                columns.append(rv.left.column)
+            elif hasattr(rv.left, "name"):
+                columns.append(rv.left.name)
         elif hasattr(rv, "column"):
             columns.append(rv.column)
     return columns
@@ -133,6 +144,17 @@ def _build_operator_params(operator: str, params: dict) -> object:
         if not isinstance(function, str) or not isinstance(column, str):
             return None
         return AggregateParams(function=function, column=column)
+    elif operator == "ratio":
+        return RatioParams(
+            operator=params.get("operator", "/"),
+            numerator_function=params.get("numerator_function", "COUNT"),
+            numerator_column=params.get("numerator_column", ""),
+            denominator_function=params.get("denominator_function", "COUNT"),
+            denominator_column=params.get("denominator_column", ""),
+            numerator_condition=params.get("numerator_condition"),
+            denominator_condition=params.get("denominator_condition"),
+            scalar_multiplier=params.get("scalar_multiplier"),
+        )
     return None
 
 

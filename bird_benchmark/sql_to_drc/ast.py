@@ -82,7 +82,7 @@ class FunctionCall:
 @dataclass
 class Aggregate:
     function: AggregateFunction
-    column: ColumnRef | Literal
+    column: "ColumnRef | Literal | CaseExpr"
     distinct: bool
     pos: Position
 
@@ -179,12 +179,26 @@ class SelectStatement:
     from_source: TableSource
     where: Expression | None
     group_by: list[ColumnRef]
+    having: "Expression | None"
     order_by: list[OrderKey]
     limit: int | None
     pos: Position
 
 
 # --- Expression union ------------------------------------------------------
+
+@dataclass
+class CaseExpr:
+    """Simple CASE WHEN expression: CASE WHEN cond THEN expr [ELSE expr] END.
+
+    Only supports a single WHEN branch (the common BIRD pattern for
+    conditional aggregation). Multi-branch CASE is not supported.
+    """
+    when_condition: "Expression"
+    then_expr: "Expression"
+    else_expr: "Expression | None"
+    pos: Position
+
 
 Expression = Union[
     ColumnRef,
@@ -196,6 +210,7 @@ Expression = Union[
     InList,
     InSubquery,
     ExistsExpr,
+    CaseExpr,
 ]
 
 
@@ -211,6 +226,7 @@ __all__ = [
     "InList",
     "InSubquery",
     "ExistsExpr",
+    "CaseExpr",
     "OrderKey",
     "TableRef",
     "DerivedTable",
