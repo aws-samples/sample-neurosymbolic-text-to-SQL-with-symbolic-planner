@@ -415,6 +415,13 @@ def _build_equivalence_script(
     _collect_relation_sorts(expr2.condition, all_var_types, rel_sorts)
     _propagate_types_from_relations(expr1.condition, rel_sorts, all_var_types)
     _propagate_types_from_relations(expr2.condition, rel_sorts, all_var_types)
+
+    # Force Int for variables in ordering comparisons — SMT-LIB String
+    # doesn't support <, >, <=, >= so these MUST be Int regardless of
+    # what relation-slot propagation inferred.
+    _force_ordering_int(expr1.condition, all_var_types)
+    _force_ordering_int(expr2.condition, all_var_types)
+
     rel_sorts = {}
     _collect_relation_sorts(expr1.condition, all_var_types, rel_sorts)
     _collect_relation_sorts(expr2.condition, all_var_types, rel_sorts)
@@ -946,6 +953,35 @@ async def _run_cvc5_with_strategy(
         raise
     except Exception as e:
         return IndeterminateResult(reason=str(e))
+
+
+def _force_ordering_int(condition, var_types: dict[str, str]) -> None:
+    """Force Int type for variables in ordering comparisons (<, >, <=, >=).
+
+    SMT-LIB String doesn't support ordering operators, so any variable
+    compared with </>/<=/>=  must be Int regardless of other inferences.
+    """
+    from text_to_sql_planner.types.drc import (
+        ComparisonNode, LogicalConnectiveNode, NotNode,
+        QuantifierNode, VariableRefNode, LiteralNode,
+    )
+    if condition is None:
+        return
+    if isinstance(condition, ComparisonNode):
+        if condition.operator in ("<", ">", "<=", ">="):
+            if isinstance(condition.left, VariableRefNode):
+                var_types[condition.left.name] = "Int"
+            if isinstance(condition.right, VariableRefNode):
+                var_types[condition.right.name] = "Int"
+        _force_ordering_int(condition.left, var_types)
+        _force_ordering_int(condition.right, var_types)
+    elif isinstance(condition, LogicalConnectiveNode):
+        _force_ordering_int(condition.left, var_types)
+        _force_ordering_int(condition.right, var_types)
+    elif isinstance(condition, NotNode):
+        _force_ordering_int(condition.operand, var_types)
+    elif isinstance(condition, QuantifierNode):
+        _force_ordering_int(condition.body, var_types)
 
 
 def _propagate_types_from_relations(condition, rel_sorts: dict[str, list[str]], var_types: dict[str, str]) -> None:

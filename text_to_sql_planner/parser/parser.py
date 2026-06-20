@@ -609,6 +609,10 @@ class _Parser:
             # normalise to uppercase so the SMT converter sees one
             # consistent function head.
             result = self._parse_function_call("LIKE")
+        elif op in _AGGREGATE_FUNCS:
+            # Allow COUNT/SUM/AVG/MIN/MAX as function calls in conditions
+            # for patterns like (> (COUNT col) 15) used in HAVING semantics.
+            result = self._parse_function_call(op)
         else:
             raise ParseError(
                 offset=op_token.offset,
