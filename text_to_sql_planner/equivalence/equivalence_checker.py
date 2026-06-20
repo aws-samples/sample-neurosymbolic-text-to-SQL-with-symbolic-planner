@@ -967,8 +967,13 @@ def _propagate_types_from_relations(condition, rel_sorts: dict[str, list[str]], 
         if condition.relation in rel_sorts:
             sorts = rel_sorts[condition.relation]
             for i, var in enumerate(condition.variables):
-                if i < len(sorts) and sorts[i] == "String":
-                    var_types[var] = "String"
+                if i < len(sorts):
+                    slot_sort = sorts[i]
+                    current = var_types.get(var)
+                    if slot_sort == "String":
+                        var_types[var] = "String"
+                    elif slot_sort == "Int" and current != "String":
+                        var_types[var] = "Int"
 
     elif isinstance(condition, LogicalConnectiveNode):
         _propagate_types_from_relations(condition.left, rel_sorts, var_types)

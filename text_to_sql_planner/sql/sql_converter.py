@@ -882,7 +882,9 @@ class _SqlGenerator:
                 col = crit.column
                 if not col:
                     return SQLFailure(error="ORDER BY criterion has empty column")
-                if col in rv_name_to_idx:
+                if col == "expr":
+                    qualified = "1"
+                elif col in rv_name_to_idx:
                     qualified = _lookup_at(rv_name_to_idx[col], col)
                 else:
                     try:
@@ -1174,7 +1176,9 @@ class _SqlGenerator:
                 col = crit.column
                 if not col:
                     return SQLFailure(error="ORDER BY criterion has empty column")
-                if col in rv_name_to_idx:
+                if col == "expr":
+                    qualified = "1"
+                elif col in rv_name_to_idx:
                     qualified = _lookup_at(rv_name_to_idx[col], col)
                 else:
                     # Not a result variable — fall back to direct
