@@ -70,6 +70,12 @@ SQLResult = Union[SQLSuccess, SQLFailure]
 _AGGREGATE_FUNCS = {"COUNT", "SUM", "AVG", "MIN", "MAX"}
 
 
+
+def _has_aggregate_call(sql_fragment: str) -> bool:
+    """Check if a SQL condition fragment contains an aggregate function call."""
+    import re
+    return bool(re.search(r"\b(COUNT|SUM|AVG|MIN|MAX)\s*\(", sql_fragment))
+
 def _is_date_string(s: str) -> bool:
     """Check if a string looks like a date (YYYY-MM-DD or YYYY/MM/DD)."""
     return bool(re.match(r"^\d{4}[-/]\d{2}[-/]\d{2}$", s))
@@ -514,7 +520,12 @@ class _SqlGenerator:
         for jc in ctx.join_clauses:
             parts.append(f"  {jc}")
         if ctx.where_conditions:
-            parts.append(f"  WHERE {' AND '.join(ctx.where_conditions)}")
+            where_parts = [c for c in ctx.where_conditions if not _has_aggregate_call(c)]
+            having_parts = [c for c in ctx.where_conditions if _has_aggregate_call(c)]
+            if where_parts:
+                parts.append(f"  WHERE {' AND '.join(where_parts)}")
+            if having_parts:
+                parts.append(f"  HAVING {' AND '.join(having_parts)}")
         return "\n".join(parts)
 
     # --- Projection ---
