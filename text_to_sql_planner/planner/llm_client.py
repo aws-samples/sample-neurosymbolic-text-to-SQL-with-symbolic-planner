@@ -457,6 +457,12 @@ IMPORTANT — percentage multiplication:
 - When the evidence gives a formula like ``DIVIDE(X, Y) * 100``, replicate that EXACTLY as ``(* (/ X Y) 100)`` in the arithmetic aggregate result variable.
 - A bare ``(/ (COUNT_IF ...) (COUNT ...))`` produces a 0-to-1 decimal, NOT a percentage. Only omit ``* 100`` if the evidence omits it.
 
+IMPORTANT — computed result variables:
+- When evidence defines a value as a formula (e.g., "eligible rate = A / B"), the RESULT VARIABLE must be that formula ``(/ A B)``, NOT the raw components ``A B`` as separate columns.
+- WRONG: ``(drc (A B) ...)`` then ordering by ``(/ A B)`` — this returns raw columns, not the computed value.
+- RIGHT: ``(drc ((/ A B)) ...)`` — the arithmetic IS the result variable.
+- If the question asks "list the rates" and evidence says "rate = X / Y", the DRC result variable is ``(/ X Y)`` as a single arithmetic expression.
+
 Return ONLY the DRC expression in Lisp syntax, nothing else."""
 
 
