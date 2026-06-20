@@ -543,6 +543,8 @@ def _build_equivalence_script(
     bound_originals = set(rv_names_1) | set(rv_names_2)
     all_variables = vars1 | vars2
     for var in sorted(all_variables - bound_originals):
+        if var in all_relations:
+            continue  # Skip: name collides with a relation (table) name
         sort = all_var_types.get(var, "Int")
         lines.append(f"(declare-const {var} {sort})")
 
