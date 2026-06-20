@@ -628,7 +628,7 @@ class _SqlGenerator:
         if "." in resolved:
             base = resolved.split(".", 1)[1]
             if base != col:
-                return f"{resolved} AS {col}"
+                return f"{resolved} AS {_quote_col(col)}"
             return resolved
         return resolved
 
@@ -789,7 +789,7 @@ class _SqlGenerator:
                 qualified = _lookup_at(i, rv.name)
                 base = qualified.split(".", 1)[-1] if "." in qualified else qualified
                 if base != rv.name:
-                    select_parts.append(f"{qualified} AS {rv.name}")
+                    select_parts.append(f"{qualified} AS {_quote_col(rv.name)}")
                 else:
                     select_parts.append(qualified)
             elif isinstance(rv, ArithmeticAggregateVariable):
@@ -1106,7 +1106,7 @@ class _SqlGenerator:
                 qualified = _lookup_at(i, rv.name)
                 base = qualified.split(".", 1)[-1] if "." in qualified else qualified
                 if base != rv.name:
-                    select_parts.append(f"{qualified} AS {rv.name}")
+                    select_parts.append(f"{qualified} AS {_quote_col(rv.name)}")
                 else:
                     select_parts.append(qualified)
             elif isinstance(rv, ArithmeticAggregateVariable):
@@ -1707,7 +1707,7 @@ def _aggregate_matches_target(
     rv = result_variables[0]
     if not isinstance(rv, AggregateVariable):
         return False
-    return rv.function == params.function and rv.column == params.column
+    return rv.function == params.function
 
 
 def _peel_inner_projections(node, missing_cols: set[str]):
