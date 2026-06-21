@@ -439,6 +439,7 @@ Note: Contrast with the previous example. Here the question explicitly asks for 
 Ratio / percentage / average-per-entity patterns:
 - "What is the average number of X per Y" → divide COUNT(X) by COUNT(DISTINCT Y): ``(/ (COUNT x) (COUNT y))``
 - "What percentage of X satisfy condition C" → divide conditional count by total count: ``(/ (COUNT_IF condition col) (COUNT col))``
+  IMPORTANT: The base population filter (X) goes in the membership/condition body (it restricts which rows are counted in BOTH numerator and denominator). Only the NUMERATOR condition (C) goes in the COUNT_IF. Example: "What percentage of players under 180cm have rating > 70?" → filter to height < 180 in the condition body, then ``(/ (COUNT_IF (> rating 70) id) (COUNT id))``. Do NOT put ALL conditions inside COUNT_IF — that changes the denominator.
 - ``(COUNT_IF condition col)`` counts ``col`` only for rows where ``condition`` is true. It maps to SQL ``COUNT(CASE WHEN condition THEN col END)``.
 - The ``/`` operator in result-variable position produces SQL ``AGG1(...) / AGG2(...)`` in a single SELECT.
 
