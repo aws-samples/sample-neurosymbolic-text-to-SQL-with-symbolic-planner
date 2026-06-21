@@ -318,6 +318,8 @@ IMPORTANT RULES:
 - Quantifiers bind variables; membership (in) constrains them to a table. Always pair them.
 - When "Evidence" is provided after the question, it contains AUTHORITATIVE column-to-concept mappings. ALWAYS follow these mappings exactly — they override any other interpretation of the question. For example, if evidence says "X refers to column = 'value'", use ONLY that column/value in your DRC, even if the English phrasing suggests something else.
 - When evidence provides an inequality operator like ``column != 'value'`` or ``column <> 'value'``, use it as a direct comparison ``(!= column "value")`` in the condition — do NOT convert it into a ``(not (exists ...))`` pattern. The evidence's operator choice is intentional.
+- String comparisons in SQLite are CASE-SENSITIVE for ``=``. If the evidence gives a value like ``'cryokinesis'`` but the schema likely stores it with different casing (e.g., ``'Cryokinesis'``), use ``LIKE`` with the pattern instead of ``=`` for robustness: ``(LIKE column "cryokinesis")``. This is especially important for proper nouns that might be capitalized in the database.
+- When joining tables, use ONLY the foreign-key column specified in the schema or evidence. Do NOT join on multiple alternative columns with OR. If the evidence says "player refers to player_name = 'X'" without specifying a join column, look at the schema's column names to identify the single correct FK relationship (e.g., ``player_api_id``). A join should be a single equality ``(= t1.fk_col t2.pk_col)``, never a disjunction of columns.
 
 Examples:
 
