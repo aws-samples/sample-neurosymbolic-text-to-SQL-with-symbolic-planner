@@ -474,6 +474,12 @@ def _build_equivalence_script(
         return "Int"
 
     # Convert each condition under its substitution scope.
+    # Add relation names as identity mappings in scope so that the
+    # quantifier alpha-renamer treats them as forbidden (avoids bound
+    # variables shadowing relation names, which crashes cvc5).
+    for rel_name in all_relations:
+        scope1.setdefault(rel_name, rel_name)
+        scope2.setdefault(rel_name, rel_name)
     formula1 = _convert_node(expr1.condition, all_var_types, scope1)
     formula2 = _convert_node(expr2.condition, all_var_types, scope2)
 
