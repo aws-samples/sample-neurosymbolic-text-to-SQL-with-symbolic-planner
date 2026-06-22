@@ -37,7 +37,7 @@ def main():
     print(f"```sql\n{SCHEMA.strip()}\n```\n")
     print(f"---\n", flush=True)
 
-    result = subprocess.run(
+    result = subprocess.run(  # noqa: S603 — all arguments are hardcoded constants
         [
             sys.executable, "-m", "text_to_sql_planner",
             "-q", QUESTION,
