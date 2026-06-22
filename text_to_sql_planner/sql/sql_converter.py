@@ -76,6 +76,23 @@ def _has_aggregate_call(sql_fragment: str) -> bool:
     import re
     return bool(re.search(r"\b(COUNT|SUM|AVG|MIN|MAX)\s*\(", sql_fragment))
 
+
+def _wrap_aggregate_as_subquery(cond: str, from_clause: str, join_clauses: list[str]) -> str:
+    """Wrap aggregate function calls in a condition as scalar subqueries.
+
+    Converts ``col > AVG(col2)`` → ``col > (SELECT AVG(col2) FROM ...)``.
+    """
+    import re
+    def _replace_agg(m):
+        agg_expr = m.group(0)
+        from_part = from_clause
+        joins = " ".join(join_clauses) if join_clauses else ""
+        if joins:
+            return f"(SELECT {agg_expr} FROM {from_part} {joins})"
+        return f"(SELECT {agg_expr} FROM {from_part})"
+    return re.sub(r"\b(COUNT|SUM|AVG|MIN|MAX)\s*\([^)]*\)", _replace_agg, cond)
+
+
 def _is_date_string(s: str) -> bool:
     """Check if a string looks like a date (YYYY-MM-DD or YYYY/MM/DD)."""
     return bool(re.match(r"^\d{4}[-/]\d{2}[-/]\d{2}$", s))
@@ -520,12 +537,17 @@ class _SqlGenerator:
         for jc in ctx.join_clauses:
             parts.append(f"  {jc}")
         if ctx.where_conditions:
-            where_parts = [c for c in ctx.where_conditions if not _has_aggregate_call(c)]
-            having_parts = [c for c in ctx.where_conditions if _has_aggregate_call(c)]
-            if where_parts:
-                parts.append(f"  WHERE {' AND '.join(where_parts)}")
-            if having_parts:
-                parts.append(f"  HAVING {' AND '.join(having_parts)}")
+            where_parts = []
+            having_parts = []
+            for cond in ctx.where_conditions:
+                if _has_aggregate_call(cond):
+                    # Wrap aggregate in scalar subquery for non-GROUP-BY contexts
+                    having_parts.append(_wrap_aggregate_as_subquery(cond, ctx.from_clause, ctx.join_clauses))
+                else:
+                    where_parts.append(cond)
+            all_where = where_parts + having_parts
+            if all_where:
+                parts.append(f"  WHERE {' AND '.join(all_where)}")
         return "\n".join(parts)
 
     # --- Projection ---
@@ -1162,11 +1184,19 @@ class _SqlGenerator:
         for jc in ctx.join_clauses:
             parts.append(f"  {jc}")
         if ctx.where_conditions:
-            parts.append(f"  WHERE {' AND '.join(ctx.where_conditions)}")
+            where_parts = [c for c in ctx.where_conditions if not _has_aggregate_call(c)]
+            having_parts = [c for c in ctx.where_conditions if _has_aggregate_call(c)]
+            if where_parts:
+                parts.append(f"  WHERE {' AND '.join(where_parts)}")
+        else:
+            having_parts = []
 
         _maybe_emit_group_by(
             parts, has_aggregates, order_by, result_variables, _lookup_at
         )
+
+        if having_parts:
+            parts.append(f"  HAVING {' AND '.join(having_parts)}")
 
         # ORDER BY / LIMIT layers are non-relational — they live outside
         # the set comprehension. Each ORDER BY key references the target
