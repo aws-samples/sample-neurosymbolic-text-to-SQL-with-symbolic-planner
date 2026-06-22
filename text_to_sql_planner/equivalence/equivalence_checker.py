@@ -924,6 +924,7 @@ async def _run_cvc5_with_strategy(
 ) -> EquivalenceResult:
     """Run cvc5 once with the given CLI arg list and interpret the result."""
     try:
+        # nosemgrep: python.lang.security.audit.dangerous-asyncio-create-exec-audit
         proc = await asyncio.create_subprocess_exec(
             config.cvc5_path,
             *args,

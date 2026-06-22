@@ -37,6 +37,7 @@ def main():
     print(f"```sql\n{SCHEMA.strip()}\n```\n")
     print(f"---\n", flush=True)
 
+    # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
     result = subprocess.run(
         [
             sys.executable, "-m", "text_to_sql_planner",

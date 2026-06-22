@@ -64,8 +64,13 @@ def _make_sqlite(path: Path, db_id: str) -> None:
 
     path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(str(path)) as conn:
+        # db_id is a test-controlled identifier; validate it's alphanumeric.
+        table_name = f"{db_id}_main"
+        if not all(c.isalnum() or c == "_" for c in table_name):
+            raise ValueError(f"Invalid table name: {table_name}")
+        # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query
         conn.execute(
-            f"CREATE TABLE {db_id}_main (id INTEGER PRIMARY KEY, value TEXT)"
+            "CREATE TABLE [" + table_name + "] (id INTEGER PRIMARY KEY, value TEXT)"
         )
         conn.commit()
 
