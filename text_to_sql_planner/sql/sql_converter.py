@@ -1186,6 +1186,13 @@ class _SqlGenerator:
         if ctx.where_conditions:
             where_parts = [c for c in ctx.where_conditions if not _has_aggregate_call(c)]
             having_parts = [c for c in ctx.where_conditions if _has_aggregate_call(c)]
+            # When there's no GROUP BY, aggregate conditions need scalar
+            # subqueries (not HAVING). HAVING without GROUP BY treats the
+            # whole table as one group, which is wrong for row-level filtering.
+            if having_parts and not has_aggregates:
+                wrapped = [_wrap_aggregate_as_subquery(c, ctx.from_clause, ctx.join_clauses) for c in having_parts]
+                where_parts.extend(wrapped)
+                having_parts = []
             if where_parts:
                 parts.append(f"  WHERE {' AND '.join(where_parts)}")
         else:
