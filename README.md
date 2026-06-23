@@ -10,7 +10,7 @@ To see how it works, let's consider a ridiculously simple example. Consider the 
 
 Given this _target_ DRC expression and a set of degenerate DRC expressions, one per DB table, we use a symbolic planner to find a tree of [relational algebra](https://en.wikipedia.org/wiki/Relational_algebra) (RA) operators (join, project, select, etc.) that convert the tables into the target relation. Finally we convert this tree of RA operators into a SQL query (and simplify it).
 
-This system acheives near-SOTA performance on the [BIRD-SQL](https://bird-bench.github.io) benchmark suite while having a surprisingly simple architecture..
+This system acheives near-SOTA performance on the [BIRD-SQL](https://bird-bench.github.io) benchmark suite while having a surprisingly simple architecture.
 
 The pipeline:
 
