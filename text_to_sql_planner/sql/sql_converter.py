@@ -1435,12 +1435,12 @@ class _SqlGenerator:
             base = self._condition_to_sql(node.arguments[0], var_map)
             days_str = self._condition_to_sql(node.arguments[1], var_map)
             interval = _days_to_interval(days_str)
-            return f"{base} - INTERVAL '{interval}'"
+            return f"date({base}, '-{interval}')"
         elif node.function == "DATE_ADD" and len(node.arguments) == 2:
             base = self._condition_to_sql(node.arguments[0], var_map)
             days_str = self._condition_to_sql(node.arguments[1], var_map)
             interval = _days_to_interval(days_str)
-            return f"{base} + INTERVAL '{interval}'"
+            return f"date({base}, '+{interval}')"
         elif node.function == "DATEDIFF" and len(node.arguments) == 2:
             left = self._condition_to_sql(node.arguments[0], var_map)
             right = self._condition_to_sql(node.arguments[1], var_map)
