@@ -624,7 +624,7 @@ class _SqlGenerator:
         # Indent the inner SQL for readability inside the wrapper.
         indented = "\n  ".join(inner_sql.splitlines())
         return (
-            f"SELECT {params.function}({inner_alias}.{params.column})\n"
+            f"SELECT {params.function}({inner_alias}.{params.column}) AS {_quote_col(params.column)}\n"
             f"  FROM (\n  {indented}\n  ) {inner_alias}"
         )
 
