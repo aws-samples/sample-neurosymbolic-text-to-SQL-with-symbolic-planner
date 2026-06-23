@@ -8,7 +8,7 @@ To see how it works, let's consider a ridiculously simple example. Consider the 
 
 > {COUNT(id) | ∃ id,name,age (id,name,age ∈ Employees ∧ age >= 30)}
 
-Given this _target_ DRC expression and a set of degenerate DRC expressions, one per DB table, we use a symbolic planner to find a tree of [relational algebra](https://en.wikipedia.org/wiki/Relational_algebra) (RA) operators that convert the tables into the target relation. Finally we convert this tree of RA operators into a SQL query (and simplify it).
+Given this _target_ DRC expression and a set of degenerate DRC expressions, one per DB table, we use a symbolic planner to find a tree of [relational algebra](https://en.wikipedia.org/wiki/Relational_algebra) (RA) operators (join, project, select, etc.) that convert the tables into the target relation. Finally we convert this tree of RA operators into a SQL query (and simplify it).
 
 The pipeline:
 
