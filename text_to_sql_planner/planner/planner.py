@@ -461,7 +461,7 @@ async def plan(
                 print(f"> Not equivalent yet, continuing...\n")
             elif isinstance(eq_result, IndeterminateResult):
                 print(f"> ⚠️ Equivalence indeterminate: {eq_result.reason} — treating as not-equivalent\n")
-                best_indeterminate_node = new_node
+                best_indeterminate_node = op_node
 
             success_this_iteration = True
             break
