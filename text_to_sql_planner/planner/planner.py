@@ -255,6 +255,10 @@ async def plan(
                 tree = OperationTree(root=node)
                 return PlannerSuccess(operation_tree=tree, iterations=0)
 
+    # Track the best relation where cvc5 returned indeterminate (crash/timeout)
+    # so we can use it as a fallback if the planner can't prove anything.
+    best_indeterminate_node = None
+
     for iteration in range(1, config.max_iterations + 1):
         print(f"\n## Iteration {iteration}/{config.max_iterations}\n", flush=True)
         print(f"### Available relations ({len(available)})\n")
@@ -457,6 +461,7 @@ async def plan(
                 print(f"> Not equivalent yet, continuing...\n")
             elif isinstance(eq_result, IndeterminateResult):
                 print(f"> ⚠️ Equivalence indeterminate: {eq_result.reason} — treating as not-equivalent\n")
+                best_indeterminate_node = new_node
 
             success_this_iteration = True
             break
@@ -506,6 +511,10 @@ async def plan(
                     )
             # Salvage scan didn't find a match either. Fail.
             print(f"\n> ❌ All retries exhausted at iteration {iteration}. Stopping.\n")
+            if best_indeterminate_node is not None:
+                print(f"### ⚠️ Using best-effort relation (cvc5 indeterminate)\n")
+                tree = OperationTree(root=best_indeterminate_node)
+                return PlannerSuccess(operation_tree=tree, iterations=iteration)
             return PlannerError(
                 error_type="operator_selection_failed",
                 message=(
@@ -516,6 +525,10 @@ async def plan(
             )
 
     print(f"\n> ❌ Max iterations ({config.max_iterations}) reached without equivalence.\n")
+    if best_indeterminate_node is not None:
+        print(f"### ⚠️ Using best-effort relation (cvc5 indeterminate)\n")
+        tree = OperationTree(root=best_indeterminate_node)
+        return PlannerSuccess(operation_tree=tree, iterations=config.max_iterations)
     return PlannerError(
         error_type="max_iterations_exceeded",
         message=f"Reached maximum iterations ({config.max_iterations}) without finding equivalence.",
