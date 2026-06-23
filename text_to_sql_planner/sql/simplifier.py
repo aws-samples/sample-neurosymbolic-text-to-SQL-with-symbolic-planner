@@ -117,13 +117,26 @@ def _find_first_keyword(text: str, keywords: list[str]) -> int:
 
 def _find_matching_paren(text: str, start: int) -> int:
     depth = 0
-    for i in range(start, len(text)):
-        if text[i] == "(":
+    i = start
+    while i < len(text):
+        ch = text[i]
+        if ch == "'":
+            # Skip single-quoted string literal
+            i += 1
+            while i < len(text) and text[i] != "'":
+                if text[i] == "'" and i + 1 < len(text) and text[i + 1] == "'":
+                    i += 2  # escaped quote
+                else:
+                    i += 1
+            i += 1  # skip closing quote
+            continue
+        if ch == "(":
             depth += 1
-        elif text[i] == ")":
+        elif ch == ")":
             depth -= 1
             if depth == 0:
                 return i
+        i += 1
     return -1
 
 
