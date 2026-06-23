@@ -4,6 +4,12 @@ A natural-language-to-SQL system that produces SQL whose meaning is *formally
 verified* against the user's intent — not just plausible-looking SQL stitched
 together by a language model.
 
+To see how it works, let's consider a ridiculously simple example. Consider the question "How many employees are at least 30 years old?". Given an appropriate DB schema, we convert this into a [Domain Relational Calculus](https://en.wikipedia.org/wiki/Domain_relational_calculus) (DRC) expression: 
+
+> {COUNT(id) | ∃ id,name,age (id,name,age ∈ Employees ∧ age >= 30)}
+
+Given this _target_ DRC expression and a set of degenerate DRC expressions, one per DB table, we use a symbolic planner to find a tree of [relational algebra](https://en.wikipedia.org/wiki/Relational_algebra) (RA) operators that convert the tables into the target relation. Finally we convert this tree of RA operators into a SQL query (and simplify it).
+
 The pipeline:
 
 1. An LLM converts the question into Domain Relational Calculus (DRC), a
