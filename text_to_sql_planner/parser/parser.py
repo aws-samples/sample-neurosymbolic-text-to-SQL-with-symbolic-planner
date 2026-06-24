@@ -43,7 +43,7 @@ _BUILTIN_FUNCTIONS = frozenset(
     {"DATE_SUB", "DATE_ADD", "YEAR", "MONTH", "DAY", "DATEDIFF", "LIKE"}
 )
 _QUANTIFIER_OPS = frozenset({"forall", "exists"})
-_AGGREGATE_FUNCS = frozenset({"COUNT", "SUM", "AVG", "MIN", "MAX"})
+_AGGREGATE_FUNCS = frozenset({"COUNT", "COUNT_DISTINCT", "SUM", "AVG", "MIN", "MAX"})
 
 
 @dataclass
@@ -386,6 +386,21 @@ class _Parser:
                 operator=op_token.value,  # type: ignore[arg-type]
                 left=left,
                 right=right,
+            )
+
+        # Conditional output: (IF condition "then_value" "else_value")
+        if head.value == "IF":
+            from text_to_sql_planner.types.drc import ConditionalOutputVariable
+            self._advance()  # consume IF
+            condition = self._parse_condition()
+            then_tok = self._expect(TokenType.STRING, "expected then-value string in IF")
+            else_tok = self._expect(TokenType.STRING, "expected else-value string in IF")
+            self._expect(TokenType.RPAREN, "after IF expression")
+            self._leave()
+            return ConditionalOutputVariable(
+                condition=condition,
+                then_value=then_tok.value,
+                else_value=else_tok.value,
             )
 
         # Conditional aggregate: (COUNT_IF condition col) or (SUM_IF ...)

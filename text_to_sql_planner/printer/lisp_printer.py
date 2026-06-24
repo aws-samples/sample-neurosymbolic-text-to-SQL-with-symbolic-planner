@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Union
 
 from text_to_sql_planner.types.drc import (
+    ConditionalOutputVariable,
     AggregateVariable,
     ArithmeticAggregateVariable,
     ArithmeticNode,
@@ -210,6 +211,9 @@ def _print_result_variables(variables: list[ResultVariable]) -> str:
         elif isinstance(var, ConditionalAggregateVariable):
             cond_str = _print_condition(var.condition)
             parts.append(f"({var.function}_IF {cond_str} {var.column})")
+        elif isinstance(var, ConditionalOutputVariable):
+            cond_str = _print_condition(var.condition)
+            parts.append(f"(IF {cond_str} \"{var.then_value}\" \"{var.else_value}\")")
         elif isinstance(var, ScalarLiteralVariable):
             parts.append(str(var.value))
         else:

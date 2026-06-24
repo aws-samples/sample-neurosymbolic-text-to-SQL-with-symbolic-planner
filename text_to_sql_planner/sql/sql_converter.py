@@ -30,6 +30,7 @@ from text_to_sql_planner.types.operators import (
     RatioParams,
 )
 from text_to_sql_planner.types.drc import (
+    ConditionalOutputVariable,
     ArithmeticNode,
     ComparisonNode,
     IsNotNullNode,
@@ -840,7 +841,9 @@ class _SqlGenerator:
                 )
             elif isinstance(rv, AggregateVariable):
                 qualified_col = _lookup_at(i, rv.column)
-                if rv.function == "COUNT":
+                if rv.function == "COUNT_DISTINCT":
+                    select_parts.append(f"COUNT(DISTINCT {qualified_col})")
+                elif rv.function == "COUNT":
                     select_parts.append(f"COUNT({qualified_col})")
                 else:
                     select_parts.append(f"{rv.function}({qualified_col})")
@@ -1157,10 +1160,15 @@ class _SqlGenerator:
                 )
             elif isinstance(rv, AggregateVariable):
                 qualified_col = _lookup_at(i, rv.column)
-                if rv.function == "COUNT":
+                if rv.function == "COUNT_DISTINCT":
+                    select_parts.append(f"COUNT(DISTINCT {qualified_col})")
+                elif rv.function == "COUNT":
                     select_parts.append(f"COUNT({qualified_col})")
                 else:
                     select_parts.append(f"{rv.function}({qualified_col})")
+            elif isinstance(rv, ConditionalOutputVariable):
+                cond_sql = self._condition_to_sql(rv.condition, ctx.var_mapping)
+                select_parts.append(f"IIF({cond_sql}, '{rv.then_value}', '{rv.else_value}')")
 
         select_str = ", ".join(select_parts)
 
@@ -1444,7 +1452,7 @@ class _SqlGenerator:
         elif node.function == "DATEDIFF" and len(node.arguments) == 2:
             left = self._condition_to_sql(node.arguments[0], var_map)
             right = self._condition_to_sql(node.arguments[1], var_map)
-            return f"({left} - {right})"
+            return f"CAST((JULIANDAY({left}) - JULIANDAY({right})) AS REAL) / 365"
         elif node.function == "LIKE" and len(node.arguments) == 2:
             # ``(LIKE col pattern)`` → ``col LIKE pattern`` (SQL infix
             # form). Without this the converter would emit ``LIKE(col,
@@ -1647,6 +1655,7 @@ def _format_aggregate(
     nested ``ArithmeticAggregateVariable``, and ``ScalarLiteralVariable``.
     """
     from text_to_sql_planner.types.drc import (
+    ConditionalOutputVariable,
         ScalarLiteralVariable,
         ConditionalAggregateVariable,
         ArithmeticAggregateVariable,
@@ -1679,6 +1688,8 @@ def _format_aggregate(
         qualified_col = var_map[agg.column]
     else:
         qualified_col = lookup_at(position, agg.column)
+    if agg.function == "COUNT_DISTINCT":
+        return f"COUNT(DISTINCT {qualified_col})"
     if agg.function == "COUNT":
         return f"COUNT({qualified_col})"
     return f"{agg.function}({qualified_col})"
@@ -1890,6 +1901,7 @@ def convert_query_to_sql(
     ``ORDER BY`` / ``LIMIT`` layers (if any) become outer-SELECT clauses.
     """
     from text_to_sql_planner.types.drc import (
+    ConditionalOutputVariable,
         DRCExpression,
         LimitExpression,
         OrderByExpression,

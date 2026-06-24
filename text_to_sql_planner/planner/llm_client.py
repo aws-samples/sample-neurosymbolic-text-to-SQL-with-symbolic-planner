@@ -294,8 +294,10 @@ Syntax rules:
 - Top-level: (drc (result-var1 result-var2 ...) condition)
 - Result variables can be plain column names OR aggregate functions:
   - Plain column: just the name, e.g. name, id, age
-  - Aggregate: (COUNT col), (SUM col), (AVG col), (MIN col), (MAX col)
+  - Aggregate: (COUNT col), (COUNT_DISTINCT col), (SUM col), (AVG col), (MIN col), (MAX col)
+    Use (COUNT_DISTINCT col) when the question or evidence says "distinct count" or "number of distinct".
   - Conditional aggregate: (COUNT_IF condition col) — counts col only where condition is true. Use for "what percentage of X satisfy Y" patterns: (/ (COUNT_IF (= status "A") id) (COUNT id)).
+  - Conditional output: (IF condition "then_value" "else_value") — produces IIF(condition, 'then', 'else') in SQL. Use for yes/no questions: "Is X true?" → (IF (condition) "Yes" "No"). Also for categorization: (IF (is-not-null col) "has value" "no value").
   - Arithmetic of aggregates: (/ (COUNT col1) (COUNT col2)), (* (SUM col1) (AVG col2)), etc.
     Use this for ratio/percentage questions like "average number of X per Y" = (/ (COUNT x) (COUNT y)).
 - Membership: (in (var1 var2 ...) TableName) — asserts that the tuple (var1, var2, ...) is a row in TableName
@@ -304,7 +306,7 @@ Syntax rules:
 - Comparison: (= x y), (!= x y), (< x y), (> x y), (<= x y), (>= x y)
 - Quantifiers: (exists (var1 var2 ...) body), (forall (var1 var2 ...) body)
   - Quantifiers just bind variables. Use (in ...) inside the body to constrain them to a relation.
-- Date functions: CURRENT_DATE (today's date), (DATE_SUB expr days) (subtract days from a date), (DATEDIFF expr1 expr2) (days between two dates)
+- Date functions: CURRENT_DATE (today's date), (DATE_SUB expr days) (subtract days from a date), (DATEDIFF expr1 expr2) (age in years between two dates — e.g., ``(DATEDIFF CURRENT_DATE Birthday)`` for current age). Use DATEDIFF for "older than N years" patterns: ``(> (DATEDIFF CURRENT_DATE Birthday) N)``.
 - String pattern matching: (LIKE column "pattern") — SQL LIKE semantics. Use ``%`` as a wildcard in the pattern. ``"%data%"`` matches any string containing ``data``; ``"data%"`` matches a prefix; ``"%data"`` matches a suffix.
 - NULL check: (is-not-null column) — SQL ``column IS NOT NULL``. Use this whenever the evidence or question says "is not null" or "is not empty" or "has a value". Do NOT use ``(!= column "")`` or ``(not (= column NULL))`` — those have wrong SQL NULL semantics.
 - Literals: strings in double quotes "hello", numbers as-is 42

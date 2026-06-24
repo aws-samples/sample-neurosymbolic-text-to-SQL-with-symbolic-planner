@@ -86,9 +86,21 @@ class ScalarLiteralVariable:
     value: Union[int, float] = 0
 
 
-ResultVariable = Union[ColumnVariable, AggregateVariable, ArithmeticAggregateVariable, ConditionalAggregateVariable, ScalarLiteralVariable]
+@dataclass
+class ConditionalOutputVariable:
+    """IIF/CASE WHEN result: ``(IF condition then_value else_value)`` in result position.
 
-AggregateFunction = Literal["COUNT", "SUM", "AVG", "MIN", "MAX"]
+    Emits SQL: ``IIF(condition, then_val, else_val)``
+    """
+    type: Literal["conditional_output"] = "conditional_output"
+    condition: "DRCCondition" = None  # type: ignore
+    then_value: str = ""
+    else_value: str = ""
+
+
+ResultVariable = Union[ColumnVariable, AggregateVariable, ArithmeticAggregateVariable, ConditionalAggregateVariable, ScalarLiteralVariable, ConditionalOutputVariable]
+
+AggregateFunction = Literal["COUNT", "COUNT_DISTINCT", "SUM", "AVG", "MIN", "MAX"]
 
 
 # Condition nodes (recursive)
