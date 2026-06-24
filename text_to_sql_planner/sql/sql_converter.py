@@ -102,15 +102,28 @@ def _is_date_string(s: str) -> bool:
 # Regex matching bare SQL identifiers that don't need quoting.
 _BARE_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
+_SQL_RESERVED = frozenset({
+    "ORDER", "GROUP", "SELECT", "FROM", "WHERE", "JOIN", "ON", "AS",
+    "AND", "OR", "NOT", "IN", "IS", "NULL", "LIKE", "BETWEEN",
+    "EXISTS", "HAVING", "UNION", "EXCEPT", "INTERSECT", "INSERT",
+    "UPDATE", "DELETE", "CREATE", "DROP", "ALTER", "TABLE", "INDEX",
+    "VIEW", "TRIGGER", "BEGIN", "END", "COMMIT", "ROLLBACK",
+    "LIMIT", "OFFSET", "ASC", "DESC", "BY", "SET", "VALUES",
+    "INTO", "DISTINCT", "ALL", "CASE", "WHEN", "THEN", "ELSE",
+    "CAST", "PRIMARY", "KEY", "REFERENCES", "FOREIGN", "CHECK",
+    "DEFAULT", "CONSTRAINT", "UNIQUE", "COLUMN", "ADD", "REPLACE",
+})
+
 
 def _quote_col(col: str) -> str:
-    """Quote a column name for SQL if it contains non-identifier chars.
+    """Quote a column/table name for SQL if it contains non-identifier chars
+    or is a SQL reserved word.
 
     Names with spaces, hyphens, dots, or other special characters are
-    wrapped in backticks. Plain identifiers pass through unchanged.
-    Used when building ``alias.column`` references in ``var_mapping``.
+    wrapped in backticks. SQL reserved words (ORDER, GROUP, etc.) are
+    also backtick-quoted to prevent syntax errors.
     """
-    if _BARE_IDENT_RE.match(col):
+    if _BARE_IDENT_RE.match(col) and col.upper() not in _SQL_RESERVED:
         return col
     # Escape embedded backticks by doubling them, per SQLite convention.
     escaped = col.replace("`", "``")
@@ -268,8 +281,8 @@ class _SqlGenerator:
         alias = self._aliases.next_alias(node.table_name)
         if node.columns:
             cols = ", ".join(f"{alias}.{c}" for c in node.columns)
-            return f"SELECT {cols} FROM {node.table_name} {alias}"
-        return f"SELECT * FROM {node.table_name} {alias}"
+            return f"SELECT {cols} FROM {_quote_col(node.table_name)} {alias}"
+        return f"SELECT * FROM {_quote_col(node.table_name)} {alias}"
 
     def _convert_operator(self, node: OperatorNode) -> str:
         """Route operator to the appropriate handler."""
@@ -323,7 +336,7 @@ class _SqlGenerator:
             raise _ConversionError("Table leaf has empty table name")
         alias = self._aliases.next_alias(node.table_name)
         ctx = _QueryContext()
-        ctx.from_clause = f"{node.table_name} {alias}"
+        ctx.from_clause = f"{_quote_col(node.table_name)} {alias}"
         ctx.table_instances[node.table_name] = [alias]
         for col in node.columns:
             # Use the original SQL column name (which may have spaces)
