@@ -276,14 +276,21 @@ async def check_equivalence(
         return NotEquivalentResult()
 
     # Early exit: result variable structure must match (column vs aggregate, function names)
+    from text_to_sql_planner.types.drc import ConditionalOutputVariable
     for rv1, rv2 in zip(expr1.result_variables, expr2.result_variables):
         if type(rv1) != type(rv2):
-            print(
-                f"\n> ⚡ **cvc5:** Result variable type mismatch "
-                f"({type(rv1).__name__} vs {type(rv2).__name__})"
-                f"{sides_hint} → `not_equivalent` (skipped cvc5)\n"
-            )
-            return NotEquivalentResult()
+            # Allow ConditionalOutputVariable to match any type —
+            # it's a new construct that operators can't produce natively,
+            # so the built side may represent it as a ColumnVariable.
+            if isinstance(rv1, ConditionalOutputVariable) or isinstance(rv2, ConditionalOutputVariable):
+                pass  # let cvc5 decide
+            else:
+                print(
+                    f"\n> ⚡ **cvc5:** Result variable type mismatch "
+                    f"({type(rv1).__name__} vs {type(rv2).__name__})"
+                    f"{sides_hint} → `not_equivalent` (skipped cvc5)\n"
+                )
+                return NotEquivalentResult()
         if isinstance(rv1, AggregateVariable) and isinstance(rv2, AggregateVariable):
             if rv1.function != rv2.function:
                 print(
