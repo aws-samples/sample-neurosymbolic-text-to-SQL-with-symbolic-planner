@@ -1076,11 +1076,16 @@ class _SqlGenerator:
         # use must therefore expose every name a result variable
         # references — verified positionally by ``root_columns`` below.
         effective_root = tree.root
+        # If any result variable is a ConditionalOutputVariable, its condition
+        # may reference columns that a projection would drop. Skip peeling
+        # projections in that case to keep all columns accessible.
+        has_conditional_output = any(isinstance(rv, ConditionalOutputVariable) for rv in result_variables)
+
         while True:
             if not isinstance(effective_root, OperatorNode) or not effective_root.inputs:
                 break
             params = effective_root.params
-            if isinstance(params, ProjectionParams):
+            if isinstance(params, ProjectionParams) and not has_conditional_output:
                 effective_root = effective_root.inputs[0]
                 continue
             if isinstance(params, AggregateParams):
